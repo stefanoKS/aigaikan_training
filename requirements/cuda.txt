@@ -1,0 +1,5 @@
+-r base.txt
+torch==2.4.1
+torchvision==0.19.1
+anomalib==1.2.0
+
