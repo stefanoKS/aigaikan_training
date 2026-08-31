@@ -125,6 +125,7 @@ class AnomalibService:
         config: TrainingConfig,
         run_directory: Path | None = None,
         callbacks: list[Any] | None = None,
+        calibration_mode: bool = False,
     ) -> dict[str, Any]:
         """Instantiate current Anomalib components from the project configuration."""
         config.validate()
@@ -137,26 +138,12 @@ class AnomalibService:
         from anomalib.engine import Engine
 
         ok_train = self._required_folder(dataset, DatasetRole.OK_TRAIN)
-        ng_test = self._required_folder(dataset, DatasetRole.NG_TEST)
-        ok_test = self._optional_folder(dataset, DatasetRole.OK_TEST)
-        masks = self._optional_folder(dataset, DatasetRole.MASKS)
         model = self._create_model(definition, config)
         device = self.resolve_device(config.device)
         if device == "gpu":
             self._configure_gpu_precision()
 
-        datamodule_kwargs: dict[str, Any] = {
-            "name": "custom",
-            "normal_dir": ok_train,
-            "abnormal_dir": ng_test,
-            "normal_test_dir": ok_test,
-            "mask_dir": masks,
-            "train_batch_size": config.batch_size,
-            "eval_batch_size": config.batch_size,
-            "num_workers": config.num_workers,
-            "seed": config.random_seed,
-        }
-        datamodule = Folder(**datamodule_kwargs)
+        datamodule = self.create_datamodule(dataset, config, calibration_mode=calibration_mode)
         engine_kwargs: dict[str, Any] = {
             "max_epochs": config.max_epochs,
             "check_val_every_n_epoch": config.validation_every_n_epochs,
@@ -169,6 +156,8 @@ class AnomalibService:
             "enable_model_summary": False,
             "logger": False,
         }
+        if config.is_dinomaly:
+            engine_kwargs["max_steps"] = config.target_training_steps
         if callbacks:
             engine_kwargs["callbacks"] = callbacks
         engine = Engine(
@@ -182,6 +171,34 @@ class AnomalibService:
             "device": device,
             "device_note": self._device_note(config.device, device),
         }
+
+    def create_datamodule(
+        self,
+        dataset: DatasetConfig,
+        config: TrainingConfig,
+        *,
+        calibration_mode: bool,
+    ) -> Any:
+        """Create an explicit Folder datamodule without Anomalib-side random splitting."""
+        from anomalib.data import Folder
+
+        ok_train = self._required_folder(dataset, DatasetRole.OK_TRAIN)
+        ng_test = self._required_folder(dataset, DatasetRole.NG_TEST)
+        ok_test = self._optional_folder(dataset, DatasetRole.OK_TEST)
+        masks = self._optional_folder(dataset, DatasetRole.MASKS)
+        return Folder(
+            name="custom",
+            normal_dir=ok_train,
+            abnormal_dir=ng_test,
+            normal_test_dir=ok_test,
+            mask_dir=masks,
+            train_batch_size=config.batch_size,
+            eval_batch_size=config.batch_size,
+            num_workers=config.num_workers,
+            test_split_mode="from_dir",
+            val_split_mode="same_as_test" if calibration_mode else "none",
+            seed=config.split_seed,
+        )
 
     def create_inference_components(self, config: TrainingConfig, output_directory: Path) -> dict[str, Any]:
         """Create a model and engine for prediction from a saved checkpoint."""
@@ -253,9 +270,10 @@ class AnomalibService:
                 num_neighbors=config.num_neighbors,
                 coreset_sampling_ratio=config.coreset_sampling_ratio,
                 pre_trained=True,
+                pre_processor=model_class.configure_pre_processor(image_size=config.model_input_size),
             )
         if definition.key == "dinomaly":
-            image_size = (config.image_height, config.image_width)
+            image_size = config.model_input_size
             return model_class(
                 encoder_name=config.dinomaly_encoder,
                 decoder_depth=config.dinomaly_decoder_depth,

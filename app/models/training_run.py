@@ -27,5 +27,11 @@ class TrainingRun:
     run_date: str = ""
     training_duration_seconds: float = 0.0
     evaluation_duration_seconds: float = 0.0
+    final_checkpoint_path: str = ""
+    final_checkpoint_sha256: str = ""
+    dataset_manifest_sha256: str = ""
+    quality_status: str = ""
+    export_status: str = "Not exported"
+    aigaikan_compatibility_status: str = "Not validated"
     metrics: dict[str, float | str | None] = field(default_factory=dict)
     predictions: list[PredictionResult] = field(default_factory=list)

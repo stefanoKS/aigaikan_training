@@ -3,6 +3,7 @@
 from pathlib import Path
 
 from app.models.training_run import TrainingRun
+from app.models.prediction_result import PredictionResult
 from app.services.export_service import ModelExportFormat
 
 from PySide6.QtWidgets import (
@@ -107,6 +108,10 @@ class ResultsPage(QWidget):
             "False NG",
             "True NG",
             "False OK",
+            "Quality Status",
+            "Canonical Checkpoint",
+            "Export Status",
+            "AIGAIKAN Compatibility",
         ):
             label = QLabel("Not available")
             self.metric_labels[key] = label
@@ -126,6 +131,9 @@ class ResultsPage(QWidget):
         splitter.addWidget(right_column)
         root.addWidget(splitter, stretch=1)
         self.current_run_directory: Path | None = None
+        self.current_run: TrainingRun | None = None
+        self._predictions: list[PredictionResult] = []
+        self.filter_combo.currentTextChanged.connect(self._apply_prediction_filter)
 
     def set_metrics(self, metrics: dict[str, str]) -> None:
         """Populate the metrics table."""
@@ -138,6 +146,8 @@ class ResultsPage(QWidget):
     def clear_results(self) -> None:
         """Clear the previous project's completed-run summary."""
         self.current_run_directory = None
+        self.current_run = None
+        self._predictions = []
         self.export_model_button.setEnabled(False)
         self.metrics_table.setRowCount(0)
         self.gallery_table.setRowCount(0)
@@ -146,6 +156,8 @@ class ResultsPage(QWidget):
 
     def set_training_run(self, run: TrainingRun) -> None:
         """Populate the completed-run metadata and metrics."""
+        self.current_run = run
+        self._predictions = list(run.predictions)
         run_directory = Path(run.run_dir)
         self.current_run_directory = run_directory if run_directory.is_dir() else None
         self.export_model_button.setEnabled(self.current_run_directory is not None)
@@ -158,12 +170,45 @@ class ResultsPage(QWidget):
             "Device": run.device.upper(),
             "Training Duration": self._format_duration(run.training_duration_seconds),
             "Evaluation Duration": self._format_duration(run.evaluation_duration_seconds),
+            "Quality Status": run.quality_status or "Not available",
+            "Canonical Checkpoint": Path(run.final_checkpoint_path).name if run.final_checkpoint_path else "Not available",
+            "Export Status": run.export_status,
+            "AIGAIKAN Compatibility": run.aigaikan_compatibility_status,
         }
-        for key in ("Image AUROC", "Image F1", "Precision", "Recall", "Threshold"):
+        for key in ("Image AUROC", "Image F1", "Precision", "Recall", "Threshold", "Decision Threshold"):
             if key in metric_values:
-                summary[key] = metric_values[key]
+                summary["Threshold" if key == "Decision Threshold" else key] = metric_values[key]
         for key, label in self.metric_labels.items():
             label.setText(summary.get(key, "Not available"))
+        self._apply_prediction_filter()
+
+    def filtered_predictions(self) -> list[PredictionResult]:
+        """Return the rows currently selected by the Results filter."""
+        selected_filter = self.filter_combo.currentText()
+        if selected_filter == "Highest anomaly score":
+            return sorted(self._predictions, key=lambda item: item.anomaly_score, reverse=True)
+        if selected_filter == "Lowest anomaly score":
+            return sorted(self._predictions, key=lambda item: item.anomaly_score)
+        if selected_filter == "All":
+            return list(self._predictions)
+        return [item for item in self._predictions if item.classification_bucket() == selected_filter]
+
+    def _apply_prediction_filter(self) -> None:
+        """Render filtered final-test rows without losing the persisted run data."""
+        predictions = self.filtered_predictions()
+        self.gallery_table.setRowCount(len(predictions))
+        for row_index, prediction in enumerate(predictions):
+            values = (
+                prediction.original_image or prediction.source_path,
+                prediction.anomaly_map,
+                prediction.overlay_image,
+                prediction.predicted_label,
+                prediction.ground_truth_label,
+                f"{prediction.anomaly_score:.6g}",
+                prediction.source_path,
+            )
+            for column_index, value in enumerate(values):
+                self.gallery_table.setItem(row_index, column_index, QTableWidgetItem(value))
 
     def set_default_export_directory(self, directory: Path) -> None:
         """Set the active project's root as the default model export destination."""

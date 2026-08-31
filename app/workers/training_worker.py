@@ -12,9 +12,14 @@ from time import perf_counter
 from typing import Any, Callable
 
 from app.core.environment_info import collect_environment_info
+from app.core.dataset_manifest import build_dataset_manifest, build_effective_split, stage_effective_split, write_dataset_manifest
 from app.core.model_registry import ModelExecutionMode
+from app.core.prediction_adapter import iter_anomalib_predictions
 from app.core.project_manager import ProjectManager
+from app.core.quality_metrics import calculate_quality_metrics
 from app.core.result_parser import ResultParser
+from app.core.run_artifacts import extract_decision_threshold, resolve_canonical_checkpoint, write_run_manifest
+from app.models.prediction_result import PredictionResult
 from app.models.project_config import ProjectConfig
 from app.models.training_run import TrainingRun
 from app.services.anomalib_service import AnomalibService
@@ -142,22 +147,35 @@ def run(project_file: Path) -> int:
     emit({"type": "progress", "current": 1, "total": len(STAGES)})
     emit({"type": "log", "level": "info", "message": f"Loaded project {project.name}"})
 
-    environment = collect_environment_info(Path(project.project_path), project.training.random_seed)
     (run_dir / "model").mkdir(parents=True, exist_ok=True)
     (run_dir / "visualizations").mkdir(parents=True, exist_ok=True)
-    (run_dir / "environment.json").write_text(json.dumps(environment, indent=2), encoding="utf-8")
-    (run_dir / "config.json").write_text(json.dumps(project.training.to_dict(), indent=2), encoding="utf-8")
     result_parser = ResultParser()
 
     try:
+        effective_split = build_effective_split(project.dataset, project.training.split_seed)
+        project.training.apply_model_defaults(len(effective_split.training_ok))
+        manifest = build_dataset_manifest(effective_split.roles(), Path(project.project_path))
+        write_dataset_manifest(run_dir / "dataset_manifest.json", manifest)
+        staged_dataset = stage_effective_split(effective_split, project.dataset, run_dir / "dataset_snapshot")
+        environment = collect_environment_info(Path(project.project_path), project.training.random_seed)
+        (run_dir / "environment.json").write_text(json.dumps(environment, indent=2), encoding="utf-8")
+        (run_dir / "config.json").write_text(json.dumps(project.training.to_dict(), indent=2), encoding="utf-8")
+        emit(
+            {
+                "type": "log",
+                "level": "info",
+                "message": f"Staged deterministic split: {effective_split.counts()}",
+            }
+        )
         emit({"type": "stage", "name": STAGES[1]})
         emit({"type": "progress", "current": 2, "total": len(STAGES)})
         progress_callback = create_training_progress_callback(emit)
         components = service.create_components(
-            dataset=project.dataset,
+            dataset=staged_dataset.training_config,
             config=project.training,
             run_directory=run_dir,
             callbacks=[progress_callback],
+            calibration_mode=True,
         )
         device_note = str(components["device_note"])
         if device_note:
@@ -180,10 +198,28 @@ def run(project_file: Path) -> int:
                     "message": f"{definition.display_name} is zero-shot; skipping Engine.fit",
                 }
             )
+        canonical_checkpoint = resolve_canonical_checkpoint(components["engine"])
+        decision_threshold = extract_decision_threshold(components["model"])
+        emit(
+            {
+                "type": "log",
+                "level": "info",
+                "message": f"Using Anomalib canonical checkpoint: {canonical_checkpoint.path.name}",
+            }
+        )
         emit({"type": "stage", "name": STAGES[5]})
         emit({"type": "progress", "current": 6, "total": len(STAGES)})
         evaluation_started = perf_counter()
-        metrics = components["engine"].test(model=components["model"], datamodule=components["datamodule"])
+        final_test_datamodule = service.create_datamodule(
+            staged_dataset.final_test_config,
+            project.training,
+            calibration_mode=False,
+        )
+        metrics = components["engine"].test(
+            model=components["model"],
+            datamodule=final_test_datamodule,
+            ckpt_path=str(canonical_checkpoint.path),
+        )
         evaluation_duration = perf_counter() - evaluation_started
         metric_payload = metrics[0] if metrics else {}
         run_metrics: dict[str, float | str | None] = {}
@@ -192,6 +228,49 @@ def run(project_file: Path) -> int:
                 value = value.item()
             if isinstance(value, (int, float)):
                 run_metrics[result_parser.normalize_metric_name(str(name))] = value
+                emit({"type": "metric", "name": name, "value": value})
+        emit({"type": "stage", "name": STAGES[6]})
+        final_predictions_output = components["engine"].predict(
+            model=components["model"],
+            datamodule=final_test_datamodule,
+            return_predictions=True,
+            ckpt_path=str(canonical_checkpoint.path),
+        )
+        predictions = []
+        for anomalib_prediction in iter_anomalib_predictions(final_predictions_output):
+            staged_path = anomalib_prediction.image_path
+            source_path = staged_dataset.source_path_by_staged_path.get(staged_path)
+            if source_path is None:
+                raise ValueError(f"Final-test prediction path is not part of the staged dataset: {staged_path}")
+            dataset_role = staged_path.parent.name
+            if dataset_role == "final_test_ok":
+                ground_truth = "OK"
+            elif dataset_role == "final_test_ng":
+                ground_truth = "NG"
+            else:
+                raise ValueError(f"Final-test prediction path has an unexpected staged role: {staged_path}")
+            predictions.append(
+                PredictionResult(
+                    source_path=str(source_path),
+                    predicted_label="NG" if anomalib_prediction.score >= decision_threshold else "OK",
+                    ground_truth_label=ground_truth,
+                    anomaly_score=anomalib_prediction.score,
+                    threshold=decision_threshold,
+                    original_image=str(source_path),
+                    dataset_role=dataset_role,
+                )
+            )
+        expected_prediction_count = sum(effective_split.counts()["final_test"].values())
+        if len(predictions) != expected_prediction_count:
+            raise RuntimeError(
+                f"Final-test prediction count mismatch: expected {expected_prediction_count}, received {len(predictions)}."
+            )
+        result_parser.export_predictions_csv(run_dir / "predictions.csv", predictions)
+        quality_report = calculate_quality_metrics(predictions)
+        run_metrics.update(quality_report.metrics)
+        run_metrics["Quality Status"] = quality_report.status
+        for name, value in quality_report.metrics.items():
+            if isinstance(value, (int, float)):
                 emit({"type": "metric", "name": name, "value": value})
         result_parser.write_training_run(
             run_dir / "results.json",
@@ -203,8 +282,27 @@ def run(project_file: Path) -> int:
                 run_date=str(environment.get("training_date", "")),
                 training_duration_seconds=training_duration,
                 evaluation_duration_seconds=evaluation_duration,
+                final_checkpoint_path=str(canonical_checkpoint.path),
+                final_checkpoint_sha256=canonical_checkpoint.sha256,
+                dataset_manifest_sha256=str(manifest["manifest_sha256"]),
+                quality_status=quality_report.status,
                 metrics=run_metrics,
+                predictions=predictions,
             ),
+        )
+        write_run_manifest(
+            run_dir / "run_manifest.json",
+            canonical_checkpoint=canonical_checkpoint,
+            dataset_manifest_sha256=str(manifest["manifest_sha256"]),
+            split_counts=effective_split.counts(),
+            threshold=decision_threshold,
+            extra={
+                "model": definition.display_name,
+                "config_path": str(run_dir / "config.json"),
+                "environment_path": str(run_dir / "environment.json"),
+                "predictions_path": str(run_dir / "predictions.csv"),
+                "quality_status": quality_report.status,
+            },
         )
         emit({"type": "stage", "name": STAGES[7]})
         emit({"type": "progress", "current": 8, "total": len(STAGES)})

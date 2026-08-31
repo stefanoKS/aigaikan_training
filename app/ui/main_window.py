@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.core.dataset_manager import DatasetManager
+from app.core.dataset_manifest import build_effective_split
 from app.core.dataset_validator import DatasetValidationReport, DatasetValidator
 from app.core.inference_controller import InferenceController
 from app.core.model_registry import ModelExecutionMode, ModelRegistry
@@ -219,9 +220,18 @@ class MainWindow(QMainWindow):
         self.config_page.reset_button.clicked.connect(self._reset_training_config)
         self.config_page.browse_supplemental_button.clicked.connect(self._choose_supplemental_data)
         self.config_page.model_combo.currentIndexChanged.connect(self._update_model_action)
+        self.config_page.model_combo.currentIndexChanged.connect(self._update_estimated_training_steps)
+        self.config_page.batch_size_spin.valueChanged.connect(self._update_estimated_training_steps)
+        self.config_page.max_epochs_spin.valueChanged.connect(self._update_estimated_training_steps)
+        self.config_page.target_training_steps_spin.valueChanged.connect(self._update_estimated_training_steps)
+        self.config_page.seed_spin.valueChanged.connect(self._sync_split_seed_on_initial_edit)
 
         self.results_page.browse_export_directory_button.clicked.connect(self._choose_model_export_directory)
         self.results_page.export_model_button.clicked.connect(self._export_model)
+        self.results_page.export_csv_button.clicked.connect(self._export_results_csv)
+        self.results_page.export_json_button.clicked.connect(self._export_results_json)
+        self.results_page.open_folder_button.clicked.connect(self._open_results_folder)
+        self.results_page.compare_button.clicked.connect(self._compare_results)
 
         self.training_page.start_button.clicked.connect(self._start_training)
         self.training_page.cancel_button.clicked.connect(self.training_controller.cancel)
@@ -312,6 +322,8 @@ class MainWindow(QMainWindow):
             return
 
         exported_lines = [f"{result.export_format.upper()}: {result.exported_path}" for result in report.exported]
+        if report.package_directory is not None:
+            exported_lines.insert(0, f"Deployment package: {report.package_directory}")
         failure_lines = [f"{export_format.upper()}: {message}" for export_format, message in report.failures.items()]
         message = "\n".join([*exported_lines, *failure_lines])
         if report.exported and report.failures:
@@ -320,6 +332,63 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Model Export Completed", message)
         else:
             QMessageBox.warning(self, "Model Export Failed", message or "No model formats were exported.")
+        if self.results_page.current_run is not None:
+            self.results_page.current_run.export_status = "Partial" if report.failures and report.exported else (
+                "Exported" if report.exported else "Failed"
+            )
+            torch_validated = any(result.export_format == "torch" for result in report.exported)
+            self.results_page.current_run.aigaikan_compatibility_status = (
+                "Validated with Anomalib TorchInferencer" if torch_validated else "Torch compatibility not requested"
+            )
+            self.result_parser.write_training_run(
+                run_directory / "results.json",
+                self.results_page.current_run,
+            )
+            self.results_page.set_training_run(self.results_page.current_run)
+
+    def _export_results_csv(self) -> None:
+        run = self.results_page.current_run
+        if run is None:
+            QMessageBox.information(self, "No Training Run", "Complete or load a training run before exporting results.")
+            return
+        selected, _ = QFileDialog.getSaveFileName(self, "Export Results CSV", f"{run.run_name}_predictions.csv", "CSV Files (*.csv)")
+        if selected:
+            self.result_parser.export_predictions_csv(Path(selected), self.results_page.filtered_predictions())
+
+    def _export_results_json(self) -> None:
+        run = self.results_page.current_run
+        if run is None:
+            QMessageBox.information(self, "No Training Run", "Complete or load a training run before exporting results.")
+            return
+        selected, _ = QFileDialog.getSaveFileName(self, "Export Results JSON", f"{run.run_name}_results.json", "JSON Files (*.json)")
+        if selected:
+            self.result_parser.write_training_run(Path(selected), run)
+
+    def _open_results_folder(self) -> None:
+        directory = self.results_page.current_run_directory
+        if directory is None:
+            QMessageBox.information(self, "No Training Run", "Complete or load a training run before opening results.")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(directory)))
+
+    def _compare_results(self) -> None:
+        run = self.results_page.current_run
+        if run is None:
+            QMessageBox.information(self, "No Training Run", "Complete or load a training run before comparing results.")
+            return
+        selected, _ = QFileDialog.getOpenFileName(self, "Select Results JSON to Compare", "", "JSON Files (*.json)")
+        if not selected:
+            return
+        try:
+            comparison = self.result_parser.read_training_run(Path(selected))
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Could Not Compare Runs", str(exc))
+            return
+        shared_metric_names = sorted(set(run.metrics) & set(comparison.metrics))
+        lines = [f"Current: {run.run_name}", f"Compared: {comparison.run_name}"]
+        for name in shared_metric_names:
+            lines.append(f"{name}: {run.metrics[name]} | {comparison.metrics[name]}")
+        QMessageBox.information(self, "Run Comparison", "\n".join(lines))
 
     def _add_recent_project(self, project: ProjectConfig) -> None:
         for index in range(self.home_page.recent_projects_list.count()):
@@ -432,6 +501,20 @@ class MainWindow(QMainWindow):
         self.dataset_page.validation_summary.setPlainText(
             f"{len(report.errors)} error(s), {len(report.warnings)} warning(s)."
         )
+        try:
+            split = build_effective_split(project.dataset, project.training.split_seed)
+            counts = split.counts()
+            self.dataset_page.effective_split_summary.setPlainText(
+                "Training\n"
+                f"OK: {counts['training']['ok']}\n\n"
+                "Validation\n"
+                f"OK: {counts['validation']['ok']}  NG: {counts['validation']['ng']}\n\n"
+                "Final Test\n"
+                f"OK: {counts['final_test']['ok']}  NG: {counts['final_test']['ng']}\n\n"
+                f"Split Seed: {split.seed}"
+            )
+        except ValueError as exc:
+            self.dataset_page.effective_split_summary.setPlainText(f"Split unavailable: {exc}")
         self._save_project(show_dialog=False)
         self._refresh_dataset_page()
         if show_dialog:
@@ -508,6 +591,8 @@ class MainWindow(QMainWindow):
         config.gradient_clip_val = self.config_page.gradient_clip_spin.value()
         config.accumulate_grad_batches = self.config_page.accumulate_grad_batches_spin.value()
         config.random_seed = self.config_page.seed_spin.value()
+        config.split_seed = self.config_page.split_seed_spin.value()
+        config.target_training_steps = self.config_page.target_training_steps_spin.value()
         config.coreset_sampling_ratio = self.config_page.coreset_ratio_spin.value()
         config.num_neighbors = self.config_page.neighbors_spin.value()
         config.num_workers = self.config_page.workers_spin.value()
@@ -517,6 +602,7 @@ class MainWindow(QMainWindow):
         config.dinomaly_context_recentering = self.config_page.dinomaly_context_recentering_check.isChecked()
         config.supplemental_data_path = self.config_page.supplemental_path_edit.text().strip()
         config.zero_shot_class_name = self.config_page.zero_shot_class_name_edit.text().strip()
+        config.apply_model_defaults(self._training_image_count())
         try:
             config.validate()
         except ValueError as exc:
@@ -546,6 +632,7 @@ class MainWindow(QMainWindow):
         self.config_page.gradient_clip_spin.setValue(config.gradient_clip_val)
         self.config_page.accumulate_grad_batches_spin.setValue(config.accumulate_grad_batches)
         self.config_page.seed_spin.setValue(config.random_seed)
+        self.config_page.split_seed_spin.setValue(config.split_seed)
         self.config_page.coreset_ratio_spin.setValue(config.coreset_sampling_ratio)
         self.config_page.neighbors_spin.setValue(config.num_neighbors)
         self.config_page.workers_spin.setValue(config.num_workers)
@@ -553,12 +640,44 @@ class MainWindow(QMainWindow):
         self.config_page.dinomaly_encoder_combo.setCurrentIndex(max(encoder_index, 0))
         self.config_page.dinomaly_decoder_depth_spin.setValue(config.dinomaly_decoder_depth)
         self.config_page.dinomaly_dropout_spin.setValue(config.dinomaly_bottleneck_dropout)
+        self.config_page.target_training_steps_spin.setValue(config.target_training_steps)
         self.config_page.dinomaly_context_recentering_check.setChecked(config.dinomaly_context_recentering)
         self.config_page.supplemental_path_edit.setText(config.supplemental_data_path)
         self.config_page.zero_shot_class_name_edit.setText(config.zero_shot_class_name)
         self.training_page.active_model_label.setText(definition.display_name)
         self.training_page.active_device_label.setText(config.device.value)
         self._update_model_action()
+        self._update_estimated_training_steps()
+
+    def _training_image_count(self) -> int:
+        """Return the deterministic training subset size when project data is available."""
+        project = self.current_project
+        if project is None:
+            return 1
+        try:
+            return len(build_effective_split(project.dataset, project.training.split_seed).training_ok)
+        except ValueError:
+            return max(project.dataset.folders[DatasetRole.OK_TRAIN].image_count, 1)
+
+    def _update_estimated_training_steps(self) -> None:
+        """Keep the UI estimate aligned with the selected model and saved default policy."""
+        model_key = str(self.config_page.model_combo.currentData())
+        config = TrainingConfig(
+            model_name=model_key,
+            batch_size=self.config_page.batch_size_spin.value(),
+            max_epochs=self.config_page.max_epochs_spin.value(),
+            target_training_steps=self.config_page.target_training_steps_spin.value(),
+        )
+        config.apply_model_defaults(self._training_image_count())
+        self.config_page.set_estimated_training_steps(
+            config.estimated_training_steps(self._training_image_count()),
+            config.max_epochs,
+        )
+
+    def _sync_split_seed_on_initial_edit(self) -> None:
+        """Keep new projects deterministic until a user deliberately changes the split seed."""
+        if self.config_page.split_seed_spin.value() == 42:
+            self.config_page.split_seed_spin.setValue(self.config_page.seed_spin.value())
 
     def _choose_supplemental_data(self) -> None:
         try:

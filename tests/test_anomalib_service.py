@@ -31,6 +31,10 @@ def test_dinomaly_uses_selected_folders_and_omits_missing_masks(tmp_path: Path, 
         def __init__(self, **kwargs) -> None:
             self.kwargs = kwargs
 
+        @staticmethod
+        def configure_pre_processor(**kwargs) -> dict[str, object]:
+            return kwargs
+
     class FakeDinomaly:
         def __init__(self, **kwargs) -> None:
             self.kwargs = kwargs
@@ -68,7 +72,8 @@ def test_dinomaly_uses_selected_folders_and_omits_missing_masks(tmp_path: Path, 
     assert folder_calls["normal_dir"] == ok_folder.resolve()
     assert folder_calls["abnormal_dir"] == ng_folder.resolve()
     assert folder_calls["mask_dir"] is None
-    assert "test_split_mode" not in folder_calls
+    assert folder_calls["test_split_mode"] == "from_dir"
+    assert folder_calls["val_split_mode"] == "none"
 
 
 def test_generic_image_model_uses_the_catalog_class(tmp_path: Path, monkeypatch) -> None:
@@ -115,6 +120,74 @@ def test_generic_image_model_uses_the_catalog_class(tmp_path: Path, monkeypatch)
     assert components["engine"].kwargs["callbacks"] == ["progress-callback"]
     assert components["engine"].kwargs["max_epochs"] == 1
     assert components["engine"].kwargs["check_val_every_n_epoch"] == 1
+
+
+def test_patchcore_uses_anomalib_owned_model_input_preprocessing(tmp_path: Path, monkeypatch) -> None:
+    """The UI model-input dimensions must configure PatchCore's preprocessor once."""
+    class FakeFolder:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+    class FakeEngine:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+    class FakePatchcore:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+        @staticmethod
+        def configure_pre_processor(**kwargs) -> dict[str, object]:
+            return kwargs
+
+    anomalib_data = ModuleType("anomalib.data")
+    anomalib_engine = ModuleType("anomalib.engine")
+    anomalib_models = ModuleType("anomalib.models")
+    anomalib_data.Folder = FakeFolder
+    anomalib_engine.Engine = FakeEngine
+    anomalib_models.Patchcore = FakePatchcore
+    monkeypatch.setitem(sys.modules, "anomalib.data", anomalib_data)
+    monkeypatch.setitem(sys.modules, "anomalib.engine", anomalib_engine)
+    monkeypatch.setitem(sys.modules, "anomalib.models", anomalib_models)
+
+    ok_folder = tmp_path / "ok"
+    ng_folder = tmp_path / "ng"
+    ok_folder.mkdir()
+    ng_folder.mkdir()
+    dataset = DatasetConfig()
+    dataset.folders[DatasetRole.OK_TRAIN].path = str(ok_folder)
+    dataset.folders[DatasetRole.NG_TEST].path = str(ng_folder)
+    config = TrainingConfig(model_name="patchcore", image_width=280, image_height=280, device=DeviceMode.CPU)
+
+    components = AnomalibService().create_components(dataset, config)
+
+    assert components["model"].kwargs["pre_processor"] == {"image_size": (280, 280)}
+
+
+def test_calibration_datamodule_never_splits_the_final_test_subset(tmp_path: Path, monkeypatch) -> None:
+    """Calibration reuses its own held-out snapshot rather than splitting it again."""
+    class FakeFolder:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+    anomalib_data = ModuleType("anomalib.data")
+    anomalib_data.Folder = FakeFolder
+    monkeypatch.setitem(sys.modules, "anomalib.data", anomalib_data)
+    for folder_name in ("ok_train", "ok_test", "ng_test"):
+        (tmp_path / folder_name).mkdir()
+    dataset = DatasetConfig()
+    dataset.folders[DatasetRole.OK_TRAIN].path = str(tmp_path / "ok_train")
+    dataset.folders[DatasetRole.OK_TEST].path = str(tmp_path / "ok_test")
+    dataset.folders[DatasetRole.NG_TEST].path = str(tmp_path / "ng_test")
+
+    datamodule = AnomalibService().create_datamodule(
+        dataset,
+        TrainingConfig(device=DeviceMode.CPU),
+        calibration_mode=True,
+    )
+
+    assert datamodule.kwargs["test_split_mode"] == "from_dir"
+    assert datamodule.kwargs["val_split_mode"] == "same_as_test"
 
 
 def test_video_model_is_rejected_for_image_folder_projects() -> None:

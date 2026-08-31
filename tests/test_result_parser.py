@@ -5,10 +5,10 @@ from __future__ import annotations
 from pathlib import Path
 
 from app.core.result_parser import ResultParser
+from app.core.run_artifacts import CanonicalCheckpoint, read_canonical_checkpoint, read_persisted_threshold, write_run_manifest
 from app.models.prediction_result import PredictionResult
 from app.models.training_run import TrainingRun
-from app.workers.inference_worker import _count_images, _find_checkpoint
-from app.workers.inference_worker import _threshold_from_model
+from app.workers.inference_worker import _count_images
 
 
 def test_parse_worker_json_messages() -> None:
@@ -66,27 +66,31 @@ def test_write_and_read_training_run(tmp_path: Path) -> None:
     assert restored.metrics == {"Image AUROC": 1.0, "Image F1": 0.98}
 
 
-def test_inference_worker_finds_checkpoint_and_counts_images(tmp_path: Path) -> None:
+def test_inference_worker_uses_manifest_checkpoint_and_counts_images(tmp_path: Path) -> None:
     checkpoint = tmp_path / "Padim" / "custom" / "latest" / "weights" / "lightning" / "model.ckpt"
     checkpoint.parent.mkdir(parents=True)
     checkpoint.touch()
     (tmp_path / "images").mkdir()
     (tmp_path / "images" / "one.png").touch()
     (tmp_path / "images" / "ignored.txt").touch()
+    write_run_manifest(
+        tmp_path / "run_manifest.json",
+        canonical_checkpoint=CanonicalCheckpoint(checkpoint.resolve(), ""),
+        dataset_manifest_sha256="a" * 64,
+        split_counts={"final_test": {"ok": 1, "ng": 1}},
+        threshold=128.47,
+    )
 
-    assert _find_checkpoint(tmp_path) == checkpoint
+    checkpoint.write_text("checkpoint", encoding="utf-8")
+    canonical = CanonicalCheckpoint(checkpoint.resolve(), __import__("hashlib").sha256(b"checkpoint").hexdigest())
+    write_run_manifest(
+        tmp_path / "run_manifest.json",
+        canonical_checkpoint=canonical,
+        dataset_manifest_sha256="a" * 64,
+        split_counts={"final_test": {"ok": 1, "ng": 1}},
+        threshold=128.47,
+    )
+    assert read_canonical_checkpoint(tmp_path) == canonical
+    assert read_persisted_threshold(tmp_path) == 128.47
     assert _count_images(tmp_path / "images") == 1
-
-
-def test_inference_worker_uses_normalized_threshold_for_display() -> None:
-    class Threshold:
-        value = 128.47
-
-    class PostProcessor:
-        image_threshold = Threshold()
-
-    class Model:
-        post_processor = PostProcessor()
-
-    assert _threshold_from_model(Model()) == 0.5
 

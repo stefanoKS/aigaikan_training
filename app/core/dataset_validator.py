@@ -44,6 +44,7 @@ class DatasetValidator:
     MIN_OK_TRAIN_IMAGES = 2
     MIN_NG_TEST_IMAGES = 1
     REQUIRED_ROLES = (DatasetRole.OK_TRAIN, DatasetRole.NG_TEST)
+    OPTIONAL_ROLES = (DatasetRole.OK_VALIDATION, DatasetRole.NG_VALIDATION, DatasetRole.OK_TEST, DatasetRole.MASKS)
 
     def validate(self, config: DatasetConfig) -> DatasetValidationReport:
         """Validate all configured dataset folders."""
@@ -60,6 +61,8 @@ class DatasetValidator:
             self._validate_folder(role, path, report, role_files)
 
         self._validate_counts(role_files, report)
+        self._validate_cross_role_duplicates(role_files, report)
+        self._validate_source_resolution(role_files, report)
         self._validate_masks(config, role_files, report)
         return report
 
@@ -71,7 +74,7 @@ class DatasetValidator:
         role_files: dict[DatasetRole, list[Path]],
     ) -> None:
         if not path.exists():
-            if role is DatasetRole.MASKS:
+            if role in self.OPTIONAL_ROLES:
                 return
             report.errors.append(ValidationIssue("error", role.value, "Folder does not exist", str(path)))
             return
@@ -82,6 +85,10 @@ class DatasetValidator:
         all_files = sorted(item for item in path.iterdir() if item.is_file())
         if not all_files:
             if role is DatasetRole.MASKS:
+                role_files[role] = []
+                return
+            if role in self.OPTIONAL_ROLES:
+                report.warnings.append(ValidationIssue("warning", role.value, "Optional folder is empty", str(path)))
                 role_files[role] = []
                 return
             report.errors.append(ValidationIssue("error", role.value, "Folder is empty", str(path)))
@@ -160,6 +167,80 @@ class DatasetValidator:
             report.errors.append(
                 ValidationIssue("error", DatasetRole.NG_TEST.value, "Insufficient NG test images")
             )
+        if len(role_files.get(DatasetRole.OK_TRAIN, [])) < 20:
+            report.warnings.append(
+                ValidationIssue(
+                    "warning",
+                    DatasetRole.OK_TRAIN.value,
+                    "Very small OK training set; production confidence will be limited",
+                )
+            )
+        if len(role_files.get(DatasetRole.NG_TEST, [])) < 10:
+            report.warnings.append(
+                ValidationIssue(
+                    "warning",
+                    DatasetRole.NG_TEST.value,
+                    "Very small NG test set; production confidence will be limited",
+                )
+            )
+
+    @staticmethod
+    def _validate_cross_role_duplicates(
+        role_files: dict[DatasetRole, list[Path]],
+        report: DatasetValidationReport,
+    ) -> None:
+        """Reject source files whose bytes appear in more than one data split role."""
+        hashes: dict[str, tuple[DatasetRole, Path]] = {}
+        names: dict[str, tuple[DatasetRole, Path]] = {}
+        for role, paths in role_files.items():
+            if role is DatasetRole.MASKS:
+                continue
+            for path in paths:
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                previous = hashes.get(digest)
+                if previous is not None and previous[0] is not role:
+                    report.errors.append(
+                        ValidationIssue(
+                            "error",
+                            role.value,
+                            f"Cross-split duplicate content matches {previous[0].value}/{previous[1].name}",
+                            str(path),
+                        )
+                    )
+                else:
+                    hashes[digest] = (role, path)
+                name_key = path.name.casefold()
+                previous_name = names.get(name_key)
+                if previous_name is not None and previous_name[0] is not role:
+                    report.warnings.append(
+                        ValidationIssue(
+                            "warning",
+                            role.value,
+                            f"Cross-split duplicate filename matches {previous_name[0].value}/{previous_name[1].name}",
+                            str(path),
+                        )
+                    )
+                else:
+                    names[name_key] = (role, path)
+
+    @staticmethod
+    def _validate_source_resolution(
+        role_files: dict[DatasetRole, list[Path]],
+        report: DatasetValidationReport,
+    ) -> None:
+        """Ensure source image resolution is consistent across train/validation/test roles."""
+        resolutions: dict[tuple[int, int], Path] = {}
+        for role, paths in role_files.items():
+            if role is DatasetRole.MASKS:
+                continue
+            for path in paths:
+                with Image.open(path) as image:
+                    resolutions.setdefault(image.size, path)
+        if len(resolutions) > 1:
+            details = ", ".join(f"{width}x{height}" for width, height in sorted(resolutions))
+            report.errors.append(
+                ValidationIssue("error", "dataset", f"Inconsistent source resolutions: {details}")
+            )
 
     def _validate_masks(
         self,
@@ -167,7 +248,10 @@ class DatasetValidator:
         role_files: dict[DatasetRole, list[Path]],
         report: DatasetValidationReport,
     ) -> None:
-        ng_files = role_files.get(DatasetRole.NG_TEST, [])
+        ng_files = [
+            *role_files.get(DatasetRole.NG_VALIDATION, []),
+            *role_files.get(DatasetRole.NG_TEST, []),
+        ]
         mask_files = role_files.get(DatasetRole.MASKS, [])
         if not mask_files:
             if ng_files:

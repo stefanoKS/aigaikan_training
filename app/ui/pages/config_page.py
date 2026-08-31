@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.core.model_registry import ModelExecutionMode, ModelRegistry
+from app.core.model_registry import ModelExecutionMode, ModelRegistry, ModelSupportLevel
 
 
 class ConfigPage(QWidget):
@@ -35,12 +35,8 @@ class ConfigPage(QWidget):
         basic_form = QFormLayout(basic_group)
         self.model_combo = QComboBox()
         self.model_combo.setMinimumContentsLength(28)
-        for definition in self.model_registry.all():
-            self.model_combo.addItem(definition.display_name, definition.key)
-            item = getattr(self.model_combo.model(), "item", lambda _index: None)(self.model_combo.count() - 1)
-            if item is not None:
-                item.setEnabled(definition.supports_image_folder)
-                item.setToolTip(definition.requirement or "Supported image-folder model")
+        self.show_experimental_models_check = QCheckBox("Show experimental models")
+        self._populate_models()
         self.model_support_label = QLabel()
         self.model_support_label.setObjectName("ModelSupport")
         self.model_support_label.setWordWrap(True)
@@ -48,23 +44,27 @@ class ConfigPage(QWidget):
         self.device_combo.addItems(["Auto", "CUDA", "CPU"])
         self.image_width_spin = QSpinBox()
         self.image_width_spin.setRange(32, 8192)
-        self.image_width_spin.setValue(256)
+        self.image_width_spin.setValue(280)
         self.image_height_spin = QSpinBox()
         self.image_height_spin.setRange(32, 8192)
-        self.image_height_spin.setValue(256)
+        self.image_height_spin.setValue(280)
         self.batch_size_spin = QSpinBox()
         self.batch_size_spin.setRange(1, 512)
         self.batch_size_spin.setValue(8)
         self.seed_spin = QSpinBox()
         self.seed_spin.setRange(0, 999999)
         self.seed_spin.setValue(42)
+        self.split_seed_spin = QSpinBox()
+        self.split_seed_spin.setRange(0, 999999)
+        self.split_seed_spin.setValue(42)
         basic_form.addRow("Model", self.model_combo)
+        basic_form.addRow("Advanced", self.show_experimental_models_check)
         basic_form.addRow("Compatibility", self.model_support_label)
         basic_form.addRow("Device", self.device_combo)
-        basic_form.addRow("Image Width", self.image_width_spin)
-        basic_form.addRow("Image Height", self.image_height_spin)
-        basic_form.addRow("Batch Size", self.batch_size_spin)
+        basic_form.addRow("AI Input Width", self.image_width_spin)
+        basic_form.addRow("AI Input Height", self.image_height_spin)
         basic_form.addRow("Random Seed", self.seed_spin)
+        basic_form.addRow("Split Seed", self.split_seed_spin)
         self.workers_spin = QSpinBox()
         self.workers_spin.setRange(0, 64)
         self.workers_spin.setValue(0)
@@ -76,6 +76,8 @@ class ConfigPage(QWidget):
         self.max_epochs_spin = QSpinBox()
         self.max_epochs_spin.setRange(1, 10000)
         self.max_epochs_spin.setValue(1)
+        self.estimated_steps_label = QLabel("-")
+        self.estimated_steps_label.setObjectName("EstimatedSteps")
         self.validation_every_n_epochs_spin = QSpinBox()
         self.validation_every_n_epochs_spin.setRange(1, 10000)
         self.validation_every_n_epochs_spin.setValue(1)
@@ -88,7 +90,9 @@ class ConfigPage(QWidget):
         self.accumulate_grad_batches_spin = QSpinBox()
         self.accumulate_grad_batches_spin.setRange(1, 1024)
         self.accumulate_grad_batches_spin.setValue(1)
+        trainer_form.addRow("Batch Size", self.batch_size_spin)
         trainer_form.addRow("Max Epochs", self.max_epochs_spin)
+        trainer_form.addRow("Estimated Training Steps", self.estimated_steps_label)
         trainer_form.addRow("Validate Every (Epochs)", self.validation_every_n_epochs_spin)
         trainer_form.addRow("Gradient Clip Norm", self.gradient_clip_spin)
         trainer_form.addRow("Accumulate Batches", self.accumulate_grad_batches_spin)
@@ -126,9 +130,9 @@ class ConfigPage(QWidget):
         self.dinomaly_encoder_combo = QComboBox()
         self.dinomaly_encoder_combo.addItems(
             [
-                "vit_small_patch16_dinov3.lvd1689m",
-                "vit_base_patch16_dinov3.lvd1689m",
-                "vit_large_patch16_dinov3.lvd1689m",
+                "vit_small_patch14_reg4_dinov2",
+                "vit_base_patch14_reg4_dinov2",
+                "vit_large_patch14_reg4_dinov2",
             ]
         )
         self.dinomaly_decoder_depth_spin = QSpinBox()
@@ -138,10 +142,15 @@ class ConfigPage(QWidget):
         self.dinomaly_dropout_spin.setRange(0.0, 0.99)
         self.dinomaly_dropout_spin.setSingleStep(0.05)
         self.dinomaly_dropout_spin.setValue(0.2)
+        self.target_training_steps_spin = QSpinBox()
+        self.target_training_steps_spin.setRange(1000, 1000000)
+        self.target_training_steps_spin.setSingleStep(500)
+        self.target_training_steps_spin.setValue(3000)
         self.dinomaly_context_recentering_check = QCheckBox()
-        dinomaly_form.addRow("DINOv3 Encoder", self.dinomaly_encoder_combo)
+        dinomaly_form.addRow("DINOv2 Encoder", self.dinomaly_encoder_combo)
         dinomaly_form.addRow("Decoder Depth", self.dinomaly_decoder_depth_spin)
         dinomaly_form.addRow("Bottleneck Dropout", self.dinomaly_dropout_spin)
+        dinomaly_form.addRow("Target Training Steps", self.target_training_steps_spin)
         dinomaly_form.addRow("Context Recentering", self.dinomaly_context_recentering_check)
         root.addWidget(self.dinomaly_group)
 
@@ -157,7 +166,35 @@ class ConfigPage(QWidget):
         root.addLayout(button_row)
         root.addStretch(1)
         self.model_combo.currentIndexChanged.connect(self._update_model_support)
+        self.show_experimental_models_check.toggled.connect(self._populate_models)
         self._update_model_support()
+
+    def set_estimated_training_steps(self, steps: int, epochs: int) -> None:
+        """Show the model-adjusted optimizer work without changing layout width."""
+        self.estimated_steps_label.setText(f"{steps:,} steps ({epochs:,} epochs)")
+
+    def _populate_models(self) -> None:
+        """Keep production-validated models prominent while retaining experimental access."""
+        current_key = str(self.model_combo.currentData())
+        definitions = self.model_registry.image_folder_models()
+        if not self.show_experimental_models_check.isChecked():
+            definitions = [
+                definition
+                for definition in definitions
+                if definition.support_level is ModelSupportLevel.PRODUCTION_VALIDATED
+            ]
+        self.model_combo.blockSignals(True)
+        self.model_combo.clear()
+        for definition in definitions:
+            self.model_combo.addItem(definition.display_name, definition.key)
+            item = getattr(self.model_combo.model(), "item", lambda _index: None)(self.model_combo.count() - 1)
+            if item is not None:
+                item.setToolTip(definition.requirement or definition.support_level.replace("-", " ").title())
+        index = self.model_combo.findData(current_key)
+        self.model_combo.setCurrentIndex(max(index, 0))
+        self.model_combo.blockSignals(False)
+        if hasattr(self, "model_support_label"):
+            self._update_model_support()
 
     def _update_model_support(self) -> None:
         """Describe the currently selected model's project compatibility."""
@@ -172,7 +209,7 @@ class ConfigPage(QWidget):
             if definition.execution_mode is ModelExecutionMode.EVALUATE
             else "Train and evaluate"
         )
-        details = [data_contract, execution]
+        details = [data_contract, execution, definition.support_level.replace("-", " ").title()]
         if definition.requirement:
             details.append(definition.requirement)
         self.model_support_label.setText(" | ".join(details))
@@ -185,6 +222,9 @@ class ConfigPage(QWidget):
         is_training_model = self._model_definitions[model_key].execution_mode is ModelExecutionMode.TRAIN
         self.trainer_group.setEnabled(is_training_model)
         self.trainer_group.setTitle("Trainer Settings" if is_training_model else "Trainer Settings (Not used for zero-shot evaluation)")
+        is_patchcore = model_key == "patchcore"
+        self.max_epochs_spin.setValue(1 if is_patchcore else self.max_epochs_spin.value())
+        self.max_epochs_spin.setEnabled(not is_patchcore and is_training_model)
 
         supplemental_models = {
             "draem": ("DRAEM Resources", "Required DTD texture dataset folder"),

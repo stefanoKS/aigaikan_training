@@ -21,8 +21,11 @@ class DatasetPage(QWidget):
     """Dataset management UI."""
 
     ROLES = (
-        ("OK Folder", "ok_train"),
-        ("NG Folder", "ng_test"),
+        ("OK Train Folder", "ok_train"),
+        ("OK Validation Folder (Optional)", "ok_validation"),
+        ("NG Validation Folder (Optional)", "ng_validation"),
+        ("OK Final Test Folder (Optional)", "ok_test"),
+        ("NG Final Test Folder", "ng_test"),
         ("NG Mask Folder (Optional)", "masks"),
     )
 
@@ -67,7 +70,7 @@ class DatasetPage(QWidget):
             form.addRow("Folder Path", path_label)
             form.addRow("Image Count", count_label)
             form.addRow("Invalid Images", invalid_label)
-            form.addRow("Typical Resolution", resolution_label)
+            form.addRow("Source Resolution", resolution_label)
             form.addRow("Color Mode", color_label)
             button_row = QHBoxLayout()
             button_row.addWidget(import_button)
@@ -102,10 +105,14 @@ class DatasetPage(QWidget):
         self.validation_table.setHorizontalHeaderLabels(["Level", "Role", "Message", "Path"])
         self.validation_summary = QTextEdit()
         self.validation_summary.setReadOnly(True)
+        self.effective_split_summary = QTextEdit()
+        self.effective_split_summary.setReadOnly(True)
         right_layout.addWidget(QLabel("Dataset Validation"))
         right_layout.addWidget(self.validation_table, stretch=2)
         right_layout.addWidget(QLabel("Summary"))
         right_layout.addWidget(self.validation_summary, stretch=1)
+        right_layout.addWidget(QLabel("Effective Split"))
+        right_layout.addWidget(self.effective_split_summary, stretch=1)
         splitter.addWidget(right_column)
         root.addWidget(splitter, stretch=1)
 

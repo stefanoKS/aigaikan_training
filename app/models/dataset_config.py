@@ -14,6 +14,8 @@ class DatasetRole(StrEnum):
     """Supported dataset roles."""
 
     OK_TRAIN = "ok_train"
+    OK_VALIDATION = "ok_validation"
+    NG_VALIDATION = "ng_validation"
     OK_TEST = "ok_test"
     NG_TEST = "ng_test"
     MASKS = "masks"
@@ -72,7 +74,7 @@ class DatasetConfig:
     folders: dict[DatasetRole, ImportedFolder] = field(
         default_factory=lambda: {
             role: ImportedFolder(role=role)
-            for role in (DatasetRole.OK_TRAIN, DatasetRole.OK_TEST, DatasetRole.NG_TEST, DatasetRole.MASKS)
+            for role in DatasetRole
         }
     )
 
@@ -85,6 +87,6 @@ class DatasetConfig:
         """Deserialize the configuration."""
         folders = {
             role: ImportedFolder.from_dict(payload.get(role.value, {"role": role.value}))
-            for role in (DatasetRole.OK_TRAIN, DatasetRole.OK_TEST, DatasetRole.NG_TEST, DatasetRole.MASKS)
+            for role in DatasetRole
         }
         return cls(folders=folders)

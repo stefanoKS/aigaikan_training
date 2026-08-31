@@ -20,6 +20,13 @@ class ModelExecutionMode(StrEnum):
     EVALUATE = "evaluate"
 
 
+class ModelSupportLevel(StrEnum):
+    """Validation status of a selectable model."""
+
+    PRODUCTION_VALIDATED = "production-validated"
+    EXPERIMENTAL = "experimental"
+
+
 @dataclass(frozen=True, slots=True)
 class ModelDefinition:
     """Descriptor for a model exported by Anomalib."""
@@ -31,6 +38,7 @@ class ModelDefinition:
     execution_mode: ModelExecutionMode = ModelExecutionMode.TRAIN
     requirement: str = ""
     supports_export: bool = True
+    support_level: ModelSupportLevel = ModelSupportLevel.EXPERIMENTAL
 
     @property
     def supports_image_folder(self) -> bool:
@@ -47,7 +55,12 @@ class ModelRegistry:
     """
 
     _MODEL_DEFINITIONS = (
-        ModelDefinition("patchcore", "PatchCore", "Patchcore"),
+        ModelDefinition(
+            "patchcore",
+            "PatchCore",
+            "Patchcore",
+            support_level=ModelSupportLevel.PRODUCTION_VALIDATED,
+        ),
         ModelDefinition("padim", "PaDiM", "Padim"),
         ModelDefinition("cfa", "CFA", "Cfa"),
         ModelDefinition("cflow", "CFlow", "Cflow"),
@@ -76,7 +89,12 @@ class ModelRegistry:
         ModelDefinition("l2bt", "L2BT", "L2BT"),
         ModelDefinition("cfm", "CFM", "CFM", requirement="Requires PointMAE weights."),
         ModelDefinition("anomaly_dino", "AnomalyDINO", "AnomalyDINO"),
-        ModelDefinition("dinomaly", "Dinomaly (DINOv3)", "Dinomaly"),
+        ModelDefinition(
+            "dinomaly",
+            "Dinomaly",
+            "Dinomaly",
+            support_level=ModelSupportLevel.PRODUCTION_VALIDATED,
+        ),
         ModelDefinition("inpformer", "INP-Former", "InpFormer"),
         ModelDefinition(
             "superadd",
@@ -136,6 +154,14 @@ class ModelRegistry:
     def image_folder_models(self) -> list[ModelDefinition]:
         """Return models compatible with this application's folder dataset."""
         return [definition for definition in self._MODEL_DEFINITIONS if definition.supports_image_folder]
+
+    def production_models(self) -> list[ModelDefinition]:
+        """Return the models that completed the production validation contract."""
+        return [
+            definition
+            for definition in self.image_folder_models()
+            if definition.support_level is ModelSupportLevel.PRODUCTION_VALIDATED
+        ]
 
     def get(self, identifier: str) -> ModelDefinition:
         """Get a definition by stored key, display name, or Anomalib class name."""

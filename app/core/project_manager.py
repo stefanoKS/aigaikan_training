@@ -22,6 +22,8 @@ class ProjectManager:
     PROJECT_FILE_NAME = "project.json"
     REQUIRED_DIRECTORIES = (
         "dataset/ok_train",
+        "dataset/ok_validation",
+        "dataset/ng_validation",
         "dataset/ok_test",
         "dataset/ng_test",
         "dataset/masks",

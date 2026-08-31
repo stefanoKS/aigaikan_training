@@ -18,6 +18,7 @@ class PredictionResult:
     original_image: str = ""
     anomaly_map: str = ""
     overlay_image: str = ""
+    dataset_role: str = ""
 
     def classification_bucket(self) -> str:
         """Return the result bucket."""
@@ -35,4 +36,5 @@ class PredictionResult:
         """Serialize the result."""
         payload = asdict(self)
         payload["classification_bucket"] = self.classification_bucket()
+        payload["correct"] = payload["classification_bucket"] in {"Correct OK", "Correct NG"}
         return payload

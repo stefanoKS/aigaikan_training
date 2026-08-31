@@ -85,14 +85,15 @@ class ResultParser:
             reader = csv.DictReader(handle)
             return [
                 PredictionResult(
-                    source_path=row.get("source_path", ""),
-                    predicted_label=row.get("predicted_label", ""),
-                    ground_truth_label=row.get("ground_truth_label", ""),
-                    anomaly_score=float(row.get("anomaly_score", 0.0)),
+                    source_path=row.get("image_path", row.get("source_path", "")),
+                    predicted_label=row.get("prediction", row.get("predicted_label", "")),
+                    ground_truth_label=row.get("ground_truth", row.get("ground_truth_label", "")),
+                    anomaly_score=float(row.get("score", row.get("anomaly_score", 0.0))),
                     threshold=float(row.get("threshold", 0.0)),
                     original_image=row.get("original_image", ""),
                     anomaly_map=row.get("anomaly_map", ""),
                     overlay_image=row.get("overlay_image", ""),
+                    dataset_role=row.get("dataset_role", ""),
                 )
                 for row in reader
             ]
@@ -115,6 +116,7 @@ class ResultParser:
                 original_image=str(item.get("original_image", "")),
                 anomaly_map=str(item.get("anomaly_map", "")),
                 overlay_image=str(item.get("overlay_image", "")),
+                dataset_role=str(item.get("dataset_role", "")),
             )
             for item in payload.get("predictions", [])
             if isinstance(item, dict)
@@ -128,6 +130,12 @@ class ResultParser:
             run_date=str(payload.get("run_date", "")),
             training_duration_seconds=float(payload.get("training_duration_seconds", 0.0)),
             evaluation_duration_seconds=float(payload.get("evaluation_duration_seconds", 0.0)),
+            final_checkpoint_path=str(payload.get("final_checkpoint_path", "")),
+            final_checkpoint_sha256=str(payload.get("final_checkpoint_sha256", "")),
+            dataset_manifest_sha256=str(payload.get("dataset_manifest_sha256", "")),
+            quality_status=str(payload.get("quality_status", "")),
+            export_status=str(payload.get("export_status", "Not exported")),
+            aigaikan_compatibility_status=str(payload.get("aigaikan_compatibility_status", "Not validated")),
             metrics=metrics if isinstance(metrics, dict) else {},
             predictions=predictions,
         )
@@ -135,11 +143,13 @@ class ResultParser:
     def export_predictions_csv(self, path: Path, predictions: list[PredictionResult]) -> Path:
         """Export prediction rows to a CSV file."""
         fieldnames = [
-            "source_path",
-            "predicted_label",
-            "ground_truth_label",
-            "anomaly_score",
+            "image_path",
+            "dataset_role",
+            "ground_truth",
+            "prediction",
+            "score",
             "threshold",
+            "correct",
             "original_image",
             "anomaly_map",
             "overlay_image",
@@ -149,6 +159,21 @@ class ResultParser:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
             writer.writeheader()
             for prediction in predictions:
-                writer.writerow(prediction.to_dict())
+                payload = prediction.to_dict()
+                writer.writerow(
+                    {
+                        "image_path": payload["source_path"],
+                        "dataset_role": payload["dataset_role"],
+                        "ground_truth": payload["ground_truth_label"],
+                        "prediction": payload["predicted_label"],
+                        "score": payload["anomaly_score"],
+                        "threshold": payload["threshold"],
+                        "correct": payload["correct"],
+                        "original_image": payload["original_image"],
+                        "anomaly_map": payload["anomaly_map"],
+                        "overlay_image": payload["overlay_image"],
+                        "classification_bucket": payload["classification_bucket"],
+                    }
+                )
         return path
 
