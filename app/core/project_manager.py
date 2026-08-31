@@ -7,7 +7,7 @@ import logging
 import shutil
 from datetime import datetime
 from pathlib import Path
-from tempfile import NamedTemporaryFile
+from tempfile import NamedTemporaryFile, TemporaryDirectory
 from typing import Any
 
 from app.models.project_config import ProjectConfig
@@ -35,6 +35,9 @@ class ProjectManager:
 
     def create_project(self, project_name: str, parent_directory: Path | None = None) -> ProjectConfig:
         """Create a new project with the required folder structure."""
+        project_name = project_name.strip()
+        if not project_name or Path(project_name).name != project_name or project_name in {".", ".."}:
+            raise ValueError("Project name must be a single folder name")
         root = (parent_directory or self.default_root).expanduser().resolve()
         project_root = root / project_name
         project_root.mkdir(parents=True, exist_ok=False)
@@ -83,13 +86,32 @@ class ProjectManager:
     def import_dataset_folder(self, source: Path, destination: Path, copy_files: bool) -> Path:
         """Copy a dataset folder into the project or keep the original reference."""
         source = source.expanduser().resolve()
+        destination = destination.expanduser().resolve()
         if not source.exists():
             raise FileNotFoundError(f"Dataset folder does not exist: {source}")
+        if not source.is_dir():
+            raise NotADirectoryError(f"Dataset path is not a folder: {source}")
         if not copy_files:
             return source
-        if destination.exists():
-            shutil.rmtree(destination)
-        shutil.copytree(source, destination)
+        dataset_root = destination.parent
+        if source.is_relative_to(dataset_root):
+            return source
+        if destination.is_relative_to(source):
+            raise ValueError("Cannot copy a folder into one of its own subfolders. Select the image folder instead.")
+
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with TemporaryDirectory(dir=destination.parent, prefix=f".{destination.name}-import-") as temp_directory:
+                staged_destination = Path(temp_directory) / "data"
+                shutil.copytree(source, staged_destination)
+                if destination.exists():
+                    shutil.rmtree(destination)
+                staged_destination.replace(destination)
+        except PermissionError as exc:
+            blocked_path = exc.filename or str(source)
+            raise PermissionError(
+                f"Cannot copy '{blocked_path}'. Close applications using this file or select Reference original folder."
+            ) from exc
         return destination
 
     def _read_project_payload(self, project_file: Path) -> dict[str, Any]:

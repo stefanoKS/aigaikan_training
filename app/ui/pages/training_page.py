@@ -19,10 +19,14 @@ class TrainingPage(QWidget):
     def __init__(self) -> None:
         super().__init__()
         root = QVBoxLayout(self)
+        root.setContentsMargins(28, 24, 28, 28)
+        root.setSpacing(16)
 
         button_row = QHBoxLayout()
         self.start_button = QPushButton("Start Training")
+        self.start_button.setObjectName("PrimaryButton")
         self.cancel_button = QPushButton("Cancel Training")
+        self.cancel_button.setObjectName("AlertButton")
         self.cancel_button.setEnabled(False)
         self.open_log_button = QPushButton("Open Log File")
         button_row.addWidget(self.start_button)

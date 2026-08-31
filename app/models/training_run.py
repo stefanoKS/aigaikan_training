@@ -24,6 +24,7 @@ class TrainingRun:
     run_dir: str
     model_name: str
     device: str
+    run_date: str = ""
     training_duration_seconds: float = 0.0
     evaluation_duration_seconds: float = 0.0
     metrics: dict[str, float | str | None] = field(default_factory=dict)

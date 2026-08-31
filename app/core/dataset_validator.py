@@ -31,7 +31,7 @@ class DatasetValidationReport:
 
     errors: list[ValidationIssue] = field(default_factory=list)
     warnings: list[ValidationIssue] = field(default_factory=list)
-    stats: dict[str, dict[str, str | int]] = field(default_factory=dict)
+    stats: dict[str, dict[str, object]] = field(default_factory=dict)
 
     @property
     def is_valid(self) -> bool:
@@ -42,8 +42,8 @@ class DatasetValidator:
     """Validate imported dataset folders."""
 
     MIN_OK_TRAIN_IMAGES = 2
-    MIN_OK_TEST_IMAGES = 1
     MIN_NG_TEST_IMAGES = 1
+    REQUIRED_ROLES = (DatasetRole.OK_TRAIN, DatasetRole.NG_TEST)
 
     def validate(self, config: DatasetConfig) -> DatasetValidationReport:
         """Validate all configured dataset folders."""
@@ -53,14 +53,14 @@ class DatasetValidator:
         for role, folder in config.folders.items():
             path = folder.resolved_path()
             if path is None:
-                if role is DatasetRole.MASKS:
+                if role not in self.REQUIRED_ROLES:
                     continue
                 report.errors.append(ValidationIssue("error", role.value, "Folder is not configured"))
                 continue
             self._validate_folder(role, path, report, role_files)
 
         self._validate_counts(role_files, report)
-        self._validate_masks(role_files, report)
+        self._validate_masks(config, role_files, report)
         return report
 
     def _validate_folder(
@@ -71,6 +71,8 @@ class DatasetValidator:
         role_files: dict[DatasetRole, list[Path]],
     ) -> None:
         if not path.exists():
+            if role is DatasetRole.MASKS:
+                return
             report.errors.append(ValidationIssue("error", role.value, "Folder does not exist", str(path)))
             return
         if not path.is_dir():
@@ -79,6 +81,9 @@ class DatasetValidator:
 
         all_files = sorted(item for item in path.iterdir() if item.is_file())
         if not all_files:
+            if role is DatasetRole.MASKS:
+                role_files[role] = []
+                return
             report.errors.append(ValidationIssue("error", role.value, "Folder is empty", str(path)))
             return
 
@@ -138,6 +143,7 @@ class DatasetValidator:
                 "image_count": len(valid_images),
                 "typical_resolution": f"{common_resolution[0]}x{common_resolution[1]}",
                 "color_mode": common_mode,
+                "thumbnail_paths": [str(path) for path in valid_images[:1]],
             }
         role_files[role] = valid_images
 
@@ -150,10 +156,6 @@ class DatasetValidator:
             report.errors.append(
                 ValidationIssue("error", DatasetRole.OK_TRAIN.value, "Insufficient OK training images")
             )
-        if len(role_files.get(DatasetRole.OK_TEST, [])) < self.MIN_OK_TEST_IMAGES:
-            report.errors.append(
-                ValidationIssue("error", DatasetRole.OK_TEST.value, "Insufficient OK test images")
-            )
         if len(role_files.get(DatasetRole.NG_TEST, [])) < self.MIN_NG_TEST_IMAGES:
             report.errors.append(
                 ValidationIssue("error", DatasetRole.NG_TEST.value, "Insufficient NG test images")
@@ -161,6 +163,7 @@ class DatasetValidator:
 
     def _validate_masks(
         self,
+        config: DatasetConfig,
         role_files: dict[DatasetRole, list[Path]],
         report: DatasetValidationReport,
     ) -> None:
@@ -168,22 +171,75 @@ class DatasetValidator:
         mask_files = role_files.get(DatasetRole.MASKS, [])
         if not mask_files:
             if ng_files:
+                mask_path = config.folders[DatasetRole.MASKS].resolved_path()
+                message = (
+                    "Mask folder is empty; pixel metrics unavailable"
+                    if mask_path is not None and mask_path.is_dir()
+                    else "Masks not supplied; pixel metrics unavailable"
+                )
                 report.warnings.append(
-                    ValidationIssue("warning", DatasetRole.MASKS.value, "Masks not supplied; pixel metrics unavailable")
+                    ValidationIssue("warning", DatasetRole.MASKS.value, message)
                 )
             return
 
-        ng_stems = {path.stem for path in ng_files}
-        mask_stems = {path.stem for path in mask_files}
-        missing_masks = sorted(ng_stems - mask_stems)
-        if missing_masks:
-            for stem in missing_masks:
+        matched_masks: set[Path] = set()
+        for ng_file in ng_files:
+            matches = [mask_file for mask_file in mask_files if ng_file.stem in mask_file.stem]
+            if not matches:
                 report.warnings.append(
                     ValidationIssue(
                         "warning",
                         DatasetRole.MASKS.value,
                         "Missing optional mask for NG image",
-                        stem,
+                        ng_file.stem,
+                    )
+                )
+                continue
+            if len(matches) > 1:
+                report.warnings.append(
+                    ValidationIssue(
+                        "warning",
+                        DatasetRole.MASKS.value,
+                        "Multiple masks match an NG image",
+                        ng_file.stem,
+                    )
+                )
+                continue
+            mask_file = matches[0]
+            matched_masks.add(mask_file)
+            self._validate_mask_image(ng_file, mask_file, report)
+
+        for mask_file in mask_files:
+            if mask_file not in matched_masks:
+                report.warnings.append(
+                    ValidationIssue(
+                        "warning",
+                        DatasetRole.MASKS.value,
+                        "Mask does not match an NG image",
+                        str(mask_file),
+                    )
+                )
+
+    @staticmethod
+    def _validate_mask_image(ng_file: Path, mask_file: Path, report: DatasetValidationReport) -> None:
+        """Check that an optional mask can serve as a pixel-level annotation."""
+        with Image.open(ng_file) as ng_image, Image.open(mask_file) as mask_image:
+            if mask_image.size != ng_image.size:
+                report.warnings.append(
+                    ValidationIssue(
+                        "warning",
+                        DatasetRole.MASKS.value,
+                        "Mask dimensions do not match the NG image",
+                        str(mask_file),
+                    )
+                )
+            if mask_image.mode not in {"1", "L", "I", "I;16"}:
+                report.warnings.append(
+                    ValidationIssue(
+                        "warning",
+                        DatasetRole.MASKS.value,
+                        "Mask should be a grayscale binary image",
+                        str(mask_file),
                     )
                 )
 

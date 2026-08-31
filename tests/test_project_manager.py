@@ -22,3 +22,17 @@ def test_create_unique_run_directory(project_manager: ProjectManager) -> None:
     assert first != second
     assert "patchcore" in first.name
     assert second.exists()
+
+
+def test_import_reuses_a_source_already_inside_project_data(project_manager: ProjectManager) -> None:
+    """Reselecting project-owned data after clearing must not copy its files again."""
+    project = project_manager.create_project("Existing Dataset")
+    source = project.root_path / "dataset" / "ng_test"
+    destination = project.root_path / "dataset" / "masks"
+    image = source / "000_overexposed.png"
+    image.write_bytes(b"image")
+
+    assigned_path = project_manager.import_dataset_folder(source, destination, copy_files=True)
+
+    assert assigned_path == source
+    assert image.exists()

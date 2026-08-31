@@ -2,7 +2,7 @@
 
 ## Application purpose
 
-Anomalib Trainer is a Windows desktop application for non-programmers who need to create anomaly-detection projects, import OK/NG images, validate datasets, launch PatchCore training through a GUI, review results, and package the application for deployment on other Windows PCs.
+Anomalib Trainer is a Windows desktop application for non-programmers who need to create anomaly-detection projects, select OK/NG folders, validate datasets, train PatchCore or Dinomaly with DINOv3 encoders, review results, and package the application for deployment on other Windows PCs.
 
 ## Screenshots
 
@@ -17,44 +17,40 @@ Anomalib Trainer is a Windows desktop application for non-programmers who need t
 - Windows 10
 - Windows 11
 
-## Python requirements
+## Environment requirements
 
-- Python 3.11
+- Miniconda or Anaconda with Conda available on `PATH`
 - PowerShell 5.1+ or PowerShell 7+
 
-## CPU installation
+## Conda installation
 
 ```powershell
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements\cpu.txt
-python scripts\verify_installation.py
+powershell -ExecutionPolicy Bypass -File scripts\setup.ps1 -Backend cpu
 ```
 
-## CUDA installation
+For NVIDIA CUDA:
 
 ```powershell
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements\cuda.txt
-python scripts\verify_installation.py
+powershell -ExecutionPolicy Bypass -File scripts\setup.ps1 -Backend cuda
 ```
+
+The setup script detects RTX 50-series (Blackwell) GPUs and installs the matching
+PyTorch 2.7.1 CUDA 12.8 build. Other NVIDIA GPUs use the CUDA 12.6 build. CUDA
+setup verifies that the installed PyTorch supports the active GPU architecture
+before it completes.
 
 ## GitHub installation
 
 ```powershell
 git clone https://github.com/stefanoKS/aigaikan_training.git
 cd aigaikan_training
-powershell -ExecutionPolicy Bypass -File scripts\setup.ps1
+powershell -ExecutionPolicy Bypass -File scripts\setup.ps1 -Backend cpu
 ```
 
 ## Running from source
 
 ```powershell
-.venv\Scripts\Activate.ps1
-python -m app.main
+conda run --live-stream -n anomalib-trainer python -m app.main
 ```
 
 or
@@ -67,22 +63,22 @@ powershell -ExecutionPolicy Bypass -File scripts\run.ps1
 
 1. Open **Home / Projects**.
 2. Click **New Project**.
-3. Choose a parent directory.
-4. The project structure is created under `AnomalibProjects\<ProjectName>`.
+3. Enter a project name.
+4. The project structure is created under `Documents\AnomalibProjects\<ProjectName>`.
+5. Use **Save Project** to explicitly save its current state.
 
 ## Dataset folder meanings
 
-- `ok_train`: normal images used for PatchCore training
-- `ok_test`: normal images used during evaluation
-- `ng_test`: anomalous images used during evaluation
-- `masks`: optional pixel-level masks for anomalous test images
+- `ok_train`: required normal images used for training. When a separate OK test folder is not supplied, Anomalib holds out a portion for evaluation.
+- `ng_test`: required anomalous images used during evaluation.
+- `masks`: optional pixel-level masks for anomalous images. A missing or unselected mask folder never blocks training; pixel-level metrics are simply unavailable.
 
-## Training PatchCore
+## Training
 
-1. Import `ok_train`, `ok_test`, and `ng_test`.
-2. Optionally import `masks`.
+1. Select the OK and NG folders from the Dataset page.
+2. Optionally select the NG mask folder.
 3. Validate the dataset from the Dataset page.
-4. Configure device, image size, batch size, and PatchCore settings on the Training Configuration page.
+4. Choose PatchCore or Dinomaly with a DINOv3 encoder on the Training Configuration page.
 5. Start training from the Training page.
 
 ## Reading the results
@@ -96,7 +92,7 @@ The Results page is designed to show:
 ## Building the executable
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\build.ps1
+powershell -ExecutionPolicy Bypass -File scripts\build.ps1 -EnvironmentName anomalib-trainer
 ```
 
 ## Creating the installer
@@ -110,8 +106,7 @@ iscc installer\AnomalibTrainer.iss
 Use the weight download step before packaging:
 
 ```powershell
-.venv\Scripts\Activate.ps1
-python scripts\download_weights.py
+conda run --live-stream -n anomalib-trainer python scripts\download_weights.py
 ```
 
 Then copy the built `release\` artifacts to the target PC.
@@ -124,16 +119,21 @@ Then copy the built `release\` artifacts to the target PC.
 - reduce image width and height
 - switch device to CPU if necessary
 
+### GPU architecture is unsupported
+
+- rerun `powershell -ExecutionPolicy Bypass -File scripts\setup.ps1 -Backend cuda`
+- RTX 50-series GPUs require the CUDA 12.8 PyTorch build selected automatically by setup
+
 ### Missing model weights
 
-- run `python scripts\download_weights.py`
+- run `conda run --live-stream -n anomalib-trainer python scripts\download_weights.py`
 - verify that `weights\wide_resnet50_2-default.pth` exists
 - if internet access is blocked, download the weights on a connected PC and copy them into the `weights` folder
 
 ### PyTorch DLL issues
 
-- confirm Python 3.11 is used
-- reinstall the pinned torch/torchvision package pair
+- confirm the `anomalib-trainer` Conda environment uses Python 3.11
+- rerun `powershell -ExecutionPolicy Bypass -File scripts\setup.ps1 -Backend cpu` or replace `cpu` with `cuda`
 - verify VC++ runtime availability on the target machine
 
 ## Developer architecture

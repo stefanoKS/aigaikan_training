@@ -6,11 +6,34 @@ from app.models.training_config import DeviceMode, TrainingConfig
 
 
 def test_training_config_round_trip() -> None:
-    config = TrainingConfig(device=DeviceMode.CPU, image_width=512, image_height=320, batch_size=4)
+    config = TrainingConfig(
+        model_name="Dinomaly",
+        device=DeviceMode.CPU,
+        image_width=512,
+        image_height=320,
+        batch_size=4,
+        max_epochs=15,
+        validation_every_n_epochs=3,
+        gradient_clip_val=0.5,
+        accumulate_grad_batches=2,
+        dinomaly_encoder="vit_small_patch16_dinov3.lvd1689m",
+        dinomaly_decoder_depth=12,
+        supplemental_data_path="C:/datasets/imagenette",
+        zero_shot_class_name="widget",
+    )
     payload = config.to_dict()
     restored = TrainingConfig.from_dict(payload)
     assert restored.device is DeviceMode.CPU
     assert restored.image_width == 512
+    assert restored.max_epochs == 15
+    assert restored.validation_every_n_epochs == 3
+    assert restored.gradient_clip_val == 0.5
+    assert restored.accumulate_grad_batches == 2
+    assert restored.model_name == "Dinomaly"
+    assert restored.dinomaly_encoder == "vit_small_patch16_dinov3.lvd1689m"
+    assert restored.dinomaly_decoder_depth == 12
+    assert restored.supplemental_data_path == "C:/datasets/imagenette"
+    assert restored.zero_shot_class_name == "widget"
     restored.validate()
 
 

@@ -5,6 +5,8 @@ from __future__ import annotations
 import importlib
 import platform
 import sys
+import warnings
+from argparse import ArgumentParser
 from pathlib import Path
 
 
@@ -13,12 +15,38 @@ def check_import(name: str) -> None:
     print(f"{name}: {getattr(module, '__version__', 'ok')}")
 
 
-def main() -> int:
+def _verify_cuda_support() -> None:
+    """Confirm the installed PyTorch build includes the active GPU architecture."""
+    import torch
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        if not torch.cuda.is_available():
+            raise SystemExit("CUDA was requested, but PyTorch cannot access an NVIDIA GPU.")
+        major, minor = torch.cuda.get_device_capability(0)
+        architecture = f"sm_{major}{minor}"
+        supported_architectures = torch.cuda.get_arch_list()
+        if architecture not in supported_architectures:
+            raise SystemExit(
+                f"PyTorch {torch.__version__} does not support {architecture}. "
+                f"Supported architectures: {', '.join(supported_architectures)}"
+            )
+        print(f"CUDA GPU OK: {torch.cuda.get_device_name(0)} ({architecture})")
+
+
+def main(require_cuda: bool = False) -> int:
     if sys.version_info[:2] != (3, 11):
         raise SystemExit("Python 3.11 is required.")
     print(f"Python: {platform.python_version()}")
     for module_name in ("PySide6", "torch", "torchvision", "anomalib"):
         check_import(module_name)
+    import anomalib
+    from anomalib.models import Dinomaly, Patchcore
+
+    version = tuple(int(part) for part in anomalib.__version__.split(".")[:2])
+    if version < (2, 6):
+        raise SystemExit("Anomalib 2.6 or later is required.")
+    print(f"Available models: {Patchcore.__name__}, {Dinomaly.__name__}")
     from PySide6.QtWidgets import QApplication
 
     app = QApplication([])
@@ -31,8 +59,13 @@ def main() -> int:
         print(f"Weights OK: {weights_file}")
     else:
         print(f"Weights missing: {weights_file}")
+    if require_cuda:
+        _verify_cuda_support()
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    parser = ArgumentParser()
+    parser.add_argument("--require-cuda", action="store_true")
+    arguments = parser.parse_args()
+    raise SystemExit(main(require_cuda=arguments.require_cuda))

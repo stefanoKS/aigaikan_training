@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import platform
 import sys
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -26,10 +27,12 @@ def collect_environment_info(project_path: Path, seed: int) -> dict[str, str | b
     try:
         import torch
 
-        cuda_available = bool(torch.cuda.is_available())
-        cuda_version = str(getattr(torch.version, "cuda", "not-available"))
-        if cuda_available:
-            gpu_name = str(torch.cuda.get_device_name(0))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            cuda_available = bool(torch.cuda.is_available())
+            cuda_version = str(getattr(torch.version, "cuda", "not-available"))
+            if cuda_available:
+                gpu_name = str(torch.cuda.get_device_name(0))
     except Exception:
         pass
     return {

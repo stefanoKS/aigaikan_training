@@ -18,12 +18,18 @@ class HomePage(QWidget):
     def __init__(self) -> None:
         super().__init__()
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(28, 24, 28, 28)
+        layout.setSpacing(16)
 
         action_row = QHBoxLayout()
         self.new_project_button = QPushButton("New Project")
+        self.new_project_button.setObjectName("PrimaryButton")
         self.open_project_button = QPushButton("Open Project")
+        self.save_project_button = QPushButton("Save Project")
+        self.save_project_button.setEnabled(False)
         action_row.addWidget(self.new_project_button)
         action_row.addWidget(self.open_project_button)
+        action_row.addWidget(self.save_project_button)
         action_row.addStretch(1)
         layout.addLayout(action_row)
 
@@ -44,6 +50,7 @@ class HomePage(QWidget):
         recent_group = QGroupBox("Recent Projects")
         recent_layout = QVBoxLayout(recent_group)
         self.recent_projects_list = QListWidget()
+        self.recent_projects_list.setObjectName("RecentProjectsList")
         recent_layout.addWidget(self.recent_projects_list)
         layout.addWidget(recent_group, stretch=1)
 

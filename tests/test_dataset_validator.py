@@ -42,3 +42,38 @@ def test_valid_dataset_yields_stats(synthetic_dataset: Path) -> None:
     assert report.stats["ok_train"]["image_count"] == 2
     assert report.stats["ng_test"]["typical_resolution"] == "64x64"
 
+
+def test_missing_masks_folder_is_optional(synthetic_dataset: Path) -> None:
+    config = _config_for(synthetic_dataset)
+    config.folders[DatasetRole.MASKS].path = str(synthetic_dataset / "missing_masks")
+
+    report = DatasetValidator().validate(config)
+
+    assert not any(
+        issue.role == DatasetRole.MASKS.value and issue.message == "Folder does not exist"
+        for issue in report.errors
+    )
+
+
+def test_empty_selected_mask_folder_only_warns(synthetic_dataset: Path) -> None:
+    """An empty optional mask folder must not block image-level training."""
+    (synthetic_dataset / "masks" / "ng_test.png").unlink()
+    config = _config_for(synthetic_dataset)
+
+    report = DatasetValidator().validate(config)
+
+    assert not any(issue.role == DatasetRole.MASKS.value for issue in report.errors)
+    assert any(issue.message == "Mask folder is empty; pixel metrics unavailable" for issue in report.warnings)
+
+
+def test_mask_suffix_and_dimensions_follow_anomalib_folder_contract(synthetic_dataset: Path) -> None:
+    """Anomalib accepts an image_mask suffix, while dimensions still need to match."""
+    masks_folder = synthetic_dataset / "masks"
+    (masks_folder / "ng_test.png").rename(masks_folder / "ng_test_mask.png")
+    config = _config_for(synthetic_dataset)
+
+    report = DatasetValidator().validate(config)
+
+    assert not any(issue.message == "Missing optional mask for NG image" for issue in report.warnings)
+    assert not any(issue.message == "Mask dimensions do not match the NG image" for issue in report.warnings)
+

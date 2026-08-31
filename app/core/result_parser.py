@@ -4,18 +4,20 @@ from __future__ import annotations
 
 import csv
 import json
+from dataclasses import asdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from app.models.prediction_result import PredictionResult
-from app.models.training_run import WorkerMessage
+from app.models.training_run import TrainingRun, WorkerMessage
 
 
 KNOWN_METRIC_ALIASES = {
     "image_auroc": "Image AUROC",
     "image_AUROC": "Image AUROC",
     "image_f1score": "Image F1",
+    "image_F1Score": "Image F1",
     "image_f1": "Image F1",
     "f1_score": "Image F1",
     "precision": "Precision",
@@ -94,6 +96,41 @@ class ResultParser:
                 )
                 for row in reader
             ]
+
+    def write_training_run(self, path: Path, run: TrainingRun) -> Path:
+        """Persist a training run summary for the Results page."""
+        path.write_text(json.dumps(asdict(run), indent=2), encoding="utf-8")
+        return path
+
+    def read_training_run(self, path: Path) -> TrainingRun:
+        """Load a persisted training run summary."""
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        predictions = [
+            PredictionResult(
+                source_path=str(item.get("source_path", "")),
+                predicted_label=str(item.get("predicted_label", "")),
+                ground_truth_label=str(item.get("ground_truth_label", "")),
+                anomaly_score=float(item.get("anomaly_score", 0.0)),
+                threshold=float(item.get("threshold", 0.0)),
+                original_image=str(item.get("original_image", "")),
+                anomaly_map=str(item.get("anomaly_map", "")),
+                overlay_image=str(item.get("overlay_image", "")),
+            )
+            for item in payload.get("predictions", [])
+            if isinstance(item, dict)
+        ]
+        metrics = payload.get("metrics", {})
+        return TrainingRun(
+            run_name=str(payload.get("run_name", "")),
+            run_dir=str(payload.get("run_dir", "")),
+            model_name=str(payload.get("model_name", "")),
+            device=str(payload.get("device", "")),
+            run_date=str(payload.get("run_date", "")),
+            training_duration_seconds=float(payload.get("training_duration_seconds", 0.0)),
+            evaluation_duration_seconds=float(payload.get("evaluation_duration_seconds", 0.0)),
+            metrics=metrics if isinstance(metrics, dict) else {},
+            predictions=predictions,
+        )
 
     def export_predictions_csv(self, path: Path, predictions: list[PredictionResult]) -> Path:
         """Export prediction rows to a CSV file."""

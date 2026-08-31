@@ -1,5 +1,6 @@
 """Dataset management page."""
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QComboBox,
     QFormLayout,
@@ -20,21 +21,24 @@ class DatasetPage(QWidget):
     """Dataset management UI."""
 
     ROLES = (
-        ("OK Training Images", "ok_train"),
-        ("OK Test Images", "ok_test"),
-        ("NG Test Images", "ng_test"),
-        ("Optional Masks", "masks"),
+        ("OK Folder", "ok_train"),
+        ("NG Folder", "ng_test"),
+        ("NG Mask Folder (Optional)", "masks"),
     )
 
     def __init__(self) -> None:
         super().__init__()
         root = QVBoxLayout(self)
+        root.setContentsMargins(28, 24, 28, 28)
+        root.setSpacing(16)
 
         header_row = QHBoxLayout()
         self.import_mode_combo = QComboBox()
         self.import_mode_combo.addItems(["Copy images into project", "Reference original folder"])
         self.validate_button = QPushButton("Validate Dataset")
+        self.validate_button.setObjectName("PrimaryButton")
         self.clear_button = QPushButton("Clear Dataset Selection")
+        self.clear_button.setObjectName("AlertButton")
         header_row.addWidget(QLabel("Import Mode"))
         header_row.addWidget(self.import_mode_combo)
         header_row.addStretch(1)
@@ -54,9 +58,12 @@ class DatasetPage(QWidget):
             invalid_label = QLabel("0")
             resolution_label = QLabel("-")
             color_label = QLabel("-")
-            import_button = QPushButton("Import")
-            browse_button = QPushButton("Browse")
-            thumb_label = QLabel("Thumbnail preview")
+            import_button = QPushButton("Select Folder")
+            browse_button = QPushButton("Open Folder")
+            thumb_label = QLabel("No preview\navailable")
+            thumb_label.setObjectName("DatasetThumbnail")
+            thumb_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            thumb_label.setFixedSize(180, 110)
             form.addRow("Folder Path", path_label)
             form.addRow("Image Count", count_label)
             form.addRow("Invalid Images", invalid_label)
@@ -67,6 +74,14 @@ class DatasetPage(QWidget):
             button_row.addWidget(browse_button)
             form.addRow("Actions", button_row)
             form.addRow("Preview", thumb_label)
+            if key == "masks":
+                mask_format_label = QLabel(
+                    "Use a grayscale binary PNG when possible: 0 = background, 255 = defect. "
+                    "Keep the same dimensions as its NG image and name it image.png or image_mask.png."
+                )
+                mask_format_label.setObjectName("MaskFormat")
+                mask_format_label.setWordWrap(True)
+                form.addRow("Expected Mask", mask_format_label)
             left_layout.addWidget(group)
             self.role_widgets[key] = {
                 "path": path_label,
