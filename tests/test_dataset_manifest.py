@@ -90,3 +90,20 @@ def test_staged_split_copies_source_images_without_mutating_them(tmp_path: Path)
     assert staged.final_test_config.folders[DatasetRole.NG_TEST].resolved_path().is_dir()
     assert all(staged_path.read_bytes() == source_bytes[source_path] for staged_path, source_path in staged.source_path_by_staged_path.items())
     assert all(path.read_bytes() == source_bytes[path] for path in source_bytes)
+
+
+def test_normal_only_split_has_held_out_calibration_and_no_ng_snapshot(tmp_path: Path) -> None:
+    config = _dataset_config(tmp_path)
+    for index in range(10):
+        _save_image(tmp_path / "ok_train" / f"ok_{index}.png", (index + 10, 0, 0))
+
+    split = build_effective_split(config, seed=42)
+    staged = stage_effective_split(split, config, tmp_path / "run" / "dataset_snapshot")
+
+    assert split.counts() == {
+        "training": {"ok": 8, "ng": 0},
+        "validation": {"ok": 1, "ng": 0},
+        "final_test": {"ok": 1, "ng": 0},
+    }
+    assert staged.training_config.folders[DatasetRole.NG_TEST].resolved_path() is None
+    assert staged.final_test_config.folders[DatasetRole.NG_TEST].resolved_path() is None

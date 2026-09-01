@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.core.model_registry import ModelExecutionMode, ModelRegistry, ModelSupportLevel
+from app.core.threshold_calibrator import ThresholdMethod
 
 
 class ConfigPage(QWidget):
@@ -125,7 +126,7 @@ class ConfigPage(QWidget):
         self.resources_form.addRow(self.zero_shot_class_name_label, self.zero_shot_class_name_edit)
         root.addWidget(self.resources_group)
 
-        self.dinomaly_group = QGroupBox("Dinomaly Settings")
+        self.dinomaly_group = QGroupBox("Dinomaly DINOv2 Settings")
         dinomaly_form = QFormLayout(self.dinomaly_group)
         self.dinomaly_encoder_combo = QComboBox()
         self.dinomaly_encoder_combo.addItems(
@@ -154,6 +155,88 @@ class ConfigPage(QWidget):
         dinomaly_form.addRow("Context Recentering", self.dinomaly_context_recentering_check)
         root.addWidget(self.dinomaly_group)
 
+        self.dinov3_group = QGroupBox("DINOv3 Experimental Settings")
+        dinov3_form = QFormLayout(self.dinov3_group)
+        self.dinov3_encoder_label = QLabel("Dinomaly DINOv3 Encoder")
+        self.dinov3_encoder_combo = QComboBox()
+        self.dinov3_encoder_combo.addItems(
+            [
+                "vit_small_patch16_dinov3.lvd1689m",
+                "vit_base_patch16_dinov3.lvd1689m",
+                "vit_large_patch16_dinov3.lvd1689m",
+            ]
+        )
+        self.dinov3_feature_layers_label = QLabel("Feature Layers")
+        self.dinov3_feature_layers_edit = QLineEdit()
+        self.dinov3_feature_layers_edit.setPlaceholderText("Automatic runtime selection")
+        self.superadd_encoder_label = QLabel("SuperADD DINOv3 Encoder")
+        self.superadd_encoder_combo = QComboBox()
+        self.superadd_encoder_combo.addItems(
+            [
+                "vit_huge_plus_patch16_dinov3.lvd1689m",
+                "vit_large_patch16_dinov3.lvd1689m",
+                "vit_base_patch16_dinov3.lvd1689m",
+            ]
+        )
+        self.superadd_patch_size_label = QLabel("SuperADD Patch Size")
+        self.superadd_patch_size_spin = QSpinBox()
+        self.superadd_patch_size_spin.setRange(32, 4096)
+        self.superadd_patch_size_spin.setSingleStep(16)
+        self.superadd_patch_size_spin.setValue(448)
+        self.superadd_patch_overlap_label = QLabel("SuperADD Patch Overlap")
+        self.superadd_patch_overlap_spin = QSpinBox()
+        self.superadd_patch_overlap_spin.setRange(1, 2048)
+        self.superadd_patch_overlap_spin.setSingleStep(16)
+        self.superadd_patch_overlap_spin.setValue(16)
+        self.dinov3_experimental_label = QLabel(
+            "Dinomaly DINOv3 is an application adapter. Runtime encoder metadata and token layout are verified before training."
+        )
+        self.dinov3_experimental_label.setWordWrap(True)
+        dinov3_form.addRow(self.dinov3_encoder_label, self.dinov3_encoder_combo)
+        dinov3_form.addRow(self.dinov3_feature_layers_label, self.dinov3_feature_layers_edit)
+        dinov3_form.addRow(self.superadd_encoder_label, self.superadd_encoder_combo)
+        dinov3_form.addRow(self.superadd_patch_size_label, self.superadd_patch_size_spin)
+        dinov3_form.addRow(self.superadd_patch_overlap_label, self.superadd_patch_overlap_spin)
+        dinov3_form.addRow(self.dinov3_experimental_label)
+        root.addWidget(self.dinov3_group)
+
+        self.threshold_group = QGroupBox("Decision Threshold Calibration")
+        threshold_form = QFormLayout(self.threshold_group)
+        self.threshold_method_combo = QComboBox()
+        for label, method in (
+            ("Automatic from held-out calibration data", ThresholdMethod.AUTO),
+            ("Labeled F1", ThresholdMethod.LABELED_F1),
+            ("Labeled recall priority", ThresholdMethod.LABELED_RECALL_PRIORITY),
+            ("Normal-only conformal", ThresholdMethod.NORMAL_ONLY_CONFORMAL),
+            ("Normal-only maximum (legacy)", ThresholdMethod.NORMAL_ONLY_MAX),
+        ):
+            self.threshold_method_combo.addItem(label, method.value)
+        self.threshold_fpr_combo = QComboBox()
+        for label, rate in (("0.1%", 0.001), ("0.5%", 0.005), ("1.0%", 0.01), ("Custom", None)):
+            self.threshold_fpr_combo.addItem(label, rate)
+        self.threshold_fpr_spin = QDoubleSpinBox()
+        self.threshold_fpr_spin.setRange(0.001, 99.999)
+        self.threshold_fpr_spin.setDecimals(3)
+        self.threshold_fpr_spin.setSuffix("%")
+        self.threshold_fpr_spin.setValue(0.5)
+        self.minimum_ng_recall_check = QCheckBox("Require minimum NG recall")
+        self.minimum_ng_recall_spin = QDoubleSpinBox()
+        self.minimum_ng_recall_spin.setRange(0.0, 100.0)
+        self.minimum_ng_recall_spin.setDecimals(1)
+        self.minimum_ng_recall_spin.setSuffix("%")
+        self.minimum_ng_recall_spin.setValue(95.0)
+        self.normal_only_calibration_note = QLabel(
+            "Normal-only calibration selects a false-reject operating point. Defect-detection performance remains unverified without genuine NG data."
+        )
+        self.normal_only_calibration_note.setWordWrap(True)
+        threshold_form.addRow("Calibration Method", self.threshold_method_combo)
+        threshold_form.addRow("Normal False Reject Target", self.threshold_fpr_combo)
+        threshold_form.addRow("Custom Normal False Reject Target", self.threshold_fpr_spin)
+        threshold_form.addRow("NG Recall Target", self.minimum_ng_recall_check)
+        threshold_form.addRow("Required NG Recall", self.minimum_ng_recall_spin)
+        threshold_form.addRow(self.normal_only_calibration_note)
+        root.addWidget(self.threshold_group)
+
         button_row = QHBoxLayout()
         self.save_button = QPushButton("Save Configuration")
         self.save_button.setObjectName("PrimaryButton")
@@ -167,7 +250,10 @@ class ConfigPage(QWidget):
         root.addStretch(1)
         self.model_combo.currentIndexChanged.connect(self._update_model_support)
         self.show_experimental_models_check.toggled.connect(self._populate_models)
+        self.threshold_fpr_combo.currentIndexChanged.connect(self._update_threshold_controls)
+        self.minimum_ng_recall_check.toggled.connect(self._update_threshold_controls)
         self._update_model_support()
+        self._update_threshold_controls()
 
     def set_estimated_training_steps(self, steps: int, epochs: int) -> None:
         """Show the model-adjusted optimizer work without changing layout width."""
@@ -217,14 +303,28 @@ class ConfigPage(QWidget):
 
     def _update_model_controls(self, model_key: str) -> None:
         """Show only inputs that apply to the selected Anomalib model."""
+        is_dinomaly_dinov2 = model_key == "dinomaly_dinov2"
+        is_dinomaly_dinov3 = model_key == "dinomaly_dinov3"
+        is_superadd = model_key == "superadd_dinov3"
         self.patchcore_group.setVisible(model_key == "patchcore")
-        self.dinomaly_group.setVisible(model_key == "dinomaly")
+        self.dinomaly_group.setVisible(is_dinomaly_dinov2)
+        self.dinov3_group.setVisible(is_dinomaly_dinov3 or is_superadd)
+        self.dinov3_encoder_label.setVisible(is_dinomaly_dinov3)
+        self.dinov3_encoder_combo.setVisible(is_dinomaly_dinov3)
+        self.superadd_encoder_label.setVisible(is_superadd)
+        self.superadd_encoder_combo.setVisible(is_superadd)
+        self.superadd_patch_size_label.setVisible(is_superadd)
+        self.superadd_patch_size_spin.setVisible(is_superadd)
+        self.superadd_patch_overlap_label.setVisible(is_superadd)
+        self.superadd_patch_overlap_spin.setVisible(is_superadd)
+        self.dinov3_feature_layers_label.setVisible(is_dinomaly_dinov3 or is_superadd)
+        self.dinov3_feature_layers_edit.setVisible(is_dinomaly_dinov3 or is_superadd)
         is_training_model = self._model_definitions[model_key].execution_mode is ModelExecutionMode.TRAIN
         self.trainer_group.setEnabled(is_training_model)
         self.trainer_group.setTitle("Trainer Settings" if is_training_model else "Trainer Settings (Not used for zero-shot evaluation)")
-        is_patchcore = model_key == "patchcore"
-        self.max_epochs_spin.setValue(1 if is_patchcore else self.max_epochs_spin.value())
-        self.max_epochs_spin.setEnabled(not is_patchcore and is_training_model)
+        uses_fixed_one_pass = model_key in {"patchcore", "superadd_dinov3"}
+        self.max_epochs_spin.setValue(1 if uses_fixed_one_pass else self.max_epochs_spin.value())
+        self.max_epochs_spin.setEnabled(not uses_fixed_one_pass and is_training_model)
 
         supplemental_models = {
             "draem": ("DRAEM Resources", "Required DTD texture dataset folder"),
@@ -245,4 +345,24 @@ class ConfigPage(QWidget):
         elif uses_zero_shot_class:
             self.resources_group.setTitle("WinCLIP Prompt")
             self.zero_shot_class_name_edit.setPlaceholderText("Optional object category, for example: bottle")
+
+    def threshold_false_reject_rate(self) -> float:
+        """Return the selected normal false-reject rate as a probability."""
+        preset = self.threshold_fpr_combo.currentData()
+        return float(preset) if preset is not None else self.threshold_fpr_spin.value() / 100
+
+    def dinov3_feature_layers(self) -> tuple[int, ...]:
+        """Parse optional explicit feature layers while leaving blank for runtime selection."""
+        text = self.dinov3_feature_layers_edit.text().strip()
+        if not text:
+            return ()
+        try:
+            return tuple(int(value.strip()) for value in text.split(",") if value.strip())
+        except ValueError as exc:
+            raise ValueError("DINOv3 feature layers must be comma-separated integers.") from exc
+
+    def _update_threshold_controls(self) -> None:
+        """Enable only the optional calibration inputs selected by the user."""
+        self.threshold_fpr_spin.setEnabled(self.threshold_fpr_combo.currentData() is None)
+        self.minimum_ng_recall_spin.setEnabled(self.minimum_ng_recall_check.isChecked())
 

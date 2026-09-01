@@ -29,6 +29,8 @@ from app.core.dataset_manifest import build_effective_split
 from app.core.dataset_validator import DatasetValidationReport, DatasetValidator
 from app.core.inference_controller import InferenceController
 from app.core.model_registry import ModelExecutionMode, ModelRegistry
+from app.core.run_comparison import compare_training_runs
+from app.core.threshold_calibrator import ThresholdMethod
 from app.core.project_manager import ProjectManager
 from app.core.result_parser import ResultParser
 from app.core.settings_manager import SettingsManager
@@ -336,6 +338,10 @@ class MainWindow(QMainWindow):
             self.results_page.current_run.export_status = "Partial" if report.failures and report.exported else (
                 "Exported" if report.exported else "Failed"
             )
+            if report.exported:
+                self.results_page.current_run.metrics["Export Size (bytes)"] = sum(
+                    result.exported_path.stat().st_size for result in report.exported
+                )
             torch_validated = any(result.export_format == "torch" for result in report.exported)
             self.results_page.current_run.aigaikan_compatibility_status = (
                 "Validated with Anomalib TorchInferencer" if torch_validated else "Torch compatibility not requested"
@@ -376,19 +382,32 @@ class MainWindow(QMainWindow):
         if run is None:
             QMessageBox.information(self, "No Training Run", "Complete or load a training run before comparing results.")
             return
-        selected, _ = QFileDialog.getOpenFileName(self, "Select Results JSON to Compare", "", "JSON Files (*.json)")
-        if not selected:
+        selected_paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Select Two or More Results JSON Files to Compare",
+            "",
+            "JSON Files (*.json)",
+        )
+        if not selected_paths:
             return
         try:
-            comparison = self.result_parser.read_training_run(Path(selected))
+            comparisons = [self.result_parser.read_training_run(Path(selected)) for selected in selected_paths]
+            report = compare_training_runs([run, *comparisons])
         except (OSError, ValueError) as exc:
             QMessageBox.warning(self, "Could Not Compare Runs", str(exc))
             return
-        shared_metric_names = sorted(set(run.metrics) & set(comparison.metrics))
-        lines = [f"Current: {run.run_name}", f"Compared: {comparison.run_name}"]
-        for name in shared_metric_names:
-            lines.append(f"{name}: {run.metrics[name]} | {comparison.metrics[name]}")
-        QMessageBox.information(self, "Run Comparison", "\n".join(lines))
+        lines = [report.reason]
+        for metric_name, values in report.metric_rows.items():
+            rendered_values = " | ".join(
+                f"{comparison_run.run_name}: {value if value is not None else 'NOT MEASURED'}"
+                for comparison_run, value in zip(report.runs, values, strict=True)
+            )
+            lines.append(f"{metric_name}: {rendered_values}")
+        message = "\n".join(lines)
+        if report.direct_quality_comparison_allowed:
+            QMessageBox.information(self, "Run Comparison", message)
+        else:
+            QMessageBox.warning(self, "Run Comparison Evidence Warning", message)
 
     def _add_recent_project(self, project: ProjectConfig) -> None:
         for index in range(self.home_page.recent_projects_list.count()):
@@ -597,9 +616,26 @@ class MainWindow(QMainWindow):
         config.num_neighbors = self.config_page.neighbors_spin.value()
         config.num_workers = self.config_page.workers_spin.value()
         config.dinomaly_encoder = self.config_page.dinomaly_encoder_combo.currentText()
+        config.dinomaly_dinov3_encoder = self.config_page.dinov3_encoder_combo.currentText()
+        config.superadd_encoder = self.config_page.superadd_encoder_combo.currentText()
+        config.superadd_patch_size = self.config_page.superadd_patch_size_spin.value()
+        config.superadd_patch_overlap = self.config_page.superadd_patch_overlap_spin.value()
         config.dinomaly_decoder_depth = self.config_page.dinomaly_decoder_depth_spin.value()
         config.dinomaly_bottleneck_dropout = self.config_page.dinomaly_dropout_spin.value()
         config.dinomaly_context_recentering = self.config_page.dinomaly_context_recentering_check.isChecked()
+        try:
+            config.dinov3_feature_layers = self.config_page.dinov3_feature_layers()
+        except ValueError as exc:
+            if show_dialog:
+                QMessageBox.warning(self, "Invalid Training Settings", str(exc))
+            return False
+        config.threshold_method = ThresholdMethod(str(self.config_page.threshold_method_combo.currentData()))
+        config.target_normal_false_reject_rate = self.config_page.threshold_false_reject_rate()
+        config.minimum_required_ng_recall = (
+            self.config_page.minimum_ng_recall_spin.value() / 100
+            if self.config_page.minimum_ng_recall_check.isChecked()
+            else None
+        )
         config.supplemental_data_path = self.config_page.supplemental_path_edit.text().strip()
         config.zero_shot_class_name = self.config_page.zero_shot_class_name_edit.text().strip()
         config.apply_model_defaults(self._training_image_count())
@@ -638,10 +674,28 @@ class MainWindow(QMainWindow):
         self.config_page.workers_spin.setValue(config.num_workers)
         encoder_index = self.config_page.dinomaly_encoder_combo.findText(config.dinomaly_encoder)
         self.config_page.dinomaly_encoder_combo.setCurrentIndex(max(encoder_index, 0))
+        dinov3_encoder_index = self.config_page.dinov3_encoder_combo.findText(config.dinomaly_dinov3_encoder)
+        self.config_page.dinov3_encoder_combo.setCurrentIndex(max(dinov3_encoder_index, 0))
+        superadd_encoder_index = self.config_page.superadd_encoder_combo.findText(config.superadd_encoder)
+        self.config_page.superadd_encoder_combo.setCurrentIndex(max(superadd_encoder_index, 0))
+        self.config_page.dinov3_feature_layers_edit.setText(
+            ", ".join(str(layer) for layer in config.dinov3_feature_layers)
+        )
+        self.config_page.superadd_patch_size_spin.setValue(config.superadd_patch_size)
+        self.config_page.superadd_patch_overlap_spin.setValue(config.superadd_patch_overlap)
         self.config_page.dinomaly_decoder_depth_spin.setValue(config.dinomaly_decoder_depth)
         self.config_page.dinomaly_dropout_spin.setValue(config.dinomaly_bottleneck_dropout)
         self.config_page.target_training_steps_spin.setValue(config.target_training_steps)
         self.config_page.dinomaly_context_recentering_check.setChecked(config.dinomaly_context_recentering)
+        threshold_method_index = self.config_page.threshold_method_combo.findData(config.threshold_method.value)
+        self.config_page.threshold_method_combo.setCurrentIndex(max(threshold_method_index, 0))
+        target_rate_index = self.config_page.threshold_fpr_combo.findData(config.target_normal_false_reject_rate)
+        self.config_page.threshold_fpr_combo.setCurrentIndex(target_rate_index if target_rate_index >= 0 else 3)
+        self.config_page.threshold_fpr_spin.setValue(config.target_normal_false_reject_rate * 100)
+        self.config_page.minimum_ng_recall_check.setChecked(config.minimum_required_ng_recall is not None)
+        if config.minimum_required_ng_recall is not None:
+            self.config_page.minimum_ng_recall_spin.setValue(config.minimum_required_ng_recall * 100)
+        self.config_page._update_threshold_controls()
         self.config_page.supplemental_path_edit.setText(config.supplemental_data_path)
         self.config_page.zero_shot_class_name_edit.setText(config.zero_shot_class_name)
         self.training_page.active_model_label.setText(definition.display_name)

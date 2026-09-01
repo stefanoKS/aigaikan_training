@@ -30,6 +30,15 @@ class TrainingRun:
     final_checkpoint_path: str = ""
     final_checkpoint_sha256: str = ""
     dataset_manifest_sha256: str = ""
+    calibration_manifest_sha256: str = ""
+    final_test_manifest_sha256: str = ""
+    evaluation_revision_id: str = ""
+    model_variant: str = ""
+    encoder_family: str = ""
+    threshold_metadata: dict[str, Any] = field(default_factory=dict)
+    mean_inference_latency_ms: float | None = None
+    p95_inference_latency_ms: float | None = None
+    peak_gpu_memory_mb: float | None = None
     quality_status: str = ""
     export_status: str = "Not exported"
     aigaikan_compatibility_status: str = "Not validated"

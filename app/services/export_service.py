@@ -14,7 +14,7 @@ from typing import Any, Iterable
 
 from app.core.dataset_manifest import sha256_file
 from app.core.result_parser import ResultParser
-from app.core.run_artifacts import read_canonical_checkpoint, read_persisted_threshold
+from app.core.run_artifacts import read_canonical_checkpoint, read_persisted_threshold_metadata
 from app.models.prediction_result import PredictionResult
 from app.models.training_config import TrainingConfig
 from app.services.anomalib_service import AnomalibService
@@ -72,7 +72,8 @@ class ExportService:
 
         config = self._load_training_config(run_directory)
         checkpoint_path = read_canonical_checkpoint(run_directory).path
-        decision_threshold = read_persisted_threshold(run_directory)
+        threshold_metadata = read_persisted_threshold_metadata(run_directory)
+        decision_threshold = float(threshold_metadata["threshold_value"])
         final_test_predictions = self._load_final_test_predictions(run_directory)
         export_directory = export_directory.expanduser().resolve()
         package_directory = export_directory / self.package_directory_name(config.model_name, run_directory.name)
@@ -104,7 +105,7 @@ class ExportService:
                 result.validation_report = self._write_validation_report(
                     result,
                     validation,
-                    decision_threshold,
+                    threshold_metadata,
                 )
                 exported.append(result)
             except Exception as exc:
@@ -117,6 +118,7 @@ class ExportService:
             exported=exported,
             failures=failures,
             included_artifacts=included_artifacts,
+            threshold_metadata=threshold_metadata,
         )
         return ModelExportReport(exported=exported, failures=failures, package_directory=package_directory)
 
@@ -136,9 +138,12 @@ class ExportService:
             "results.json",
             "predictions.csv",
         )
+        optional_names = ("calibration_manifest.json", "final_test_manifest.json")
         copied: dict[str, str] = {}
-        for name in required_names:
+        for name in (*required_names, *optional_names):
             source_path = run_directory / name
+            if name in optional_names and not source_path.is_file():
+                continue
             if not source_path.is_file() or source_path.stat().st_size == 0:
                 raise FileNotFoundError(f"Required run artifact is missing or empty: {source_path}")
             target_path = package_directory / name
@@ -155,12 +160,14 @@ class ExportService:
         exported: list[ExportResult],
         failures: dict[str, str],
         included_artifacts: dict[str, str],
+        threshold_metadata: dict[str, object],
     ) -> Path:
         """Record deployment package provenance and every verified file digest."""
         payload = {
             "canonical_checkpoint": str(canonical_checkpoint_path),
             "canonical_checkpoint_sha256": sha256_file(canonical_checkpoint_path),
             "final_test_prediction_count": len(final_test_predictions),
+            "threshold_metadata": threshold_metadata,
             "included_run_artifacts": included_artifacts,
             "exports": [
                 {
@@ -196,7 +203,7 @@ class ExportService:
     def _write_validation_report(
         result: ExportResult,
         validation: dict[str, object],
-        threshold: float,
+        threshold_metadata: dict[str, object],
     ) -> Path:
         report_path = result.exported_path.with_suffix(f"{result.exported_path.suffix}.validation.json")
         report_path.write_text(
@@ -205,7 +212,8 @@ class ExportService:
                     "artifact": str(result.exported_path),
                     "artifact_sha256": result.sha256,
                     "format": result.export_format,
-                    "decision_threshold": threshold,
+                    "decision_threshold": threshold_metadata["threshold_value"],
+                    "threshold_metadata": threshold_metadata,
                     "validation": validation,
                 },
                 indent=2,

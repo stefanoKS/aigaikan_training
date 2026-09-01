@@ -40,3 +40,15 @@ def test_small_but_clean_final_test_is_a_quality_warning() -> None:
     report = calculate_quality_metrics([_prediction("OK", "OK", 0.1), _prediction("NG", "NG", 0.9)])
 
     assert report.status == "WARNING"
+
+
+def test_normal_only_final_test_does_not_report_defect_detection_performance() -> None:
+    report = calculate_quality_metrics([_prediction("OK", "OK", 0.1), _prediction("OK", "NG", 0.8)])
+
+    assert report.status == "NOT VERIFIED"
+    assert report.metrics["NG Detected"] == "NOT MEASURED"
+    assert report.metrics["NG Missed"] == "NOT MEASURED"
+    assert report.metrics["Escape Rate"] == "NOT MEASURED"
+    assert report.metrics["AUROC"] == "NOT MEASURED"
+    assert report.metrics["Precision"] == "NOT MEASURED"
+    assert "NO GENUINE NG TEST DATA" in report.warning

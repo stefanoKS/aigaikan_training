@@ -133,6 +133,19 @@ class ResultParser:
             final_checkpoint_path=str(payload.get("final_checkpoint_path", "")),
             final_checkpoint_sha256=str(payload.get("final_checkpoint_sha256", "")),
             dataset_manifest_sha256=str(payload.get("dataset_manifest_sha256", "")),
+            calibration_manifest_sha256=str(payload.get("calibration_manifest_sha256", "")),
+            final_test_manifest_sha256=str(payload.get("final_test_manifest_sha256", "")),
+            evaluation_revision_id=str(payload.get("evaluation_revision_id", "")),
+            model_variant=str(payload.get("model_variant", "")),
+            encoder_family=str(payload.get("encoder_family", "")),
+            threshold_metadata=(
+                dict(payload["threshold_metadata"])
+                if isinstance(payload.get("threshold_metadata"), dict)
+                else {}
+            ),
+            mean_inference_latency_ms=_optional_float(payload.get("mean_inference_latency_ms")),
+            p95_inference_latency_ms=_optional_float(payload.get("p95_inference_latency_ms")),
+            peak_gpu_memory_mb=_optional_float(payload.get("peak_gpu_memory_mb")),
             quality_status=str(payload.get("quality_status", "")),
             export_status=str(payload.get("export_status", "Not exported")),
             aigaikan_compatibility_status=str(payload.get("aigaikan_compatibility_status", "Not validated")),
@@ -176,4 +189,11 @@ class ResultParser:
                     }
                 )
         return path
+
+
+def _optional_float(value: Any) -> float | None:
+    """Deserialize an optional measured numeric value without inventing a default."""
+    if value is None:
+        return None
+    return float(value)
 

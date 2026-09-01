@@ -18,7 +18,8 @@ from app.core.prediction_adapter import iter_anomalib_predictions
 from app.core.project_manager import ProjectManager
 from app.core.quality_metrics import calculate_quality_metrics
 from app.core.result_parser import ResultParser
-from app.core.run_artifacts import extract_decision_threshold, resolve_canonical_checkpoint, write_run_manifest
+from app.core.run_artifacts import resolve_canonical_checkpoint, write_evaluation_revision, write_run_manifest
+from app.core.threshold_calibrator import CalibrationSample, ThresholdCalibrationConfig, ThresholdCalibrator
 from app.models.prediction_result import PredictionResult
 from app.models.project_config import ProjectConfig
 from app.models.training_run import TrainingRun
@@ -126,6 +127,104 @@ def emit(message: dict[str, object]) -> None:
     sys.stdout.flush()
 
 
+def calibration_samples_from_predictions(
+    output: Any,
+    source_path_by_staged_path: dict[Path, Path],
+) -> list[CalibrationSample]:
+    """Convert only held-out calibration predictions into evidence for threshold selection."""
+    samples: list[CalibrationSample] = []
+    for prediction in iter_anomalib_predictions(output):
+        if prediction.image_path not in source_path_by_staged_path:
+            raise ValueError(f"Calibration prediction path is not part of the staged dataset: {prediction.image_path}")
+        role = prediction.image_path.parent.name
+        if role == "validation_ok":
+            label = "OK"
+        elif role == "validation_ng":
+            label = "NG"
+        else:
+            raise ValueError(f"Calibration prediction path has an unexpected staged role: {prediction.image_path}")
+        samples.append(CalibrationSample(score=prediction.score, label=label))
+    return samples
+
+
+def _final_test_predictions(
+    output: Any,
+    source_path_by_staged_path: dict[Path, Path],
+    threshold: float,
+) -> list[PredictionResult]:
+    """Build final-test rows using the application-calibrated deployment threshold."""
+    predictions: list[PredictionResult] = []
+    for anomalib_prediction in iter_anomalib_predictions(output):
+        staged_path = anomalib_prediction.image_path
+        source_path = source_path_by_staged_path.get(staged_path)
+        if source_path is None:
+            raise ValueError(f"Final-test prediction path is not part of the staged dataset: {staged_path}")
+        dataset_role = staged_path.parent.name
+        if dataset_role == "final_test_ok":
+            ground_truth = "OK"
+        elif dataset_role == "final_test_ng":
+            ground_truth = "NG"
+        else:
+            raise ValueError(f"Final-test prediction path has an unexpected staged role: {staged_path}")
+        predictions.append(
+            PredictionResult(
+                source_path=str(source_path),
+                predicted_label="NG" if anomalib_prediction.score >= threshold else "OK",
+                ground_truth_label=ground_truth,
+                anomaly_score=anomalib_prediction.score,
+                threshold=threshold,
+                original_image=str(source_path),
+                dataset_role=dataset_role,
+            )
+        )
+    return predictions
+
+
+def _model_provenance(definition: Any, config: Any, model: Any) -> dict[str, object]:
+    """Describe model identity and encoder provenance without conflating DINO families."""
+    payload: dict[str, object] = {
+        "algorithm": definition.algorithm or definition.anomalib_class_name or definition.display_name,
+        "model_variant": definition.model_variant or definition.key,
+        "encoder_family": definition.encoder_family or None,
+        "official_anomalib_implementation": definition.official_anomalib_implementation,
+    }
+    if definition.key == "dinomaly_dinov2":
+        payload["encoder"] = {"family": "DINOv2", "name": config.dinomaly_encoder}
+    elif definition.key == "dinomaly_dinov3":
+        payload["encoder"] = getattr(model, "encoder_metadata", {"family": "DINOv3", "name": config.dinomaly_dinov3_encoder})
+    elif definition.key == "superadd_dinov3":
+        payload["encoder"] = {
+            "family": "DINOv3",
+            "name": config.superadd_encoder,
+            "feature_layers": list(config.dinov3_feature_layers),
+        }
+    return payload
+
+
+def _reset_gpu_peak_memory(device: str) -> None:
+    """Reset GPU peak accounting only when a CUDA prediction is actually selected."""
+    if device != "gpu":
+        return
+    try:
+        import torch
+
+        torch.cuda.reset_peak_memory_stats()
+    except Exception:
+        pass
+
+
+def _peak_gpu_memory_mb(device: str) -> float | None:
+    """Return measured CUDA peak memory when the runtime provides it."""
+    if device != "gpu":
+        return None
+    try:
+        import torch
+
+        return torch.cuda.max_memory_allocated() / (1024 * 1024)
+    except Exception:
+        return None
+
+
 def run(project_file: Path) -> int:
     """Run training for the given project."""
     manager = ProjectManager(project_file.parent.parent)
@@ -156,6 +255,22 @@ def run(project_file: Path) -> int:
         project.training.apply_model_defaults(len(effective_split.training_ok))
         manifest = build_dataset_manifest(effective_split.roles(), Path(project.project_path))
         write_dataset_manifest(run_dir / "dataset_manifest.json", manifest)
+        calibration_manifest = build_dataset_manifest(
+            {
+                "validation_ok": effective_split.validation_ok,
+                "validation_ng": effective_split.validation_ng,
+            },
+            Path(project.project_path),
+        )
+        write_dataset_manifest(run_dir / "calibration_manifest.json", calibration_manifest)
+        final_test_manifest = build_dataset_manifest(
+            {
+                "final_test_ok": effective_split.final_test_ok,
+                "final_test_ng": effective_split.final_test_ng,
+            },
+            Path(project.project_path),
+        )
+        write_dataset_manifest(run_dir / "final_test_manifest.json", final_test_manifest)
         staged_dataset = stage_effective_split(effective_split, project.dataset, run_dir / "dataset_snapshot")
         environment = collect_environment_info(Path(project.project_path), project.training.random_seed)
         (run_dir / "environment.json").write_text(json.dumps(environment, indent=2), encoding="utf-8")
@@ -199,12 +314,49 @@ def run(project_file: Path) -> int:
                 }
             )
         canonical_checkpoint = resolve_canonical_checkpoint(components["engine"])
-        decision_threshold = extract_decision_threshold(components["model"])
         emit(
             {
                 "type": "log",
                 "level": "info",
                 "message": f"Using Anomalib canonical checkpoint: {canonical_checkpoint.path.name}",
+            }
+        )
+        calibration_predictions_output = components["engine"].predict(
+            model=components["model"],
+            datamodule=components["datamodule"],
+            return_predictions=True,
+            ckpt_path=str(canonical_checkpoint.path),
+        )
+        calibration_samples = calibration_samples_from_predictions(
+            calibration_predictions_output,
+            staged_dataset.source_path_by_staged_path,
+        )
+        expected_calibration_count = sum(effective_split.counts()["validation"].values())
+        if len(calibration_samples) != expected_calibration_count:
+            raise RuntimeError(
+                f"Calibration prediction count mismatch: expected {expected_calibration_count}, "
+                f"received {len(calibration_samples)}."
+            )
+        calibration_result = ThresholdCalibrator().calibrate(
+            calibration_samples,
+            ThresholdCalibrationConfig(
+                method=project.training.threshold_method,
+                target_normal_false_reject_rate=project.training.target_normal_false_reject_rate,
+                minimum_required_ng_recall=project.training.minimum_required_ng_recall,
+            ),
+        )
+        decision_threshold = calibration_result.threshold_value
+        threshold_metadata = calibration_result.to_dict()
+        threshold_metadata["calibration_manifest_sha256"] = calibration_manifest["manifest_sha256"]
+        threshold_metadata["calibration_manifest_path"] = str(run_dir / "calibration_manifest.json")
+        emit(
+            {
+                "type": "log",
+                "level": "warning" if calibration_result.warning else "info",
+                "message": (
+                    f"Calibrated threshold {decision_threshold:.6g} with {calibration_result.threshold_method} "
+                    f"from {calibration_result.calibration_sample_count} held-out validation images."
+                ),
             }
         )
         emit({"type": "stage", "name": STAGES[5]})
@@ -215,20 +367,7 @@ def run(project_file: Path) -> int:
             project.training,
             calibration_mode=False,
         )
-        metrics = components["engine"].test(
-            model=components["model"],
-            datamodule=final_test_datamodule,
-            ckpt_path=str(canonical_checkpoint.path),
-        )
-        evaluation_duration = perf_counter() - evaluation_started
-        metric_payload = metrics[0] if metrics else {}
-        run_metrics: dict[str, float | str | None] = {}
-        for name, value in metric_payload.items():
-            if hasattr(value, "item"):
-                value = value.item()
-            if isinstance(value, (int, float)):
-                run_metrics[result_parser.normalize_metric_name(str(name))] = value
-                emit({"type": "metric", "name": name, "value": value})
+        _reset_gpu_peak_memory(str(components["device"]))
         emit({"type": "stage", "name": STAGES[6]})
         final_predictions_output = components["engine"].predict(
             model=components["model"],
@@ -236,42 +375,59 @@ def run(project_file: Path) -> int:
             return_predictions=True,
             ckpt_path=str(canonical_checkpoint.path),
         )
-        predictions = []
-        for anomalib_prediction in iter_anomalib_predictions(final_predictions_output):
-            staged_path = anomalib_prediction.image_path
-            source_path = staged_dataset.source_path_by_staged_path.get(staged_path)
-            if source_path is None:
-                raise ValueError(f"Final-test prediction path is not part of the staged dataset: {staged_path}")
-            dataset_role = staged_path.parent.name
-            if dataset_role == "final_test_ok":
-                ground_truth = "OK"
-            elif dataset_role == "final_test_ng":
-                ground_truth = "NG"
-            else:
-                raise ValueError(f"Final-test prediction path has an unexpected staged role: {staged_path}")
-            predictions.append(
-                PredictionResult(
-                    source_path=str(source_path),
-                    predicted_label="NG" if anomalib_prediction.score >= decision_threshold else "OK",
-                    ground_truth_label=ground_truth,
-                    anomaly_score=anomalib_prediction.score,
-                    threshold=decision_threshold,
-                    original_image=str(source_path),
-                    dataset_role=dataset_role,
-                )
-            )
+        evaluation_duration = perf_counter() - evaluation_started
+        predictions = _final_test_predictions(
+            final_predictions_output,
+            staged_dataset.source_path_by_staged_path,
+            decision_threshold,
+        )
         expected_prediction_count = sum(effective_split.counts()["final_test"].values())
         if len(predictions) != expected_prediction_count:
             raise RuntimeError(
                 f"Final-test prediction count mismatch: expected {expected_prediction_count}, received {len(predictions)}."
             )
+        mean_inference_latency_ms = evaluation_duration * 1000 / len(predictions)
+        peak_gpu_memory_mb = _peak_gpu_memory_mb(str(components["device"]))
+        run_metrics: dict[str, float | str | None] = {
+            "Mean Inference Latency (ms/image)": mean_inference_latency_ms,
+            "P95 Inference Latency (ms/image)": "NOT MEASURED (aggregate prediction timing)",
+            "Peak GPU Memory (MB)": peak_gpu_memory_mb if peak_gpu_memory_mb is not None else "NOT MEASURED",
+            "Model Size (bytes)": canonical_checkpoint.path.stat().st_size,
+        }
         result_parser.export_predictions_csv(run_dir / "predictions.csv", predictions)
         quality_report = calculate_quality_metrics(predictions)
         run_metrics.update(quality_report.metrics)
         run_metrics["Quality Status"] = quality_report.status
+        run_metrics["Threshold Method"] = calibration_result.threshold_method
+        run_metrics["Calibration Image Count"] = calibration_result.calibration_sample_count
+        run_metrics["Calibration Normal Image Count"] = calibration_result.normal_calibration_sample_count
+        run_metrics["Calibration NG Image Count"] = calibration_result.abnormal_calibration_sample_count
+        run_metrics["Calibration Target False Reject Rate"] = calibration_result.target_false_reject_rate
+        run_metrics["Calibration Observed False Reject Rate"] = calibration_result.observed_calibration_false_reject_rate
+        run_metrics["Calibration OK Score P05"] = calibration_result.normal_score_quantiles.get("p05")
+        run_metrics["Calibration OK Score P50"] = calibration_result.normal_score_quantiles.get("p50")
+        run_metrics["Calibration OK Score P95"] = calibration_result.normal_score_quantiles.get("p95")
+        run_metrics["Calibration OK Score IQR"] = calibration_result.normal_score_iqr
+        if calibration_result.abnormal_score_quantiles:
+            run_metrics["Calibration NG Score P05"] = calibration_result.abnormal_score_quantiles.get("p05")
+            run_metrics["Calibration NG Score P50"] = calibration_result.abnormal_score_quantiles.get("p50")
+            run_metrics["Calibration NG Score P95"] = calibration_result.abnormal_score_quantiles.get("p95")
+            run_metrics["Calibration NG Score IQR"] = calibration_result.abnormal_score_iqr
+        if quality_report.warning:
+            run_metrics["Quality Evidence Warning"] = quality_report.warning
         for name, value in quality_report.metrics.items():
             if isinstance(value, (int, float)):
                 emit({"type": "metric", "name": name, "value": value})
+        revision_path = write_evaluation_revision(
+            run_dir,
+            canonical_checkpoint=canonical_checkpoint,
+            calibration_manifest_sha256=str(calibration_manifest["manifest_sha256"]),
+            final_test_manifest_sha256=str(final_test_manifest["manifest_sha256"]),
+            threshold_metadata=threshold_metadata,
+            evaluation_metrics=quality_report.metrics,
+        )
+        threshold_metadata["threshold_revision"] = revision_path.stem
+        run_metrics["Threshold Revision"] = revision_path.stem
         result_parser.write_training_run(
             run_dir / "results.json",
             TrainingRun(
@@ -285,6 +441,14 @@ def run(project_file: Path) -> int:
                 final_checkpoint_path=str(canonical_checkpoint.path),
                 final_checkpoint_sha256=canonical_checkpoint.sha256,
                 dataset_manifest_sha256=str(manifest["manifest_sha256"]),
+                calibration_manifest_sha256=str(calibration_manifest["manifest_sha256"]),
+                final_test_manifest_sha256=str(final_test_manifest["manifest_sha256"]),
+                evaluation_revision_id=revision_path.stem,
+                model_variant=definition.model_variant or definition.key,
+                encoder_family=definition.encoder_family,
+                threshold_metadata=threshold_metadata,
+                mean_inference_latency_ms=mean_inference_latency_ms,
+                peak_gpu_memory_mb=peak_gpu_memory_mb,
                 quality_status=quality_report.status,
                 metrics=run_metrics,
                 predictions=predictions,
@@ -296,10 +460,14 @@ def run(project_file: Path) -> int:
             dataset_manifest_sha256=str(manifest["manifest_sha256"]),
             split_counts=effective_split.counts(),
             threshold=decision_threshold,
+            threshold_metadata=threshold_metadata,
             extra={
-                "model": definition.display_name,
+                "model": _model_provenance(definition, project.training, components["model"]),
                 "config_path": str(run_dir / "config.json"),
                 "environment_path": str(run_dir / "environment.json"),
+                "calibration_manifest_path": str(run_dir / "calibration_manifest.json"),
+                "final_test_manifest_path": str(run_dir / "final_test_manifest.json"),
+                "evaluation_revision_path": str(revision_path),
                 "predictions_path": str(run_dir / "predictions.csv"),
                 "quality_status": quality_report.status,
             },

@@ -164,6 +164,20 @@ def test_patchcore_uses_anomalib_owned_model_input_preprocessing(tmp_path: Path,
     assert components["model"].kwargs["pre_processor"] == {"image_size": (280, 280)}
 
 
+def test_dinomaly_dinov3_dispatches_to_the_application_adapter(monkeypatch) -> None:
+    import app.services.dinomaly_dinov3_adapter as adapter
+
+    sentinel = object()
+    monkeypatch.setattr(adapter, "create_dinomaly_dinov3_model", lambda _config: sentinel)
+
+    model = AnomalibService()._create_model(
+        ModelRegistry().get("dinomaly_dinov3"),
+        TrainingConfig(model_name="dinomaly_dinov3", device=DeviceMode.CPU),
+    )
+
+    assert model is sentinel
+
+
 def test_calibration_datamodule_never_splits_the_final_test_subset(tmp_path: Path, monkeypatch) -> None:
     """Calibration reuses its own held-out snapshot rather than splitting it again."""
     class FakeFolder:

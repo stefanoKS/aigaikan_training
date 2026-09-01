@@ -89,6 +89,13 @@ class ResultsPage(QWidget):
         splitter = QSplitter()
         metrics_group = QGroupBox("Metrics")
         metrics_form = QFormLayout(metrics_group)
+        self.no_ng_warning_label = QLabel(
+            "NO GENUINE NG TEST DATA.\nDEFECT-DETECTION PERFORMANCE HAS NOT BEEN VERIFIED."
+        )
+        self.no_ng_warning_label.setObjectName("NoNgWarning")
+        self.no_ng_warning_label.setWordWrap(True)
+        self.no_ng_warning_label.setVisible(False)
+        metrics_form.addRow(self.no_ng_warning_label)
         self.metric_labels: dict[str, QLabel] = {}
         for key in (
             "Run Name",
@@ -109,6 +116,12 @@ class ResultsPage(QWidget):
             "True NG",
             "False OK",
             "Quality Status",
+            "Defect Detection Evidence",
+            "Threshold Method",
+            "Threshold Revision",
+            "Calibration Images",
+            "Calibration False Reject Target",
+            "Calibration False Reject Observed",
             "Canonical Checkpoint",
             "Export Status",
             "AIGAIKAN Compatibility",
@@ -151,6 +164,7 @@ class ResultsPage(QWidget):
         self.export_model_button.setEnabled(False)
         self.metrics_table.setRowCount(0)
         self.gallery_table.setRowCount(0)
+        self.no_ng_warning_label.setVisible(False)
         for label in self.metric_labels.values():
             label.setText("Not available")
 
@@ -162,6 +176,10 @@ class ResultsPage(QWidget):
         self.current_run_directory = run_directory if run_directory.is_dir() else None
         self.export_model_button.setEnabled(self.current_run_directory is not None)
         metric_values = {name: self._format_value(value) for name, value in run.metrics.items()}
+        no_ng_evidence = (
+            run.metrics.get("Defect Detection Evidence") == "NOT MEASURED" or run.quality_status == "NOT VERIFIED"
+        )
+        self.no_ng_warning_label.setVisible(no_ng_evidence)
         self.set_metrics(metric_values)
         summary = {
             "Run Name": run.run_name,
@@ -174,10 +192,40 @@ class ResultsPage(QWidget):
             "Canonical Checkpoint": Path(run.final_checkpoint_path).name if run.final_checkpoint_path else "Not available",
             "Export Status": run.export_status,
             "AIGAIKAN Compatibility": run.aigaikan_compatibility_status,
+            "Defect Detection Evidence": run.metrics.get("Defect Detection Evidence", "Measured"),
+            "Threshold Method": str(
+                run.threshold_metadata.get("threshold_method", run.metrics.get("Threshold Method", "Not available"))
+            ),
+            "Threshold Revision": str(
+                run.threshold_metadata.get("threshold_revision", run.metrics.get("Threshold Revision", "Not available"))
+            ),
+            "Calibration Images": self._format_value(run.metrics.get("Calibration Image Count")),
+            "Calibration False Reject Target": self._format_value(
+                run.metrics.get("Calibration Target False Reject Rate")
+            ),
+            "Calibration False Reject Observed": self._format_value(
+                run.metrics.get("Calibration Observed False Reject Rate")
+            ),
         }
-        for key in ("Image AUROC", "Image F1", "Precision", "Recall", "Threshold", "Decision Threshold"):
-            if key in metric_values:
-                summary["Threshold" if key == "Decision Threshold" else key] = metric_values[key]
+        metric_summary_keys = {
+            "AUROC": "Image AUROC",
+            "F1": "Image F1",
+            "Precision": "Precision",
+            "Recall": "Recall",
+            "Decision Threshold": "Threshold",
+            "NG Tested": "NG Test Images",
+            "OK Tested": "OK Test Images",
+            "Actual OK -> Predicted OK": "True OK",
+            "Actual OK -> Predicted NG": "False NG",
+            "Actual NG -> Predicted NG": "True NG",
+            "Actual NG -> Predicted OK (Escaped NG)": "False OK",
+        }
+        for metric_key, summary_key in metric_summary_keys.items():
+            if metric_key in metric_values:
+                summary[summary_key] = metric_values[metric_key]
+        if no_ng_evidence:
+            for key in ("Image AUROC", "Image F1", "Precision", "Recall", "NG Test Images", "True NG", "False OK"):
+                summary[key] = "NOT MEASURED"
         for key, label in self.metric_labels.items():
             label.setText(summary.get(key, "Not available"))
         self._apply_prediction_filter()

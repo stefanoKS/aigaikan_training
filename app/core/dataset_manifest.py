@@ -85,9 +85,9 @@ def collect_configured_images(config: DatasetConfig) -> dict[DatasetRole, list[P
 def build_effective_split(config: DatasetConfig, seed: int) -> EffectiveSplit:
     """Create reproducible disjoint partitions for training, calibration, and final testing.
 
-    A project with only ``ok_train`` and ``ng_test`` keeps 20% of normal images
-    and half of each held-out class for validation. Explicit validation folders
-    take precedence when present, while the final test set remains untouched.
+    A project with only ``ok_train`` keeps disjoint normal images for training,
+    calibration, and final evaluation. Genuine NG images are optional: they are
+    never borrowed from final testing to calibrate a threshold.
     """
     images = collect_configured_images(config)
     ok_train = images.get(DatasetRole.OK_TRAIN, [])
@@ -97,9 +97,6 @@ def build_effective_split(config: DatasetConfig, seed: int) -> EffectiveSplit:
     validation_ng = images.get(DatasetRole.NG_VALIDATION, [])
     if len(ok_train) < 2:
         raise ValueError("At least two OK training images are required to create a split.")
-    if not ng_test:
-        raise ValueError("At least one NG test image is required to create a split.")
-
     shuffled_ok = _shuffled(ok_train, seed)
     if ok_test:
         training_ok = tuple(shuffled_ok)
@@ -116,7 +113,7 @@ def build_effective_split(config: DatasetConfig, seed: int) -> EffectiveSplit:
     if validation_ng:
         final_test_ng = tuple(ng_test)
     else:
-        final_test_ng, validation_ng = _split_for_validation(ng_test, seed + 2)
+        final_test_ng, validation_ng = _split_for_optional_validation(ng_test, seed + 2)
 
     split = EffectiveSplit(
         training_ok=training_ok,
@@ -148,12 +145,10 @@ def validate_effective_split(split: EffectiveSplit) -> None:
     if duplicate_paths or duplicate_content:
         details = "; ".join([*duplicate_paths, *duplicate_content])
         raise ValueError(f"Dataset leakage detected across training, validation, and final test: {details}")
-    if not split.final_test_ng:
-        raise ValueError("The final test split must contain at least one NG image.")
     if not split.final_test_ok:
         raise ValueError("The final test split must contain at least one OK image.")
-    if not split.validation_ok or not split.validation_ng:
-        raise ValueError("Validation must contain at least one OK and one NG image for threshold calibration.")
+    if not split.validation_ok:
+        raise ValueError("Validation must contain at least one held-out OK image for threshold calibration.")
 
 
 def build_dataset_manifest(
@@ -262,6 +257,14 @@ def _split_for_validation(paths: Iterable[Path], seed: int) -> tuple[tuple[Path,
     return tuple(values[:-validation_count]), tuple(values[-validation_count:])
 
 
+def _split_for_optional_validation(paths: Iterable[Path], seed: int) -> tuple[tuple[Path, ...], tuple[Path, ...]]:
+    """Reserve NG calibration data only when doing so leaves genuine final-test data."""
+    values = _shuffled(paths, seed)
+    if len(values) < 2:
+        return tuple(values), ()
+    return _split_for_validation(values, seed)
+
+
 def _stage_images(paths: Iterable[Path], destination: Path) -> dict[Path, Path]:
     destination.mkdir(parents=True, exist_ok=True)
     mapping: dict[Path, Path] = {}
@@ -307,7 +310,8 @@ def _staged_config(
     config = DatasetConfig()
     config.folders[DatasetRole.OK_TRAIN].path = str(next(iter(training_ok.values())).parent)
     config.folders[DatasetRole.OK_TEST].path = str(next(iter(evaluation_ok.values())).parent)
-    config.folders[DatasetRole.NG_TEST].path = str(next(iter(evaluation_ng.values())).parent)
+    if evaluation_ng:
+        config.folders[DatasetRole.NG_TEST].path = str(next(iter(evaluation_ng.values())).parent)
     if masks:
         config.folders[DatasetRole.MASKS].path = str(next(iter(masks.values())).parent)
     return config

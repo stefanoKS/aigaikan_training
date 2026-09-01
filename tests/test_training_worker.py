@@ -1,6 +1,8 @@
-"""Tests for training worker progress reporting."""
+"""Tests for training worker progress reporting and calibration data isolation."""
 
-from app.workers.training_worker import TrainingProgressReporter
+from pathlib import Path
+
+from app.workers.training_worker import TrainingProgressReporter, _peak_gpu_memory_mb, calibration_samples_from_predictions
 
 
 class _FakeTrainer:
@@ -33,3 +35,19 @@ def test_progress_callback_reports_batch_counts() -> None:
         {"type": "stage_progress", "current": 0, "total": 3},
         {"type": "stage_progress", "current": 3, "total": 3},
     ]
+
+
+def test_calibration_samples_reject_final_test_predictions(tmp_path: Path) -> None:
+    staged_path = (tmp_path / "final_test_ng" / "item.png").resolve()
+    output = {"image_path": [str(staged_path)], "pred_score": [0.9], "anomaly_map": [None]}
+
+    try:
+        calibration_samples_from_predictions(output, {staged_path: tmp_path / "source.png"})
+    except ValueError as exc:
+        assert "unexpected staged role" in str(exc)
+    else:
+        raise AssertionError("Final-test predictions must never be used for threshold calibration")
+
+
+def test_cpu_prediction_does_not_claim_gpu_peak_memory() -> None:
+    assert _peak_gpu_memory_mb("cpu") is None

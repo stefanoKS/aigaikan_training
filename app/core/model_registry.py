@@ -33,7 +33,11 @@ class ModelDefinition:
 
     key: str
     display_name: str
-    anomalib_class_name: str
+    anomalib_class_name: str | None
+    algorithm: str = ""
+    model_variant: str = ""
+    encoder_family: str = ""
+    official_anomalib_implementation: bool = True
     input_type: ModelInputType = ModelInputType.IMAGE_FOLDER
     execution_mode: ModelExecutionMode = ModelExecutionMode.TRAIN
     requirement: str = ""
@@ -59,6 +63,8 @@ class ModelRegistry:
             "patchcore",
             "PatchCore",
             "Patchcore",
+            algorithm="PatchCore",
+            model_variant="patchcore",
             support_level=ModelSupportLevel.PRODUCTION_VALIDATED,
         ),
         ModelDefinition("padim", "PaDiM", "Padim"),
@@ -90,17 +96,33 @@ class ModelRegistry:
         ModelDefinition("cfm", "CFM", "CFM", requirement="Requires PointMAE weights."),
         ModelDefinition("anomaly_dino", "AnomalyDINO", "AnomalyDINO"),
         ModelDefinition(
-            "dinomaly",
+            "dinomaly_dinov2",
+            "Dinomaly (DINOv2)",
             "Dinomaly",
-            "Dinomaly",
+            algorithm="Dinomaly",
+            model_variant="dinomaly_dinov2",
+            encoder_family="DINOv2",
             support_level=ModelSupportLevel.PRODUCTION_VALIDATED,
+        ),
+        ModelDefinition(
+            "dinomaly_dinov3",
+            "Dinomaly (DINOv3, Experimental)",
+            None,
+            algorithm="Dinomaly",
+            model_variant="dinomaly_dinov3",
+            encoder_family="DINOv3",
+            official_anomalib_implementation=False,
+            requirement="Application-side DINOv3 encoder adapter; not stock Anomalib Dinomaly.",
         ),
         ModelDefinition("inpformer", "INP-Former", "InpFormer"),
         ModelDefinition(
-            "superadd",
-            "SuperADD (DINOv3)",
+            "superadd_dinov3",
+            "SuperADD (DINOv3, Experimental)",
             "SuperADD",
-            requirement="Training-free model; runs evaluation directly.",
+            algorithm="SuperADD",
+            model_variant="superadd_dinov3",
+            encoder_family="DINOv3",
+            requirement="Native Anomalib DINOv3 memory-bank comparison model.",
         ),
         ModelDefinition(
             "anomalyvfm",
@@ -145,7 +167,14 @@ class ModelRegistry:
             self._normalize(identifier): definition
             for definition in self._MODEL_DEFINITIONS
             for identifier in (definition.key, definition.display_name, definition.anomalib_class_name)
+            if identifier
         }
+        self._aliases.update(
+            {
+                "dinomaly": self._models["dinomaly_dinov2"],
+                "superadd": self._models["superadd_dinov3"],
+            }
+        )
 
     def all(self) -> list[ModelDefinition]:
         """Return every current Anomalib model definition."""
@@ -161,6 +190,14 @@ class ModelRegistry:
             definition
             for definition in self.image_folder_models()
             if definition.support_level is ModelSupportLevel.PRODUCTION_VALIDATED
+        ]
+
+    def official_anomalib_models(self) -> list[ModelDefinition]:
+        """Return definitions backed directly by installed Anomalib classes."""
+        return [
+            definition
+            for definition in self._MODEL_DEFINITIONS
+            if definition.official_anomalib_implementation and definition.anomalib_class_name
         ]
 
     def get(self, identifier: str) -> ModelDefinition:

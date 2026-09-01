@@ -77,3 +77,17 @@ def test_mask_suffix_and_dimensions_follow_anomalib_folder_contract(synthetic_da
     assert not any(issue.message == "Missing optional mask for NG image" for issue in report.warnings)
     assert not any(issue.message == "Mask dimensions do not match the NG image" for issue in report.warnings)
 
+
+def test_normal_only_dataset_is_valid_with_an_unverified_defect_warning(tmp_path: Path) -> None:
+    folder = tmp_path / "ok_train"
+    folder.mkdir()
+    Image.new("RGB", (64, 64), (20, 30, 40)).save(folder / "one.png")
+    Image.new("RGB", (64, 64), (30, 40, 50)).save(folder / "two.png")
+    config = DatasetConfig()
+    config.folders[DatasetRole.OK_TRAIN].path = str(folder)
+
+    report = DatasetValidator().validate(config)
+
+    assert report.is_valid
+    assert any("No genuine NG test data" in issue.message for issue in report.warnings)
+

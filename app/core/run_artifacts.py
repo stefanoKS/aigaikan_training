@@ -37,6 +37,7 @@ def write_run_manifest(
     dataset_manifest_sha256: str,
     split_counts: Mapping[str, Mapping[str, int]],
     threshold: float,
+    threshold_metadata: Mapping[str, object] | None = None,
     extra: Mapping[str, object] | None = None,
 ) -> Path:
     """Write the run contract used by testing, inference, export, and deployment."""
@@ -51,8 +52,47 @@ def write_run_manifest(
         "effective_split_counts": {name: dict(counts) for name, counts in split_counts.items()},
         "threshold": threshold,
     }
+    if threshold_metadata:
+        metadata = _validated_threshold_metadata(threshold_metadata, threshold)
+        payload["threshold_metadata"] = metadata
     if extra:
         payload.update(extra)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def write_evaluation_revision(
+    run_directory: Path,
+    *,
+    canonical_checkpoint: CanonicalCheckpoint,
+    calibration_manifest_sha256: str,
+    final_test_manifest_sha256: str,
+    threshold_metadata: Mapping[str, object],
+    evaluation_metrics: Mapping[str, object] | None = None,
+) -> Path:
+    """Write an immutable recalibration/evaluation record without altering the model checkpoint."""
+    metadata = _validated_threshold_metadata(
+        threshold_metadata,
+        float(threshold_metadata.get("threshold_value", "nan")),
+    )
+    revisions_directory = run_directory / "evaluation_revisions"
+    revisions_directory.mkdir(parents=True, exist_ok=True)
+    existing = sorted(revisions_directory.glob("revision-*.json"))
+    revision_id = f"revision-{len(existing) + 1:03d}"
+    metadata["threshold_revision"] = revision_id
+    path = revisions_directory / f"{revision_id}.json"
+    payload: dict[str, object] = {
+        "revision_id": revision_id,
+        "canonical_checkpoint": {
+            "path": str(canonical_checkpoint.path),
+            "sha256": canonical_checkpoint.sha256,
+        },
+        "calibration_manifest_sha256": calibration_manifest_sha256,
+        "final_test_manifest_sha256": final_test_manifest_sha256,
+        "threshold_metadata": metadata,
+    }
+    if evaluation_metrics:
+        payload["evaluation_metrics"] = dict(evaluation_metrics)
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
     return path
 
@@ -87,7 +127,7 @@ def read_run_manifest(run_directory: Path) -> dict[str, Any]:
 
 def read_persisted_threshold(run_directory: Path) -> float:
     """Read the calibrated threshold used to approve this specific training run."""
-    value = read_run_manifest(run_directory).get("threshold")
+    value = read_persisted_threshold_metadata(run_directory)["threshold_value"]
     try:
         threshold = float(value)
     except (TypeError, ValueError) as exc:
@@ -95,6 +135,23 @@ def read_persisted_threshold(run_directory: Path) -> float:
     if not isfinite(threshold):
         raise ValueError("Run manifest decision threshold must be finite.")
     return threshold
+
+
+def read_persisted_threshold_metadata(run_directory: Path) -> dict[str, object]:
+    """Read structured threshold evidence, retaining compatibility with legacy run manifests."""
+    manifest = read_run_manifest(run_directory)
+    metadata = manifest.get("threshold_metadata")
+    if isinstance(metadata, dict):
+        return _validated_threshold_metadata(metadata, float(metadata.get("threshold_value", "nan")))
+    threshold = manifest.get("threshold")
+    return _validated_threshold_metadata(
+        {
+            "threshold_value": threshold,
+            "threshold_method": "legacy_anomalib_post_processor",
+            "threshold_revision": "legacy",
+        },
+        float(threshold),
+    )
 
 
 def read_canonical_checkpoint(run_directory: Path) -> CanonicalCheckpoint:
@@ -109,3 +166,18 @@ def read_canonical_checkpoint(run_directory: Path) -> CanonicalCheckpoint:
     if current_hash != expected_hash:
         raise ValueError("Canonical checkpoint hash does not match run_manifest.json.")
     return CanonicalCheckpoint(path=checkpoint_path, sha256=current_hash)
+
+
+def _validated_threshold_metadata(metadata: Mapping[str, object], expected_threshold: float) -> dict[str, object]:
+    """Validate the exact deployed threshold while preserving all calibration provenance."""
+    payload = dict(metadata)
+    try:
+        threshold = float(payload.get("threshold_value"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Threshold metadata must contain a finite threshold_value.") from exc
+    if not isfinite(threshold):
+        raise ValueError("Threshold metadata must contain a finite threshold_value.")
+    if isfinite(expected_threshold) and threshold != expected_threshold:
+        raise ValueError("Threshold metadata does not match the persisted decision threshold.")
+    payload["threshold_value"] = threshold
+    return payload

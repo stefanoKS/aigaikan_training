@@ -43,8 +43,14 @@ class DatasetValidator:
 
     MIN_OK_TRAIN_IMAGES = 2
     MIN_NG_TEST_IMAGES = 1
-    REQUIRED_ROLES = (DatasetRole.OK_TRAIN, DatasetRole.NG_TEST)
-    OPTIONAL_ROLES = (DatasetRole.OK_VALIDATION, DatasetRole.NG_VALIDATION, DatasetRole.OK_TEST, DatasetRole.MASKS)
+    REQUIRED_ROLES = (DatasetRole.OK_TRAIN,)
+    OPTIONAL_ROLES = (
+        DatasetRole.OK_VALIDATION,
+        DatasetRole.NG_VALIDATION,
+        DatasetRole.OK_TEST,
+        DatasetRole.NG_TEST,
+        DatasetRole.MASKS,
+    )
 
     def validate(self, config: DatasetConfig) -> DatasetValidationReport:
         """Validate all configured dataset folders."""
@@ -163,10 +169,7 @@ class DatasetValidator:
             report.errors.append(
                 ValidationIssue("error", DatasetRole.OK_TRAIN.value, "Insufficient OK training images")
             )
-        if len(role_files.get(DatasetRole.NG_TEST, [])) < self.MIN_NG_TEST_IMAGES:
-            report.errors.append(
-                ValidationIssue("error", DatasetRole.NG_TEST.value, "Insufficient NG test images")
-            )
+        ng_test_count = len(role_files.get(DatasetRole.NG_TEST, []))
         if len(role_files.get(DatasetRole.OK_TRAIN, [])) < 20:
             report.warnings.append(
                 ValidationIssue(
@@ -175,7 +178,15 @@ class DatasetValidator:
                     "Very small OK training set; production confidence will be limited",
                 )
             )
-        if len(role_files.get(DatasetRole.NG_TEST, [])) < 10:
+        if not ng_test_count:
+            report.warnings.append(
+                ValidationIssue(
+                    "warning",
+                    DatasetRole.NG_TEST.value,
+                    "No genuine NG test data; defect-detection performance will not be verified",
+                )
+            )
+        elif ng_test_count < 10:
             report.warnings.append(
                 ValidationIssue(
                     "warning",

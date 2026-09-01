@@ -7,7 +7,7 @@ from app.models.training_config import DeviceMode, TrainingConfig
 
 def test_training_config_round_trip() -> None:
     config = TrainingConfig(
-        model_name="Dinomaly",
+        model_name="dinomaly_dinov3",
         device=DeviceMode.CPU,
         image_width=512,
         image_height=320,
@@ -16,7 +16,7 @@ def test_training_config_round_trip() -> None:
         validation_every_n_epochs=3,
         gradient_clip_val=0.5,
         accumulate_grad_batches=2,
-        dinomaly_encoder="vit_small_patch16_dinov3.lvd1689m",
+        dinomaly_dinov3_encoder="vit_small_patch16_dinov3",
         dinomaly_decoder_depth=12,
         supplemental_data_path="C:/datasets/imagenette",
         zero_shot_class_name="widget",
@@ -30,8 +30,8 @@ def test_training_config_round_trip() -> None:
     assert restored.validation_every_n_epochs == 3
     assert restored.gradient_clip_val == 0.5
     assert restored.accumulate_grad_batches == 2
-    assert restored.model_name == "Dinomaly"
-    assert restored.dinomaly_encoder == "vit_small_patch16_dinov3.lvd1689m"
+    assert restored.model_name == "dinomaly_dinov3"
+    assert restored.dinomaly_dinov3_encoder == "vit_small_patch16_dinov3"
     assert restored.dinomaly_decoder_depth == 12
     assert restored.supplemental_data_path == "C:/datasets/imagenette"
     assert restored.zero_shot_class_name == "widget"
@@ -53,11 +53,20 @@ def test_sparse_persisted_config_uses_current_input_size_defaults() -> None:
 
 
 def test_dinomaly_calculates_epochs_from_training_image_count() -> None:
-    config = TrainingConfig(model_name="Dinomaly", batch_size=8, max_epochs=1)
+    config = TrainingConfig(model_name="dinomaly_dinov2", batch_size=8, max_epochs=1)
     config.apply_model_defaults(training_image_count=80)
 
     assert config.max_epochs == 300
     assert config.estimated_training_steps(training_image_count=80) == 3000
+
+
+def test_legacy_dinomaly_dinov3_encoder_migrates_to_its_explicit_variant() -> None:
+    config = TrainingConfig.from_dict(
+        {"model_name": "Dinomaly", "dinomaly_encoder": "vit_small_patch16_dinov3"}
+    )
+
+    assert config.model_name == "dinomaly_dinov3"
+    assert config.is_dinomaly_dinov3
 
 
 def test_invalid_batch_size_raises() -> None:

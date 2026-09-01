@@ -51,7 +51,7 @@ class AnomalibService:
             )
         missing_models = [
             definition.anomalib_class_name
-            for definition in self.model_registry.all()
+            for definition in self.model_registry.official_anomalib_models()
             if not hasattr(anomalib_models, definition.anomalib_class_name)
         ]
         if missing_models:
@@ -183,7 +183,7 @@ class AnomalibService:
         from anomalib.data import Folder
 
         ok_train = self._required_folder(dataset, DatasetRole.OK_TRAIN)
-        ng_test = self._required_folder(dataset, DatasetRole.NG_TEST)
+        ng_test = self._optional_folder(dataset, DatasetRole.NG_TEST)
         ok_test = self._optional_folder(dataset, DatasetRole.OK_TEST)
         masks = self._optional_folder(dataset, DatasetRole.MASKS)
         return Folder(
@@ -256,6 +256,12 @@ class AnomalibService:
 
     def _create_model(self, definition: ModelDefinition, config: TrainingConfig) -> Any:
         """Instantiate a model with its supported project-level options."""
+        if definition.key == "dinomaly_dinov3":
+            from app.services.dinomaly_dinov3_adapter import create_dinomaly_dinov3_model
+
+            return create_dinomaly_dinov3_model(config)
+        if definition.anomalib_class_name is None:
+            raise RuntimeError(f"No model factory is registered for {definition.display_name}.")
         import anomalib.models as anomalib_models
 
         model_class = getattr(anomalib_models, definition.anomalib_class_name, None)
@@ -272,7 +278,7 @@ class AnomalibService:
                 pre_trained=True,
                 pre_processor=model_class.configure_pre_processor(image_size=config.model_input_size),
             )
-        if definition.key == "dinomaly":
+        if definition.key == "dinomaly_dinov2":
             image_size = config.model_input_size
             return model_class(
                 encoder_name=config.dinomaly_encoder,
@@ -283,6 +289,14 @@ class AnomalibService:
                     image_size=image_size,
                     crop_size=min(image_size),
                 ),
+            )
+        if definition.key == "superadd_dinov3":
+            return model_class(
+                backbone=config.superadd_encoder,
+                layers=list(config.dinov3_feature_layers) or None,
+                patch_size=config.superadd_patch_size,
+                patch_overlap=config.superadd_patch_overlap,
+                pre_processor=model_class.configure_pre_processor(image_size=config.model_input_size),
             )
 
         model_kwargs = self._model_kwargs(definition, config)

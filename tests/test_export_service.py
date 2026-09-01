@@ -58,6 +58,12 @@ def test_export_model_uses_configured_formats_dimensions_and_names(tmp_path: Pat
         dataset_manifest_sha256="a" * 64,
         split_counts={"final_test": {"ok": 1, "ng": 1}},
         threshold=0.5,
+        threshold_metadata={
+            "threshold_value": 0.5,
+            "threshold_method": "normal_only_conformal",
+            "threshold_revision": "revision-001",
+            "calibration_manifest_sha256": "b" * 64,
+        },
     )
     ResultParser().write_training_run(
         run_directory / "results.json",
@@ -80,18 +86,25 @@ def test_export_model_uses_configured_formats_dimensions_and_names(tmp_path: Pat
     )
     (run_directory / "environment.json").write_text("{}", encoding="utf-8")
     (run_directory / "dataset_manifest.json").write_text("{}", encoding="utf-8")
+    (run_directory / "calibration_manifest.json").write_text("{}", encoding="utf-8")
+    (run_directory / "final_test_manifest.json").write_text("{}", encoding="utf-8")
     (run_directory / "predictions.csv").write_text("image_path\nfinal_test.png\n", encoding="utf-8")
     engine = FakeEngine()
     export_directory = tmp_path / "exports"
+    received_thresholds: list[float] = []
 
-    report = ExportService(
-        FakeAnomalibService(engine),
-        deployment_validator=lambda _path, _format, predictions, threshold: {
+    def deployment_validator(_path: Path, _format: str, predictions: list[PredictionResult], threshold: float) -> dict[str, object]:
+        received_thresholds.append(threshold)
+        return {
             "status": "PASS",
             "tested_images": len(predictions),
             "decision_parity": 1.0,
             "threshold": threshold,
-        },
+        }
+
+    report = ExportService(
+        FakeAnomalibService(engine),
+        deployment_validator=deployment_validator,
     ).export_model(
         run_directory,
         export_directory,
@@ -104,12 +117,21 @@ def test_export_model_uses_configured_formats_dimensions_and_names(tmp_path: Pat
     assert all(result.validation_report and result.validation_report.is_file() for result in report.exported)
     assert report.package_directory and (report.package_directory / "deployment_manifest.json").is_file()
     assert (report.package_directory / "predictions.csv").is_file()
+    assert (report.package_directory / "calibration_manifest.json").is_file()
+    assert (report.package_directory / "final_test_manifest.json").is_file()
     assert [result.exported_path.name for result in report.exported] == [
         "patchcore_2026_08_31_12_00_00_openvino.xml",
         "patchcore_2026_08_31_12_00_00_torch.pt",
     ]
     assert [call["input_size"] for call in engine.calls] == [(480, 640), (480, 640)]
     assert [call["ckpt_path"] for call in engine.calls] == [checkpoint.resolve(), checkpoint.resolve()]
+    assert received_thresholds == [0.5, 0.5]
+    deployment_manifest = json.loads((report.package_directory / "deployment_manifest.json").read_text(encoding="utf-8"))
+    assert deployment_manifest["threshold_metadata"]["threshold_method"] == "normal_only_conformal"
+    assert deployment_manifest["threshold_metadata"]["threshold_revision"] == "revision-001"
+    validation_report = json.loads(report.exported[0].validation_report.read_text(encoding="utf-8"))
+    assert validation_report["decision_threshold"] == 0.5
+    assert validation_report["threshold_metadata"]["calibration_manifest_sha256"] == "b" * 64
 
 
 def test_deployment_validation_rejects_any_final_test_decision_mismatch(monkeypatch) -> None:
