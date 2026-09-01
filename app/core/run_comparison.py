@@ -43,7 +43,11 @@ def compare_training_runs(runs: Iterable[TrainingRun]) -> RunComparisonReport:
     if len(selected_runs) < 2:
         raise ValueError("Select at least two runs to compare.")
     split_identities = {
-        (run.dataset_manifest_sha256, run.final_test_manifest_sha256)
+        (
+            run.dataset_manifest_sha256,
+            run.calibration_manifest_sha256,
+            run.final_test_manifest_sha256,
+        )
         for run in selected_runs
     }
     complete_identity = all(all(identity) for identity in split_identities)

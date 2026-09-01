@@ -17,7 +17,9 @@ from app.core.result_parser import ResultParser
 from app.core.run_artifacts import read_canonical_checkpoint, read_persisted_threshold_metadata
 from app.models.prediction_result import PredictionResult
 from app.models.training_config import TrainingConfig
-from app.services.anomalib_service import AnomalibService
+from app.services.anomalib_service import AnomalibService, REQUIRED_ANOMALIB_VERSION
+
+DEFAULT_SCORE_TOLERANCE = 1e-4
 
 
 class ModelExportFormat(StrEnum):
@@ -36,6 +38,7 @@ class ExportResult:
     export_format: str
     sha256: str
     validation_report: Path | None = None
+    validation: dict[str, object] | None = None
 
 
 @dataclass(slots=True)
@@ -53,10 +56,14 @@ class ExportService:
     def __init__(
         self,
         anomalib_service: AnomalibService | None = None,
-        deployment_validator: Callable[[Path, str, list[PredictionResult], float], dict[str, object]] | None = None,
+        deployment_validator: Callable[[Path, str, list[PredictionResult], float, float], dict[str, object]] | None = None,
+        score_tolerance: float = DEFAULT_SCORE_TOLERANCE,
     ) -> None:
+        if not isfinite(score_tolerance) or score_tolerance < 0:
+            raise ValueError("Export score tolerance must be a finite non-negative value.")
         self.anomalib_service = anomalib_service or AnomalibService()
         self._deployment_validator = deployment_validator or self._validate_deployment
+        self.score_tolerance = score_tolerance
 
     def export_model(
         self,
@@ -90,7 +97,7 @@ class ExportService:
                     export_type=export_format.value,
                     export_root=package_directory,
                     model_file_name=self.model_file_name(config.model_name, run_directory.name, export_format),
-                    input_size=(config.image_height, config.image_width),
+                    input_size=None,
                     ckpt_path=checkpoint_path,
                 )
                 if exported_path is None:
@@ -101,7 +108,9 @@ class ExportService:
                     result.export_format,
                     final_test_predictions,
                     decision_threshold,
+                    self.score_tolerance,
                 )
+                result.validation = validation
                 result.validation_report = self._write_validation_report(
                     result,
                     validation,
@@ -114,6 +123,7 @@ class ExportService:
         self._write_package_manifest(
             package_directory,
             canonical_checkpoint_path=checkpoint_path,
+            config=config,
             final_test_predictions=final_test_predictions,
             exported=exported,
             failures=failures,
@@ -156,6 +166,7 @@ class ExportService:
         package_directory: Path,
         *,
         canonical_checkpoint_path: Path,
+        config: TrainingConfig,
         final_test_predictions: list[PredictionResult],
         exported: list[ExportResult],
         failures: dict[str, str],
@@ -164,6 +175,11 @@ class ExportService:
     ) -> Path:
         """Record deployment package provenance and every verified file digest."""
         payload = {
+            "anomalib_version": REQUIRED_ANOMALIB_VERSION,
+            "model": {
+                "id": config.model_name,
+                "profile": config.model_profile(),
+            },
             "canonical_checkpoint": str(canonical_checkpoint_path),
             "canonical_checkpoint_sha256": sha256_file(canonical_checkpoint_path),
             "final_test_prediction_count": len(final_test_predictions),
@@ -175,6 +191,7 @@ class ExportService:
                     "path": result.exported_path.name,
                     "sha256": result.sha256,
                     "validation_report": result.validation_report.name if result.validation_report else None,
+                    "validation": result.validation,
                 }
                 for result in exported
             ],
@@ -228,8 +245,9 @@ class ExportService:
         export_format: str,
         expected_predictions: list[PredictionResult],
         threshold: float,
+        score_tolerance: float = DEFAULT_SCORE_TOLERANCE,
     ) -> dict[str, object]:
-        """Reload an export and require exact final-test OK/NG decision parity."""
+        """Reload an export and require numerical and threshold-decision final-test parity."""
         if export_format == ModelExportFormat.TORCH.value:
             from anomalib.deploy import TorchInferencer
 
@@ -240,17 +258,40 @@ class ExportService:
             inferencer = OpenVINOInferencer(path=exported_path, device="CPU")
         else:
             raise ValueError(f"No deployment inferencer is configured for {export_format}.")
-        mismatches: list[str] = []
+        decision_mismatches: list[str] = []
+        score_mismatches: list[str] = []
+        score_deltas: list[float] = []
         for expected in expected_predictions:
             score = ExportService._deployment_score(inferencer.predict(expected.source_path))
+            expected_score = float(expected.anomaly_score)
+            if not isfinite(expected_score):
+                raise ValueError(f"Persisted checkpoint score must be finite: {expected.source_path}")
+            score_delta = abs(score - expected_score)
+            score_deltas.append(score_delta)
             predicted_label = "NG" if score >= threshold else "OK"
             if predicted_label != expected.predicted_label.upper():
-                mismatches.append(expected.source_path)
-        if mismatches:
+                decision_mismatches.append(expected.source_path)
+            if score_delta > score_tolerance:
+                score_mismatches.append(expected.source_path)
+        if decision_mismatches:
             raise RuntimeError(
-                f"Deployment decision parity failed for {len(mismatches)} of {len(expected_predictions)} final-test images."
+                "Deployment decision parity failed for "
+                f"{len(decision_mismatches)} of {len(expected_predictions)} final-test images."
             )
-        return {"status": "PASS", "tested_images": len(expected_predictions), "decision_parity": 1.0}
+        if score_mismatches:
+            raise RuntimeError(
+                "Deployment score parity failed for "
+                f"{len(score_mismatches)} of {len(expected_predictions)} final-test images; "
+                f"tolerance is {score_tolerance}."
+            )
+        return {
+            "status": "PASS",
+            "tested_images": len(expected_predictions),
+            "decision_parity": 1.0,
+            "score_tolerance": score_tolerance,
+            "maximum_score_delta": max(score_deltas, default=0.0),
+            "mean_score_delta": sum(score_deltas) / len(score_deltas) if score_deltas else 0.0,
+        }
 
     @staticmethod
     def _deployment_score(prediction: Any) -> float:

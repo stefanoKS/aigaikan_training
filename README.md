@@ -2,7 +2,7 @@
 
 ## Application purpose
 
-Anomalib Trainer is a Windows desktop application for creating reproducible anomaly-detection training runs from inspection images. Its production workflow is validated for PatchCore and stock Anomalib Dinomaly with DINOv2 encoders. Dinomaly-DINOv3 and SuperADD-DINOv3 are separate experimental options.
+Anomalib Trainer is a Windows desktop application for creating reproducible anomaly-detection training runs from inspection images. It supports exactly four stock Anomalib 2.5.1 configurations: PatchCore, PaDiM, Dinomaly-DINOv2, and Dinomaly-DINOv3. Production validation requires a real train, evaluation, Torch export, reload, and score-parity pass for each configuration; unit tests alone are not production evidence.
 
 ## Screenshots
 
@@ -81,10 +81,10 @@ The application hashes every selected source image and rejects duplicates across
 1. Select the OK folders and, when available, genuine NG folders from the Dataset page.
 2. Optionally select the NG mask folder.
 3. Validate the dataset from the Dataset page.
-4. Choose PatchCore, stock `dinomaly_dinov2`, or an explicitly marked experimental DINOv3 option on the Training Configuration page.
+4. Choose PatchCore, PaDiM, `dinomaly_dinov2`, or `dinomaly_dinov3` on the Training Configuration page.
 5. Start training from the Training page.
 
-PatchCore and native SuperADD build a memory bank in one epoch. Dinomaly-DINOv2 defaults to a target of 3000 optimizer steps; the application derives its saved epoch count from the eligible training image count and batch size. Dinomaly-DINOv3 is an application-side reconstruction adapter, not stock Anomalib Dinomaly. It inspects the loaded encoder's patch size, embedding width, transformer depth, heads, preprocessing, and intermediate-token contract at runtime; incompatible encoders are rejected rather than guessed.
+The supported profiles are fixed and use Anomalib-native preprocessing: PatchCore uses `wide_resnet50_2`, `layer2`/`layer3`, coreset ratio `0.1`, nine neighbors, batch size 8, and one epoch; PaDiM uses `resnet18` with `layer1`/`layer2`/`layer3`; Dinomaly-DINOv2 uses `vit_base_patch14_reg4_dinov2`; and Dinomaly-DINOv3 uses `vit_base_patch16_dinov3.lvd1689m`. Both Dinomaly profiles use decoder depth 8, bottleneck dropout 0.2, context recentering disabled, and a target of 3000 optimizer steps. The application does not impose a global image-size preprocessor override.
 
 Threshold calibration always uses held-out calibration predictions, never final-test predictions. Automatic calibration uses labeled F1 when genuine held-out OK and NG samples exist; otherwise it uses normal-only conformal calibration at the selected normal false-reject target (default $0.5\%$). Normal-only calibration establishes an operating point, not universal defect detection. The legacy maximum-score method is explicitly marked as conservative; synthetic anomaly calibration is unavailable until a dedicated generator can provide honest provenance.
 
@@ -104,7 +104,7 @@ AUROC and F1 are supplementary ranking metrics. An escaped NG is always treated 
 
 ## Model export
 
-Select OpenVINO, ONNX, and/or Torch in the Results page. Export uses the run-manifest checkpoint rather than the newest file in a folder, verifies its SHA-256 hash first, and checks that every produced artifact is nonempty. OpenVINO exports must include both the `.xml` graph and `.bin` weights file. Every export creates a named deployment folder containing the validated artifact, final-test predictions, configuration, environment report, dataset/calibration/final-test/run manifests, result report, validation sidecars, and `deployment_manifest.json` hashes. Deployment sidecars and manifests preserve the exact threshold metadata and require decision parity against stored final-test predictions; this verifies runtime consistency, not defect-detection performance when genuine NG test data is absent.
+Select OpenVINO, ONNX, and/or Torch in the Results page. Export uses the run-manifest checkpoint rather than the newest file in a folder, verifies its SHA-256 hash first, and checks that every produced artifact is nonempty. OpenVINO exports must include both the `.xml` graph and `.bin` weights file. Every export creates a named deployment folder containing the validated artifact, final-test predictions, configuration, environment report, dataset/calibration/final-test/run manifests, result report, validation sidecars, and `deployment_manifest.json` hashes. Deployment sidecars and manifests preserve the exact threshold metadata and require both exact decision parity and image-score parity within an absolute tolerance of `0.0001` against stored final-test predictions; this verifies runtime consistency, not defect-detection performance when genuine NG test data is absent.
 
 ## Reevaluation without retraining
 
@@ -138,8 +138,7 @@ Then copy the built `release\` artifacts to the target PC.
 
 ### CUDA out of memory
 
-- reduce batch size
-- reduce image width and height
+- reduce batch size for PaDiM or Dinomaly
 - switch device to CPU if necessary
 
 ### GPU architecture is unsupported
@@ -167,10 +166,6 @@ Then copy the built `release\` artifacts to the target PC.
 - `app/workers`: separate worker entrypoints for training and inference
 - `app/ui`: Qt Widgets pages inside a `QMainWindow` shell
 
-## How to add another Anomalib model
+## Model support policy
 
-1. Add a new `ModelDefinition` to `app/core/model_registry.py`.
-2. Extend `AnomalibService` with the correct model constructor and defaults.
-3. Expose the model on the Training Configuration page.
-4. Normalize any new metrics in `app/core/result_parser.py`.
-5. Add focused tests for the new configuration and result parsing behavior.
+The production surface is intentionally restricted to the four configurations listed above. Adding another model requires a separate validation contract covering training, evaluation, export, reload, numerical score parity, and documentation before it can become selectable.

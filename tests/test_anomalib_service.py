@@ -76,8 +76,8 @@ def test_dinomaly_uses_selected_folders_and_omits_missing_masks(tmp_path: Path, 
     assert folder_calls["val_split_mode"] == "none"
 
 
-def test_generic_image_model_uses_the_catalog_class(tmp_path: Path, monkeypatch) -> None:
-    """An image-folder model outside the custom configuration paths is supported."""
+def test_padim_uses_the_fixed_stock_profile(tmp_path: Path, monkeypatch) -> None:
+    """PaDiM must use the fixed supported profile and native preprocessing."""
     class FakeFolder:
         def __init__(self, **kwargs) -> None:
             self.kwargs = kwargs
@@ -120,10 +120,15 @@ def test_generic_image_model_uses_the_catalog_class(tmp_path: Path, monkeypatch)
     assert components["engine"].kwargs["callbacks"] == ["progress-callback"]
     assert components["engine"].kwargs["max_epochs"] == 1
     assert components["engine"].kwargs["check_val_every_n_epoch"] == 1
+    assert components["model"].kwargs == {
+        "backbone": "resnet18",
+        "layers": ["layer1", "layer2", "layer3"],
+        "pre_trained": True,
+    }
 
 
-def test_patchcore_uses_anomalib_owned_model_input_preprocessing(tmp_path: Path, monkeypatch) -> None:
-    """The UI model-input dimensions must configure PatchCore's preprocessor once."""
+def test_patchcore_uses_fixed_profile_and_native_preprocessing(tmp_path: Path, monkeypatch) -> None:
+    """PatchCore must use its supported profile without an app preprocessor override."""
     class FakeFolder:
         def __init__(self, **kwargs) -> None:
             self.kwargs = kwargs
@@ -157,25 +162,51 @@ def test_patchcore_uses_anomalib_owned_model_input_preprocessing(tmp_path: Path,
     dataset = DatasetConfig()
     dataset.folders[DatasetRole.OK_TRAIN].path = str(ok_folder)
     dataset.folders[DatasetRole.NG_TEST].path = str(ng_folder)
-    config = TrainingConfig(model_name="patchcore", image_width=280, image_height=280, device=DeviceMode.CPU)
+    config = TrainingConfig(model_name="patchcore", device=DeviceMode.CPU)
 
     components = AnomalibService().create_components(dataset, config)
 
-    assert components["model"].kwargs["pre_processor"] == {"image_size": (280, 280)}
+    assert components["model"].kwargs == {
+        "backbone": "wide_resnet50_2",
+        "layers": ["layer2", "layer3"],
+        "num_neighbors": 9,
+        "coreset_sampling_ratio": 0.1,
+        "pre_trained": True,
+    }
 
 
-def test_dinomaly_dinov3_dispatches_to_the_application_adapter(monkeypatch) -> None:
-    import app.services.dinomaly_dinov3_adapter as adapter
+@pytest.mark.parametrize(
+    ("model_name", "encoder_name"),
+    (
+        ("dinomaly_dinov2", "vit_base_patch14_reg4_dinov2"),
+        ("dinomaly_dinov3", "vit_base_patch16_dinov3.lvd1689m"),
+    ),
+)
+def test_dinomaly_variants_use_stock_class_and_explicit_encoder(
+    model_name: str,
+    encoder_name: str,
+    monkeypatch,
+) -> None:
+    class FakeDinomaly:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
 
-    sentinel = object()
-    monkeypatch.setattr(adapter, "create_dinomaly_dinov3_model", lambda _config: sentinel)
+    anomalib_models = ModuleType("anomalib.models")
+    anomalib_models.Dinomaly = FakeDinomaly
+    monkeypatch.setitem(sys.modules, "anomalib.models", anomalib_models)
 
     model = AnomalibService()._create_model(
-        ModelRegistry().get("dinomaly_dinov3"),
-        TrainingConfig(model_name="dinomaly_dinov3", device=DeviceMode.CPU),
+        ModelRegistry().get(model_name),
+        TrainingConfig(model_name=model_name, device=DeviceMode.CPU),
     )
 
-    assert model is sentinel
+    assert isinstance(model, FakeDinomaly)
+    assert model.kwargs == {
+        "encoder_name": encoder_name,
+        "decoder_depth": 8,
+        "bottleneck_dropout": 0.2,
+        "use_context_recentering": False,
+    }
 
 
 def test_calibration_datamodule_never_splits_the_final_test_subset(tmp_path: Path, monkeypatch) -> None:
@@ -204,14 +235,9 @@ def test_calibration_datamodule_never_splits_the_final_test_subset(tmp_path: Pat
     assert datamodule.kwargs["val_split_mode"] == "same_as_test"
 
 
-def test_video_model_is_rejected_for_image_folder_projects() -> None:
-    """Video-only models need a future video-project workflow rather than Folder data."""
-    try:
-        AnomalibService().create_components(DatasetConfig(), TrainingConfig(model_name="aivad"))
-    except ValueError as exc:
-        assert "video dataset" in str(exc)
-    else:
-        raise AssertionError("Expected the video model to be rejected")
+def test_retired_models_are_rejected_before_training() -> None:
+    with pytest.raises(ValueError, match="Unsupported production model"):
+        TrainingConfig(model_name="superadd_dinov3").validate()
 
 
 def test_auto_device_falls_back_when_pytorch_lacks_the_gpu_architecture(monkeypatch) -> None:
@@ -244,10 +270,20 @@ def test_auto_device_falls_back_when_pytorch_lacks_the_gpu_architecture(monkeypa
         service.resolve_device(DeviceMode.CUDA)
 
 
-@pytest.mark.parametrize("model_name", ("draem", "efficientad", "cfm"))
-def test_required_model_resources_are_reported_before_training(model_name: str) -> None:
-    """Models with external assets explain the missing configuration clearly."""
-    definition = ModelRegistry().get(model_name)
+def test_inspect_api_rejects_anomalib_versions_other_than_2_5_1(monkeypatch) -> None:
+    anomalib_module = ModuleType("anomalib")
+    anomalib_module.__version__ = "2.6.0"
+    anomalib_data = ModuleType("anomalib.data")
+    anomalib_data.Folder = object
+    anomalib_engine = ModuleType("anomalib.engine")
+    anomalib_engine.Engine = object
+    anomalib_models = ModuleType("anomalib.models")
+    monkeypatch.setitem(sys.modules, "anomalib", anomalib_module)
+    monkeypatch.setitem(sys.modules, "anomalib.data", anomalib_data)
+    monkeypatch.setitem(sys.modules, "anomalib.engine", anomalib_engine)
+    monkeypatch.setitem(sys.modules, "anomalib.models", anomalib_models)
 
-    with pytest.raises(ValueError, match="requires Supplemental Model Data"):
-        AnomalibService()._model_kwargs(definition, TrainingConfig(model_name=model_name))
+    info = AnomalibService().inspect_api()
+
+    assert not info.available
+    assert "2.5.1 is required" in info.notes

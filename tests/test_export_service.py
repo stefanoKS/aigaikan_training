@@ -44,13 +44,13 @@ class FakeAnomalibService:
         return {"model": object(), "engine": self.engine}
 
 
-def test_export_model_uses_configured_formats_dimensions_and_names(tmp_path: Path) -> None:
+def test_export_model_uses_configured_formats_native_preprocessing_and_names(tmp_path: Path) -> None:
     """Each selected format must receive the run checkpoint and a descriptive model name."""
     run_directory = tmp_path / "2026-08-31_12-00-00_patchcore"
     checkpoint = run_directory / "weights" / "lightning" / "model.ckpt"
     checkpoint.parent.mkdir(parents=True)
     checkpoint.write_text("checkpoint", encoding="utf-8")
-    config = TrainingConfig(model_name="PatchCore", image_width=640, image_height=480)
+    config = TrainingConfig(model_name="PatchCore")
     (run_directory / "config.json").write_text(json.dumps(config.to_dict()), encoding="utf-8")
     write_run_manifest(
         run_directory / "run_manifest.json",
@@ -93,13 +93,21 @@ def test_export_model_uses_configured_formats_dimensions_and_names(tmp_path: Pat
     export_directory = tmp_path / "exports"
     received_thresholds: list[float] = []
 
-    def deployment_validator(_path: Path, _format: str, predictions: list[PredictionResult], threshold: float) -> dict[str, object]:
+    def deployment_validator(
+        _path: Path,
+        _format: str,
+        predictions: list[PredictionResult],
+        threshold: float,
+        score_tolerance: float,
+    ) -> dict[str, object]:
         received_thresholds.append(threshold)
         return {
             "status": "PASS",
             "tested_images": len(predictions),
             "decision_parity": 1.0,
             "threshold": threshold,
+            "score_tolerance": score_tolerance,
+            "maximum_score_delta": 0.0,
         }
 
     report = ExportService(
@@ -123,12 +131,15 @@ def test_export_model_uses_configured_formats_dimensions_and_names(tmp_path: Pat
         "patchcore_2026_08_31_12_00_00_openvino.xml",
         "patchcore_2026_08_31_12_00_00_torch.pt",
     ]
-    assert [call["input_size"] for call in engine.calls] == [(480, 640), (480, 640)]
+    assert [call["input_size"] for call in engine.calls] == [None, None]
     assert [call["ckpt_path"] for call in engine.calls] == [checkpoint.resolve(), checkpoint.resolve()]
     assert received_thresholds == [0.5, 0.5]
     deployment_manifest = json.loads((report.package_directory / "deployment_manifest.json").read_text(encoding="utf-8"))
     assert deployment_manifest["threshold_metadata"]["threshold_method"] == "normal_only_conformal"
     assert deployment_manifest["threshold_metadata"]["threshold_revision"] == "revision-001"
+    assert deployment_manifest["anomalib_version"] == "2.5.1"
+    assert deployment_manifest["model"]["profile"]["preprocessing"] == "anomalib-native"
+    assert deployment_manifest["exports"][0]["validation"]["maximum_score_delta"] == 0.0
     validation_report = json.loads(report.exported[0].validation_report.read_text(encoding="utf-8"))
     assert validation_report["decision_threshold"] == 0.5
     assert validation_report["threshold_metadata"]["calibration_manifest_sha256"] == "b" * 64
@@ -156,3 +167,33 @@ def test_deployment_validation_rejects_any_final_test_decision_mismatch(monkeypa
 
     with pytest.raises(RuntimeError, match="decision parity failed"):
         ExportService._validate_deployment(Path("model.pt"), "torch", [expected], threshold=0.5)
+
+
+def test_deployment_validation_rejects_excessive_score_difference(monkeypatch) -> None:
+    class FakeTorchInferencer:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def predict(self, _source_path: str) -> dict[str, float]:
+            return {"pred_score": 0.2}
+
+    anomalib_deploy = ModuleType("anomalib.deploy")
+    anomalib_deploy.TorchInferencer = FakeTorchInferencer
+    monkeypatch.setitem(sys.modules, "anomalib.deploy", anomalib_deploy)
+    expected = PredictionResult(
+        source_path="final_test_ok.png",
+        predicted_label="OK",
+        ground_truth_label="OK",
+        anomaly_score=0.1,
+        threshold=0.5,
+        dataset_role="final_test_ok",
+    )
+
+    with pytest.raises(RuntimeError, match="score parity failed"):
+        ExportService._validate_deployment(
+            Path("model.pt"),
+            "torch",
+            [expected],
+            threshold=0.5,
+            score_tolerance=0.01,
+        )

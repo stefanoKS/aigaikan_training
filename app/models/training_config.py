@@ -6,7 +6,6 @@ from dataclasses import asdict, dataclass
 from enum import StrEnum
 from math import ceil
 from pathlib import Path
-import re
 from typing import Any
 
 from app.core.threshold_calibrator import ThresholdCalibrationConfig, ThresholdMethod
@@ -20,14 +19,15 @@ class DeviceMode(StrEnum):
     CPU = "cpu"
 
 
+_SUPPORTED_MODEL_NAMES = frozenset({"patchcore", "padim", "dinomaly", "dinomalydinov2", "dinomalydinov3"})
+
+
 @dataclass(slots=True)
 class TrainingConfig:
     """Persisted model and threshold configuration for one reproducible run."""
 
     model_name: str = "patchcore"
     device: DeviceMode = DeviceMode.AUTO
-    image_width: int = 280
-    image_height: int = 280
     batch_size: int = 8
     max_epochs: int = 1
     target_training_steps: int = 3000
@@ -36,31 +36,19 @@ class TrainingConfig:
     accumulate_grad_batches: int = 1
     random_seed: int = 42
     split_seed: int = 42
-    coreset_sampling_ratio: float = 0.1
-    num_neighbors: int = 9
     num_workers: int = 0
     output_dir: str = ""
-    backbone: str = "wide_resnet50_2"
-    layers: tuple[str, ...] = ("layer2", "layer3")
-    dinomaly_encoder: str = "vit_base_patch14_reg4_dinov2"
-    dinomaly_dinov3_encoder: str = "vit_small_patch16_dinov3.lvd1689m"
-    dinov3_feature_layers: tuple[int, ...] = ()
     dinomaly_decoder_depth: int = 8
     dinomaly_bottleneck_dropout: float = 0.2
     dinomaly_context_recentering: bool = False
-    superadd_encoder: str = "vit_huge_plus_patch16_dinov3.lvd1689m"
-    superadd_patch_size: int = 448
-    superadd_patch_overlap: int = 16
     threshold_method: ThresholdMethod = ThresholdMethod.AUTO
     target_normal_false_reject_rate: float = 0.005
     minimum_required_ng_recall: float | None = None
-    supplemental_data_path: str = ""
-    zero_shot_class_name: str = ""
 
     def validate(self) -> None:
         """Validate configuration values."""
-        if self.image_width <= 0 or self.image_height <= 0:
-            raise ValueError("Image dimensions must be positive")
+        if self._normalized_model_name not in _SUPPORTED_MODEL_NAMES:
+            raise ValueError(f"Unsupported production model: {self.model_name}")
         if self.batch_size <= 0:
             raise ValueError("Batch size must be positive")
         if self.max_epochs <= 0:
@@ -73,10 +61,6 @@ class TrainingConfig:
             raise ValueError("Gradient clip value cannot be negative")
         if self.accumulate_grad_batches <= 0:
             raise ValueError("Gradient accumulation must be positive")
-        if not 0 < self.coreset_sampling_ratio <= 1:
-            raise ValueError("Coreset sampling ratio must be between 0 and 1")
-        if self.num_neighbors <= 0:
-            raise ValueError("Number of nearest neighbors must be positive")
         if self.num_workers < 0:
             raise ValueError("Number of workers cannot be negative")
         if self.split_seed < 0:
@@ -86,17 +70,15 @@ class TrainingConfig:
         if not 0 <= self.dinomaly_bottleneck_dropout < 1:
             raise ValueError("Dinomaly bottleneck dropout must be between 0 and 1")
         if self.uses_fixed_one_pass and self.max_epochs != 1:
-            raise ValueError("PatchCore and SuperADD use exactly one epoch to build their memory banks")
-        if self.is_dinomaly_dinov2:
-            patch_size = self._encoder_patch_size()
-            if self.image_width % patch_size != 0 or self.image_height % patch_size != 0:
-                raise ValueError(f"Dinomaly DINOv2 image dimensions must be divisible by {patch_size}")
-        if self.is_dinomaly_dinov3 and self.dinov3_feature_layers and min(self.dinov3_feature_layers) < 0:
-            raise ValueError("Dinomaly DINOv3 feature layers cannot be negative")
-        if self.is_superadd and (self.superadd_patch_size <= 0 or self.superadd_patch_overlap <= 0):
-            raise ValueError("SuperADD patch size and overlap must be positive")
-        if self.is_superadd and self.superadd_patch_overlap * 2 >= self.superadd_patch_size:
-            raise ValueError("SuperADD patch overlap must be less than half of its patch size")
+            raise ValueError("PatchCore uses exactly one epoch to build its memory bank")
+        if self.is_patchcore and self.batch_size != 8:
+            raise ValueError("PatchCore uses a batch size of 8")
+        if self.is_dinomaly and (
+            self.dinomaly_decoder_depth != 8
+            or self.dinomaly_bottleneck_dropout != 0.2
+            or self.dinomaly_context_recentering
+        ):
+            raise ValueError("Dinomaly settings must use the supported stock profile")
         ThresholdCalibrationConfig(
             method=self.threshold_method,
             target_normal_false_reject_rate=self.target_normal_false_reject_rate,
@@ -120,23 +102,47 @@ class TrainingConfig:
 
     @property
     def is_dinomaly_dinov3(self) -> bool:
-        """Return whether this config selects the application-side experimental adapter."""
+        """Return whether this config selects stock Dinomaly with a DINOv3 encoder."""
         return self._normalized_model_name == "dinomalydinov3"
-
-    @property
-    def is_superadd(self) -> bool:
-        """Return whether this config selects Anomalib's native SuperADD algorithm."""
-        return self._normalized_model_name in {"superadd", "superadddinov3"}
 
     @property
     def uses_fixed_one_pass(self) -> bool:
         """Return whether the selected model builds a memory bank in one pass."""
-        return self.is_patchcore or self.is_superadd
+        return self.is_patchcore
 
     @property
-    def model_input_size(self) -> tuple[int, int]:
-        """Return Anomalib's model input shape as height then width."""
-        return self.image_height, self.image_width
+    def dinomaly_encoder_name(self) -> str:
+        """Return the explicit stock timm encoder selected by the Dinomaly variant."""
+        if self.is_dinomaly_dinov3:
+            return "vit_base_patch16_dinov3.lvd1689m"
+        return "vit_base_patch14_reg4_dinov2"
+
+    def model_profile(self) -> dict[str, object]:
+        """Return the fixed model-specific contract persisted with each run."""
+        if self.is_patchcore:
+            return {
+                "backbone": "wide_resnet50_2",
+                "layers": ["layer2", "layer3"],
+                "coreset_sampling_ratio": 0.1,
+                "num_neighbors": 9,
+                "batch_size": 8,
+                "max_epochs": 1,
+                "preprocessing": "anomalib-native",
+            }
+        if self._normalized_model_name == "padim":
+            return {
+                "backbone": "resnet18",
+                "layers": ["layer1", "layer2", "layer3"],
+                "preprocessing": "anomalib-native",
+            }
+        return {
+            "encoder_name": self.dinomaly_encoder_name,
+            "decoder_depth": 8,
+            "bottleneck_dropout": 0.2,
+            "use_context_recentering": False,
+            "training": "step-based",
+            "preprocessing": "anomalib-native",
+        }
 
     def recommended_epochs(self, training_image_count: int) -> int:
         """Return the model-specific epoch recommendation for the selected data volume."""
@@ -152,18 +158,19 @@ class TrainingConfig:
 
     def apply_model_defaults(self, training_image_count: int) -> None:
         """Apply only model-required defaults before persisting a configuration."""
-        if self.uses_fixed_one_pass:
+        if self.is_patchcore:
+            self.batch_size = 8
             self.max_epochs = 1
-        elif self.is_dinomaly and self.max_epochs == 1:
-            self.max_epochs = self.recommended_epochs(training_image_count)
+        elif self.is_dinomaly:
+            self.dinomaly_decoder_depth = 8
+            self.dinomaly_bottleneck_dropout = 0.2
+            self.dinomaly_context_recentering = False
+            if self.max_epochs == 1:
+                self.max_epochs = self.recommended_epochs(training_image_count)
 
     @property
     def _normalized_model_name(self) -> str:
         return "".join(character for character in self.model_name.casefold() if character.isalnum())
-
-    def _encoder_patch_size(self) -> int:
-        match = re.search(r"patch(\d+)", self.dinomaly_encoder.casefold())
-        return int(match.group(1)) if match else 14
 
     def resolved_output_dir(self, project_path: Path) -> Path:
         """Return the output directory with a project-relative default."""
@@ -175,9 +182,8 @@ class TrainingConfig:
         """Serialize the configuration."""
         payload = asdict(self)
         payload["device"] = self.device.value
-        payload["layers"] = list(self.layers)
-        payload["dinov3_feature_layers"] = list(self.dinov3_feature_layers)
         payload["threshold_method"] = self.threshold_method.value
+        payload["model_profile"] = self.model_profile()
         return payload
 
     @classmethod
@@ -188,13 +194,9 @@ class TrainingConfig:
         normalized_model_name = "".join(character for character in model_name.casefold() if character.isalnum())
         if normalized_model_name == "dinomaly":
             model_name = "dinomaly_dinov3" if "dinov3" in legacy_encoder.casefold() else "dinomaly_dinov2"
-        elif normalized_model_name == "superadd":
-            model_name = "superadd_dinov3"
         return cls(
             model_name=model_name,
             device=DeviceMode(payload.get("device", DeviceMode.AUTO.value)),
-            image_width=int(payload.get("image_width", 280)),
-            image_height=int(payload.get("image_height", 280)),
             batch_size=int(payload.get("batch_size", 8)),
             max_epochs=int(payload.get("max_epochs", 1)),
             target_training_steps=int(payload.get("target_training_steps", 3000)),
@@ -203,26 +205,11 @@ class TrainingConfig:
             accumulate_grad_batches=int(payload.get("accumulate_grad_batches", 1)),
             random_seed=int(payload.get("random_seed", 42)),
             split_seed=int(payload.get("split_seed", payload.get("random_seed", 42))),
-            coreset_sampling_ratio=float(payload.get("coreset_sampling_ratio", 0.1)),
-            num_neighbors=int(payload.get("num_neighbors", 9)),
             num_workers=int(payload.get("num_workers", 0)),
             output_dir=payload.get("output_dir", ""),
-            backbone=payload.get("backbone", "wide_resnet50_2"),
-            layers=tuple(payload.get("layers", ["layer2", "layer3"])),
-            dinomaly_encoder=legacy_encoder,
-            dinomaly_dinov3_encoder=payload.get(
-                "dinomaly_dinov3_encoder",
-                legacy_encoder
-                if normalized_model_name == "dinomaly" and "dinov3" in legacy_encoder.casefold()
-                else "vit_small_patch16_dinov3.lvd1689m",
-            ),
-            dinov3_feature_layers=tuple(int(layer) for layer in payload.get("dinov3_feature_layers", [])),
-            dinomaly_decoder_depth=int(payload.get("dinomaly_decoder_depth", 8)),
-            dinomaly_bottleneck_dropout=float(payload.get("dinomaly_bottleneck_dropout", 0.2)),
-            dinomaly_context_recentering=bool(payload.get("dinomaly_context_recentering", False)),
-            superadd_encoder=payload.get("superadd_encoder", "vit_huge_plus_patch16_dinov3.lvd1689m"),
-            superadd_patch_size=int(payload.get("superadd_patch_size", 448)),
-            superadd_patch_overlap=int(payload.get("superadd_patch_overlap", 16)),
+            dinomaly_decoder_depth=8,
+            dinomaly_bottleneck_dropout=0.2,
+            dinomaly_context_recentering=False,
             threshold_method=ThresholdMethod(payload.get("threshold_method", ThresholdMethod.AUTO.value)),
             target_normal_false_reject_rate=float(payload.get("target_normal_false_reject_rate", 0.005)),
             minimum_required_ng_recall=(
@@ -230,6 +217,4 @@ class TrainingConfig:
                 if payload.get("minimum_required_ng_recall") is not None
                 else None
             ),
-            supplemental_data_path=payload.get("supplemental_data_path", ""),
-            zero_shot_class_name=payload.get("zero_shot_class_name", ""),
         )

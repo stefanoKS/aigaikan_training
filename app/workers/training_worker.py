@@ -187,17 +187,12 @@ def _model_provenance(definition: Any, config: Any, model: Any) -> dict[str, obj
         "model_variant": definition.model_variant or definition.key,
         "encoder_family": definition.encoder_family or None,
         "official_anomalib_implementation": definition.official_anomalib_implementation,
+        "profile": config.model_profile(),
     }
     if definition.key == "dinomaly_dinov2":
-        payload["encoder"] = {"family": "DINOv2", "name": config.dinomaly_encoder}
+        payload["encoder"] = {"family": "DINOv2", "name": config.dinomaly_encoder_name}
     elif definition.key == "dinomaly_dinov3":
-        payload["encoder"] = getattr(model, "encoder_metadata", {"family": "DINOv3", "name": config.dinomaly_dinov3_encoder})
-    elif definition.key == "superadd_dinov3":
-        payload["encoder"] = {
-            "family": "DINOv3",
-            "name": config.superadd_encoder,
-            "feature_layers": list(config.dinov3_feature_layers),
-        }
+        payload["encoder"] = {"family": "DINOv3", "name": config.dinomaly_encoder_name}
     return payload
 
 

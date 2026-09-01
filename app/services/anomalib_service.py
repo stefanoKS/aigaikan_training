@@ -11,6 +11,8 @@ from app.core.model_registry import ModelDefinition, ModelExecutionMode, ModelRe
 from app.models.dataset_config import DatasetConfig, DatasetRole
 from app.models.training_config import DeviceMode, TrainingConfig
 
+REQUIRED_ANOMALIB_VERSION = "2.5.1"
+
 
 @dataclass(slots=True)
 class AnomalibApiInfo:
@@ -49,6 +51,17 @@ class AnomalibService:
                 engine_import="anomalib.engine.Engine",
                 notes=str(exc),
             )
+        version = str(getattr(anomalib, "__version__", "unknown"))
+        if version != REQUIRED_ANOMALIB_VERSION:
+            return AnomalibApiInfo(
+                available=False,
+                version=version,
+                patchcore_import="anomalib.models.Patchcore",
+                dinomaly_import="anomalib.models.Dinomaly",
+                folder_datamodule_import="anomalib.data.Folder",
+                engine_import="anomalib.engine.Engine",
+                notes=f"Anomalib {REQUIRED_ANOMALIB_VERSION} is required; found {version}.",
+            )
         missing_models = [
             definition.anomalib_class_name
             for definition in self.model_registry.official_anomalib_models()
@@ -57,7 +70,7 @@ class AnomalibService:
         if missing_models:
             return AnomalibApiInfo(
                 available=False,
-                version=str(getattr(anomalib, "__version__", "unknown")),
+                version=version,
                 patchcore_import="anomalib.models.Patchcore",
                 dinomaly_import="anomalib.models.Dinomaly",
                 folder_datamodule_import="anomalib.data.Folder",
@@ -66,7 +79,7 @@ class AnomalibService:
             )
         return AnomalibApiInfo(
             available=True,
-            version=str(getattr(anomalib, "__version__", "unknown")),
+            version=version,
             patchcore_import="anomalib.models.Patchcore",
             dinomaly_import="anomalib.models.Dinomaly",
             folder_datamodule_import="anomalib.data.Folder",
@@ -256,12 +269,6 @@ class AnomalibService:
 
     def _create_model(self, definition: ModelDefinition, config: TrainingConfig) -> Any:
         """Instantiate a model with its supported project-level options."""
-        if definition.key == "dinomaly_dinov3":
-            from app.services.dinomaly_dinov3_adapter import create_dinomaly_dinov3_model
-
-            return create_dinomaly_dinov3_model(config)
-        if definition.anomalib_class_name is None:
-            raise RuntimeError(f"No model factory is registered for {definition.display_name}.")
         import anomalib.models as anomalib_models
 
         model_class = getattr(anomalib_models, definition.anomalib_class_name, None)
@@ -271,74 +278,26 @@ class AnomalibService:
             )
         if definition.key == "patchcore":
             return model_class(
-                backbone=config.backbone,
-                layers=list(config.layers),
-                num_neighbors=config.num_neighbors,
-                coreset_sampling_ratio=config.coreset_sampling_ratio,
+                backbone="wide_resnet50_2",
+                layers=["layer2", "layer3"],
+                num_neighbors=9,
+                coreset_sampling_ratio=0.1,
                 pre_trained=True,
-                pre_processor=model_class.configure_pre_processor(image_size=config.model_input_size),
             )
-        if definition.key == "dinomaly_dinov2":
-            image_size = config.model_input_size
+        if definition.key == "padim":
             return model_class(
-                encoder_name=config.dinomaly_encoder,
-                decoder_depth=config.dinomaly_decoder_depth,
-                bottleneck_dropout=config.dinomaly_bottleneck_dropout,
-                use_context_recentering=config.dinomaly_context_recentering,
-                pre_processor=model_class.configure_pre_processor(
-                    image_size=image_size,
-                    crop_size=min(image_size),
-                ),
+                backbone="resnet18",
+                layers=["layer1", "layer2", "layer3"],
+                pre_trained=True,
             )
-        if definition.key == "superadd_dinov3":
+        if definition.key in {"dinomaly_dinov2", "dinomaly_dinov3"}:
             return model_class(
-                backbone=config.superadd_encoder,
-                layers=list(config.dinov3_feature_layers) or None,
-                patch_size=config.superadd_patch_size,
-                patch_overlap=config.superadd_patch_overlap,
-                pre_processor=model_class.configure_pre_processor(image_size=config.model_input_size),
+                encoder_name=config.dinomaly_encoder_name,
+                decoder_depth=8,
+                bottleneck_dropout=0.2,
+                use_context_recentering=False,
             )
-
-        model_kwargs = self._model_kwargs(definition, config)
-        return model_class(**model_kwargs)
-
-    def _model_kwargs(self, definition: ModelDefinition, config: TrainingConfig) -> dict[str, Any]:
-        """Build optional model-specific arguments from project configuration."""
-        if definition.key == "draem":
-            return {"dtd_dir": self._required_supplemental_path(config, definition, expect_file=False)}
-        if definition.key == "efficientad":
-            return {"imagenet_dir": self._required_supplemental_path(config, definition, expect_file=False)}
-        if definition.key == "cfm":
-            return {"pointmae_weights": self._required_supplemental_path(config, definition, expect_file=True)}
-        if definition.key == "glass" and config.supplemental_data_path:
-            return {"anomaly_source_path": self._existing_supplemental_path(config, definition)}
-        if definition.key == "winclip" and config.zero_shot_class_name.strip():
-            return {"class_name": config.zero_shot_class_name.strip()}
-        return {}
-
-    @staticmethod
-    def _required_supplemental_path(
-        config: TrainingConfig,
-        definition: ModelDefinition,
-        expect_file: bool,
-    ) -> Path:
-        path = AnomalibService._existing_supplemental_path(config, definition)
-        if expect_file and not path.is_file():
-            raise ValueError(f"{definition.display_name} requires a supplemental weights file.")
-        if not expect_file and not path.is_dir():
-            raise ValueError(f"{definition.display_name} requires a supplemental data folder.")
-        return path
-
-    @staticmethod
-    def _existing_supplemental_path(config: TrainingConfig, definition: ModelDefinition) -> Path:
-        if not config.supplemental_data_path.strip():
-            raise ValueError(
-                f"{definition.display_name} requires Supplemental Model Data. {definition.requirement}"
-            )
-        path = Path(config.supplemental_data_path).expanduser()
-        if not path.exists():
-            raise ValueError(f"Supplemental Model Data does not exist: {path}")
-        return path.resolve()
+        raise RuntimeError(f"No model factory is registered for {definition.display_name}.")
 
     def _required_folder(self, dataset: DatasetConfig, role: DatasetRole) -> Path:
         path = self._optional_folder(dataset, role)

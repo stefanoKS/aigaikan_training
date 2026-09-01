@@ -1,4 +1,4 @@
-"""Catalog of Anomalib 2.6 model capabilities."""
+"""Catalog of supported Anomalib 2.5.1 model configurations."""
 
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ class ModelExecutionMode(StrEnum):
 class ModelSupportLevel(StrEnum):
     """Validation status of a selectable model."""
 
+    SUPPORTED = "supported"
     PRODUCTION_VALIDATED = "production-validated"
     EXPERIMENTAL = "experimental"
 
@@ -51,12 +52,7 @@ class ModelDefinition:
 
 
 class ModelRegistry:
-    """Registry for all concrete models exported by Anomalib 2.6.0.
-
-    The UI manages still images through ``anomalib.data.Folder``. Video models
-    remain visible for accurate capability reporting, but cannot be selected
-    until a video-project workflow is added.
-    """
+    """Registry for the four image-folder configurations supported by this app."""
 
     _MODEL_DEFINITIONS = (
         ModelDefinition(
@@ -65,36 +61,16 @@ class ModelRegistry:
             "Patchcore",
             algorithm="PatchCore",
             model_variant="patchcore",
-            support_level=ModelSupportLevel.PRODUCTION_VALIDATED,
+            support_level=ModelSupportLevel.SUPPORTED,
         ),
-        ModelDefinition("padim", "PaDiM", "Padim"),
-        ModelDefinition("cfa", "CFA", "Cfa"),
-        ModelDefinition("cflow", "CFlow", "Cflow"),
-        ModelDefinition("csflow", "CS-Flow", "Csflow"),
-        ModelDefinition("dfkde", "DFKDE", "Dfkde"),
-        ModelDefinition("dfm", "DFM", "Dfm"),
-        ModelDefinition("fastflow", "FastFlow", "Fastflow"),
-        ModelDefinition("fre", "FRE", "Fre"),
-        ModelDefinition("ganomaly", "GANomaly", "Ganomaly"),
-        ModelDefinition("reverse_distillation", "Reverse Distillation", "ReverseDistillation"),
-        ModelDefinition("stfpm", "STFPM", "Stfpm"),
-        ModelDefinition("uflow", "U-Flow", "Uflow"),
-        ModelDefinition("draem", "DRAEM", "Draem", requirement="Requires a DTD texture dataset folder."),
-        ModelDefinition("dsr", "DSR", "Dsr"),
         ModelDefinition(
-            "efficientad",
-            "EfficientAD",
-            "EfficientAd",
-            requirement="Requires an ImageNet/Imagenette folder for teacher normalization.",
+            "padim",
+            "PaDiM",
+            "Padim",
+            algorithm="PaDiM",
+            model_variant="padim",
+            support_level=ModelSupportLevel.SUPPORTED,
         ),
-        ModelDefinition("glass", "GLASS", "Glass", requirement="Optionally uses an anomaly-source image folder."),
-        ModelDefinition("supersimplenet", "SuperSimpleNet", "Supersimplenet"),
-        ModelDefinition("uninet", "UniNet", "UniNet"),
-        ModelDefinition("patchflow", "PatchFlow", "Patchflow"),
-        ModelDefinition("generalad", "GeneralAD", "GeneralAD"),
-        ModelDefinition("l2bt", "L2BT", "L2BT"),
-        ModelDefinition("cfm", "CFM", "CFM", requirement="Requires PointMAE weights."),
-        ModelDefinition("anomaly_dino", "AnomalyDINO", "AnomalyDINO"),
         ModelDefinition(
             "dinomaly_dinov2",
             "Dinomaly (DINOv2)",
@@ -102,62 +78,17 @@ class ModelRegistry:
             algorithm="Dinomaly",
             model_variant="dinomaly_dinov2",
             encoder_family="DINOv2",
-            support_level=ModelSupportLevel.PRODUCTION_VALIDATED,
+            support_level=ModelSupportLevel.SUPPORTED,
         ),
         ModelDefinition(
             "dinomaly_dinov3",
-            "Dinomaly (DINOv3, Experimental)",
-            None,
+            "Dinomaly (DINOv3)",
+            "Dinomaly",
             algorithm="Dinomaly",
             model_variant="dinomaly_dinov3",
             encoder_family="DINOv3",
-            official_anomalib_implementation=False,
-            requirement="Application-side DINOv3 encoder adapter; not stock Anomalib Dinomaly.",
-        ),
-        ModelDefinition("inpformer", "INP-Former", "InpFormer"),
-        ModelDefinition(
-            "superadd_dinov3",
-            "SuperADD (DINOv3, Experimental)",
-            "SuperADD",
-            algorithm="SuperADD",
-            model_variant="superadd_dinov3",
-            encoder_family="DINOv3",
-            requirement="Native Anomalib DINOv3 memory-bank comparison model.",
-        ),
-        ModelDefinition(
-            "anomalyvfm",
-            "AnomalyVFM",
-            "AnomalyVFM",
-            execution_mode=ModelExecutionMode.EVALUATE,
-            requirement="Zero-shot model; runs evaluation directly.",
-        ),
-        ModelDefinition(
-            "winclip",
-            "WinCLIP",
-            "WinClip",
-            execution_mode=ModelExecutionMode.EVALUATE,
-            requirement="Zero-shot/few-shot model; a class name improves prompt quality.",
-        ),
-        ModelDefinition(
-            "vlmad",
-            "VLM-AD",
-            "VlmAd",
-            execution_mode=ModelExecutionMode.EVALUATE,
-            requirement="Requires a configured Ollama or cloud VLM service.",
-        ),
-        ModelDefinition(
-            "aivad",
-            "AI-VAD",
-            "AiVad",
-            input_type=ModelInputType.VIDEO,
-            requirement="Requires a video dataset project.",
-        ),
-        ModelDefinition(
-            "fuvas",
-            "FUVAS",
-            "Fuvas",
-            input_type=ModelInputType.VIDEO,
-            requirement="Requires a video dataset project.",
+            requirement="Stock Anomalib 2.5.1 Dinomaly with a DINOv3 timm encoder.",
+            support_level=ModelSupportLevel.SUPPORTED,
         ),
     )
 
@@ -172,7 +103,6 @@ class ModelRegistry:
         self._aliases.update(
             {
                 "dinomaly": self._models["dinomaly_dinov2"],
-                "superadd": self._models["superadd_dinov3"],
             }
         )
 

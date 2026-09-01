@@ -220,7 +220,6 @@ class MainWindow(QMainWindow):
         self.config_page.save_button.clicked.connect(lambda: self._save_training_config(show_dialog=True))
         self.config_page.load_button.clicked.connect(self._refresh_config_page)
         self.config_page.reset_button.clicked.connect(self._reset_training_config)
-        self.config_page.browse_supplemental_button.clicked.connect(self._choose_supplemental_data)
         self.config_page.model_combo.currentIndexChanged.connect(self._update_model_action)
         self.config_page.model_combo.currentIndexChanged.connect(self._update_estimated_training_steps)
         self.config_page.batch_size_spin.valueChanged.connect(self._update_estimated_training_steps)
@@ -602,8 +601,6 @@ class MainWindow(QMainWindow):
         config = project.training
         config.model_name = str(self.config_page.model_combo.currentData())
         config.device = DeviceMode(self.config_page.device_combo.currentText().lower())
-        config.image_width = self.config_page.image_width_spin.value()
-        config.image_height = self.config_page.image_height_spin.value()
         config.batch_size = self.config_page.batch_size_spin.value()
         config.max_epochs = self.config_page.max_epochs_spin.value()
         config.validation_every_n_epochs = self.config_page.validation_every_n_epochs_spin.value()
@@ -612,23 +609,7 @@ class MainWindow(QMainWindow):
         config.random_seed = self.config_page.seed_spin.value()
         config.split_seed = self.config_page.split_seed_spin.value()
         config.target_training_steps = self.config_page.target_training_steps_spin.value()
-        config.coreset_sampling_ratio = self.config_page.coreset_ratio_spin.value()
-        config.num_neighbors = self.config_page.neighbors_spin.value()
         config.num_workers = self.config_page.workers_spin.value()
-        config.dinomaly_encoder = self.config_page.dinomaly_encoder_combo.currentText()
-        config.dinomaly_dinov3_encoder = self.config_page.dinov3_encoder_combo.currentText()
-        config.superadd_encoder = self.config_page.superadd_encoder_combo.currentText()
-        config.superadd_patch_size = self.config_page.superadd_patch_size_spin.value()
-        config.superadd_patch_overlap = self.config_page.superadd_patch_overlap_spin.value()
-        config.dinomaly_decoder_depth = self.config_page.dinomaly_decoder_depth_spin.value()
-        config.dinomaly_bottleneck_dropout = self.config_page.dinomaly_dropout_spin.value()
-        config.dinomaly_context_recentering = self.config_page.dinomaly_context_recentering_check.isChecked()
-        try:
-            config.dinov3_feature_layers = self.config_page.dinov3_feature_layers()
-        except ValueError as exc:
-            if show_dialog:
-                QMessageBox.warning(self, "Invalid Training Settings", str(exc))
-            return False
         config.threshold_method = ThresholdMethod(str(self.config_page.threshold_method_combo.currentData()))
         config.target_normal_false_reject_rate = self.config_page.threshold_false_reject_rate()
         config.minimum_required_ng_recall = (
@@ -636,8 +617,6 @@ class MainWindow(QMainWindow):
             if self.config_page.minimum_ng_recall_check.isChecked()
             else None
         )
-        config.supplemental_data_path = self.config_page.supplemental_path_edit.text().strip()
-        config.zero_shot_class_name = self.config_page.zero_shot_class_name_edit.text().strip()
         config.apply_model_defaults(self._training_image_count())
         try:
             config.validate()
@@ -660,8 +639,6 @@ class MainWindow(QMainWindow):
         model_index = self.config_page.model_combo.findData(definition.key)
         self.config_page.model_combo.setCurrentIndex(max(model_index, 0))
         self.config_page.device_combo.setCurrentText(config.device.value.title())
-        self.config_page.image_width_spin.setValue(config.image_width)
-        self.config_page.image_height_spin.setValue(config.image_height)
         self.config_page.batch_size_spin.setValue(config.batch_size)
         self.config_page.max_epochs_spin.setValue(config.max_epochs)
         self.config_page.validation_every_n_epochs_spin.setValue(config.validation_every_n_epochs)
@@ -669,24 +646,8 @@ class MainWindow(QMainWindow):
         self.config_page.accumulate_grad_batches_spin.setValue(config.accumulate_grad_batches)
         self.config_page.seed_spin.setValue(config.random_seed)
         self.config_page.split_seed_spin.setValue(config.split_seed)
-        self.config_page.coreset_ratio_spin.setValue(config.coreset_sampling_ratio)
-        self.config_page.neighbors_spin.setValue(config.num_neighbors)
         self.config_page.workers_spin.setValue(config.num_workers)
-        encoder_index = self.config_page.dinomaly_encoder_combo.findText(config.dinomaly_encoder)
-        self.config_page.dinomaly_encoder_combo.setCurrentIndex(max(encoder_index, 0))
-        dinov3_encoder_index = self.config_page.dinov3_encoder_combo.findText(config.dinomaly_dinov3_encoder)
-        self.config_page.dinov3_encoder_combo.setCurrentIndex(max(dinov3_encoder_index, 0))
-        superadd_encoder_index = self.config_page.superadd_encoder_combo.findText(config.superadd_encoder)
-        self.config_page.superadd_encoder_combo.setCurrentIndex(max(superadd_encoder_index, 0))
-        self.config_page.dinov3_feature_layers_edit.setText(
-            ", ".join(str(layer) for layer in config.dinov3_feature_layers)
-        )
-        self.config_page.superadd_patch_size_spin.setValue(config.superadd_patch_size)
-        self.config_page.superadd_patch_overlap_spin.setValue(config.superadd_patch_overlap)
-        self.config_page.dinomaly_decoder_depth_spin.setValue(config.dinomaly_decoder_depth)
-        self.config_page.dinomaly_dropout_spin.setValue(config.dinomaly_bottleneck_dropout)
         self.config_page.target_training_steps_spin.setValue(config.target_training_steps)
-        self.config_page.dinomaly_context_recentering_check.setChecked(config.dinomaly_context_recentering)
         threshold_method_index = self.config_page.threshold_method_combo.findData(config.threshold_method.value)
         self.config_page.threshold_method_combo.setCurrentIndex(max(threshold_method_index, 0))
         target_rate_index = self.config_page.threshold_fpr_combo.findData(config.target_normal_false_reject_rate)
@@ -696,8 +657,6 @@ class MainWindow(QMainWindow):
         if config.minimum_required_ng_recall is not None:
             self.config_page.minimum_ng_recall_spin.setValue(config.minimum_required_ng_recall * 100)
         self.config_page._update_threshold_controls()
-        self.config_page.supplemental_path_edit.setText(config.supplemental_data_path)
-        self.config_page.zero_shot_class_name_edit.setText(config.zero_shot_class_name)
         self.training_page.active_model_label.setText(definition.display_name)
         self.training_page.active_device_label.setText(config.device.value)
         self._update_model_action()
@@ -732,18 +691,6 @@ class MainWindow(QMainWindow):
         """Keep new projects deterministic until a user deliberately changes the split seed."""
         if self.config_page.split_seed_spin.value() == 42:
             self.config_page.split_seed_spin.setValue(self.config_page.seed_spin.value())
-
-    def _choose_supplemental_data(self) -> None:
-        try:
-            definition = self.model_registry.get(str(self.config_page.model_combo.currentData()))
-        except ValueError:
-            return
-        if definition.key == "cfm":
-            selected, _ = QFileDialog.getOpenFileName(self, "Select PointMAE Weights")
-        else:
-            selected = QFileDialog.getExistingDirectory(self, "Select Supplemental Model Data")
-        if selected:
-            self.config_page.supplemental_path_edit.setText(selected)
 
     def _update_model_action(self) -> None:
         try:
