@@ -64,7 +64,7 @@ def test_dinomaly_uses_selected_folders_and_omits_missing_masks(tmp_path: Path, 
     dataset.folders[DatasetRole.OK_TRAIN].path = str(ok_folder)
     dataset.folders[DatasetRole.NG_TEST].path = str(ng_folder)
     dataset.folders[DatasetRole.MASKS].path = str(tmp_path / "missing_masks")
-    config = TrainingConfig(model_name="Dinomaly", device=DeviceMode.CPU)
+    config = TrainingConfig(model_name="dinomaly_dinov2", device=DeviceMode.CPU)
 
     components = AnomalibService().create_components(dataset, config)
 
@@ -118,7 +118,7 @@ def test_padim_uses_the_fixed_stock_profile(tmp_path: Path, monkeypatch) -> None
     assert isinstance(components["model"], FakePadim)
     assert components["engine"].kwargs["default_root_dir"] == str(tmp_path / "run")
     assert components["engine"].kwargs["callbacks"] == ["progress-callback"]
-    assert components["engine"].kwargs["max_epochs"] == 1
+    assert components["engine"].kwargs["max_epochs"] == 2
     assert components["engine"].kwargs["check_val_every_n_epoch"] == 1
     assert components["model"].kwargs == {
         "backbone": "resnet18",
@@ -191,6 +191,10 @@ def test_dinomaly_variants_use_stock_class_and_explicit_encoder(
         def __init__(self, **kwargs) -> None:
             self.kwargs = kwargs
 
+        @staticmethod
+        def configure_pre_processor(**kwargs) -> dict[str, object]:
+            return kwargs
+
     anomalib_models = ModuleType("anomalib.models")
     anomalib_models.Dinomaly = FakeDinomaly
     monkeypatch.setitem(sys.modules, "anomalib.models", anomalib_models)
@@ -201,12 +205,15 @@ def test_dinomaly_variants_use_stock_class_and_explicit_encoder(
     )
 
     assert isinstance(model, FakeDinomaly)
-    assert model.kwargs == {
+    expected_kwargs: dict[str, object] = {
         "encoder_name": encoder_name,
         "decoder_depth": 8,
         "bottleneck_dropout": 0.2,
         "use_context_recentering": False,
     }
+    if model_name == "dinomaly_dinov3":
+        expected_kwargs["pre_processor"] = {"image_size": (512, 512), "crop_size": 512}
+    assert model.kwargs == expected_kwargs
 
 
 def test_calibration_datamodule_never_splits_the_final_test_subset(tmp_path: Path, monkeypatch) -> None:
@@ -270,9 +277,9 @@ def test_auto_device_falls_back_when_pytorch_lacks_the_gpu_architecture(monkeypa
         service.resolve_device(DeviceMode.CUDA)
 
 
-def test_inspect_api_rejects_anomalib_versions_other_than_2_5_1(monkeypatch) -> None:
+def test_inspect_api_rejects_anomalib_versions_other_than_2_6_0(monkeypatch) -> None:
     anomalib_module = ModuleType("anomalib")
-    anomalib_module.__version__ = "2.6.0"
+    anomalib_module.__version__ = "2.5.1"
     anomalib_data = ModuleType("anomalib.data")
     anomalib_data.Folder = object
     anomalib_engine = ModuleType("anomalib.engine")
@@ -286,4 +293,4 @@ def test_inspect_api_rejects_anomalib_versions_other_than_2_5_1(monkeypatch) -> 
     info = AnomalibService().inspect_api()
 
     assert not info.available
-    assert "2.5.1 is required" in info.notes
+    assert "2.6.0 is required" in info.notes

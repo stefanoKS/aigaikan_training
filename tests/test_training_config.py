@@ -26,7 +26,7 @@ def test_training_config_round_trip() -> None:
     assert restored.model_name == "dinomaly_dinov3"
     assert restored.dinomaly_decoder_depth == 8
     assert restored.dinomaly_encoder_name == "vit_base_patch16_dinov3.lvd1689m"
-    assert payload["model_profile"]["preprocessing"] == "anomalib-native"
+    assert payload["model_profile"]["preprocessing"] == "anomalib-native-512px-patch16"
     restored.validate()
 
 
@@ -38,6 +38,15 @@ def test_patchcore_defaults_to_fixed_production_profile() -> None:
     assert config.batch_size == 8
     assert config.recommended_epochs(training_image_count=250) == 1
     config.validate()
+
+
+def test_padim_uses_a_configurable_multi_epoch_default() -> None:
+    config = TrainingConfig(model_name="padim")
+
+    assert config.max_epochs == 2
+    config.max_epochs = 5
+    config.apply_model_defaults(training_image_count=250)
+    assert config.max_epochs == 5
 
 
 def test_sparse_persisted_config_uses_current_model_profile() -> None:
@@ -52,6 +61,23 @@ def test_dinomaly_calculates_epochs_from_training_image_count() -> None:
 
     assert config.max_epochs == 300
     assert config.estimated_training_steps(training_image_count=80) == 3000
+
+
+def test_dinomaly_never_uses_the_single_epoch_default() -> None:
+    config = TrainingConfig(model_name="dinomaly_dinov2")
+
+    assert config.max_epochs == 2
+    config.apply_model_defaults(training_image_count=80)
+    assert config.max_epochs == 300
+
+
+def test_dinomaly_preprocessing_defaults_match_the_selected_encoder_patch_size() -> None:
+    assert TrainingConfig(model_name="dinomaly_dinov2").model_profile()["preprocessing"] == (
+        "anomalib-native-448px-crop392-patch14"
+    )
+    assert TrainingConfig(model_name="dinomaly_dinov3").model_profile()["preprocessing"] == (
+        "anomalib-native-512px-patch16"
+    )
 
 
 def test_legacy_dinomaly_dinov3_encoder_migrates_to_its_explicit_variant() -> None:

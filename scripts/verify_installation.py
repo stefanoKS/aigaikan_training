@@ -43,9 +43,8 @@ def main(require_cuda: bool = False) -> int:
     import anomalib
     from anomalib.models import Dinomaly, Padim, Patchcore
 
-    version = tuple(int(part) for part in anomalib.__version__.split(".")[:2])
-    if anomalib.__version__ != "2.5.1":
-        raise SystemExit(f"Anomalib 2.5.1 is required; found {anomalib.__version__}.")
+    if anomalib.__version__ != "2.6.0":
+        raise SystemExit(f"Anomalib 2.6.0 is required; found {anomalib.__version__}.")
     print(f"Available models: {Patchcore.__name__}, {Padim.__name__}, {Dinomaly.__name__}")
     from PySide6.QtWidgets import QApplication
 

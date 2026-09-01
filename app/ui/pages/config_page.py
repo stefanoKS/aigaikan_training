@@ -66,7 +66,7 @@ class ConfigPage(QWidget):
         trainer_form = QFormLayout(self.trainer_group)
         self.max_epochs_spin = QSpinBox()
         self.max_epochs_spin.setRange(1, 10000)
-        self.max_epochs_spin.setValue(1)
+        self.max_epochs_spin.setValue(2)
         self.estimated_steps_label = QLabel("-")
         self.estimated_steps_label.setObjectName("EstimatedSteps")
         self.validation_every_n_epochs_spin = QSpinBox()
@@ -201,9 +201,11 @@ class ConfigPage(QWidget):
         self.trainer_group.setTitle("Trainer Settings" if is_training_model else "Trainer Settings (Not used for zero-shot evaluation)")
         uses_fixed_one_pass = model_key == "patchcore"
         self.max_epochs_spin.setValue(1 if uses_fixed_one_pass else self.max_epochs_spin.value())
+        if is_dinomaly and self.max_epochs_spin.value() < 2:
+            self.max_epochs_spin.setValue(2)
         self.max_epochs_spin.setEnabled(not uses_fixed_one_pass and is_training_model)
-        self.batch_size_spin.setValue(8 if uses_fixed_one_pass else self.batch_size_spin.value())
-        self.batch_size_spin.setEnabled(not uses_fixed_one_pass and is_training_model)
+        self.batch_size_spin.setValue(8 if model_key == "patchcore" else self.batch_size_spin.value())
+        self.batch_size_spin.setEnabled(is_training_model)
 
     def threshold_false_reject_rate(self) -> float:
         """Return the selected normal false-reject rate as a probability."""

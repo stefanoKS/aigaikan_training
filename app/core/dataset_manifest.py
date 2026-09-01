@@ -98,18 +98,24 @@ def build_effective_split(config: DatasetConfig, seed: int) -> EffectiveSplit:
     if len(ok_train) < 2:
         raise ValueError("At least two OK training images are required to create a split.")
     shuffled_ok = _shuffled(ok_train, seed)
-    if ok_test:
-        training_ok = tuple(shuffled_ok)
-        held_out_ok = list(ok_test)
-    else:
-        held_out_count = _holdout_count(len(shuffled_ok))
-        training_ok = tuple(shuffled_ok[:-held_out_count])
-        held_out_ok = shuffled_ok[-held_out_count:]
-
     if validation_ok:
-        final_test_ok = tuple(held_out_ok)
+        calibration_ok = tuple(validation_ok)
+        if ok_test:
+            training_ok = tuple(shuffled_ok)
+            final_test_ok = tuple(ok_test)
+        else:
+            training_ok, final_test_ok = _reserve_ok_holdout(shuffled_ok, 1)
+    elif ok_test:
+        if len(ok_test) >= 2:
+            training_ok = tuple(shuffled_ok)
+            final_test_ok, calibration_ok = _split_for_validation(ok_test, seed + 1)
+        else:
+            training_ok, calibration_ok = _reserve_ok_holdout(shuffled_ok, 1)
+            final_test_ok = tuple(ok_test)
     else:
-        final_test_ok, validation_ok = _split_for_validation(held_out_ok, seed + 1)
+        held_out_count = max(_holdout_count(len(shuffled_ok)), 2)
+        training_ok, held_out_ok = _reserve_ok_holdout(shuffled_ok, held_out_count)
+        final_test_ok, calibration_ok = _split_for_validation(held_out_ok, seed + 1)
     if validation_ng:
         final_test_ng = tuple(ng_test)
     else:
@@ -117,7 +123,7 @@ def build_effective_split(config: DatasetConfig, seed: int) -> EffectiveSplit:
 
     split = EffectiveSplit(
         training_ok=training_ok,
-        validation_ok=tuple(validation_ok),
+        validation_ok=calibration_ok,
         validation_ng=tuple(validation_ng),
         final_test_ok=tuple(final_test_ok),
         final_test_ng=tuple(final_test_ng),
@@ -247,6 +253,16 @@ def _shuffled(paths: Iterable[Path], seed: int) -> list[Path]:
 
 def _holdout_count(count: int) -> int:
     return min(max(1, round(count * 0.2)), count - 1)
+
+
+def _reserve_ok_holdout(paths: list[Path], count: int) -> tuple[tuple[Path, ...], tuple[Path, ...]]:
+    """Reserve disjoint normal images while retaining the minimum fit set."""
+    if len(paths) - count < 2:
+        raise ValueError(
+            "At least four OK training images are required when normal calibration and final testing "
+            "must both be held out from OK training data."
+        )
+    return tuple(paths[:-count]), tuple(paths[-count:])
 
 
 def _split_for_validation(paths: Iterable[Path], seed: int) -> tuple[tuple[Path, ...], tuple[Path, ...]]:

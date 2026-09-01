@@ -8,10 +8,10 @@ from typing import Any
 import warnings
 
 from app.core.model_registry import ModelDefinition, ModelExecutionMode, ModelRegistry
-from app.models.dataset_config import DatasetConfig, DatasetRole
+from app.models.dataset_config import DatasetConfig, DatasetRole, SUPPORTED_IMAGE_EXTENSIONS
 from app.models.training_config import DeviceMode, TrainingConfig
 
-REQUIRED_ANOMALIB_VERSION = "2.5.1"
+REQUIRED_ANOMALIB_VERSION = "2.6.0"
 
 
 @dataclass(slots=True)
@@ -141,16 +141,20 @@ class AnomalibService:
         calibration_mode: bool = False,
     ) -> dict[str, Any]:
         """Instantiate current Anomalib components from the project configuration."""
+        ok_train = self._required_folder(dataset, DatasetRole.OK_TRAIN)
+        training_image_count = sum(
+            path.is_file() and path.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS
+            for path in ok_train.rglob("*")
+        )
+        config.apply_model_defaults(training_image_count)
         config.validate()
         definition = self.model_registry.get(config.model_name)
         if not definition.supports_image_folder:
             raise ValueError(
                 f"{definition.display_name} requires a video dataset and cannot run in an image-folder project."
             )
-        from anomalib.data import Folder
         from anomalib.engine import Engine
 
-        ok_train = self._required_folder(dataset, DatasetRole.OK_TRAIN)
         model = self._create_model(definition, config)
         device = self.resolve_device(config.device)
         if device == "gpu":
@@ -291,11 +295,19 @@ class AnomalibService:
                 pre_trained=True,
             )
         if definition.key in {"dinomaly_dinov2", "dinomaly_dinov3"}:
+            model_kwargs: dict[str, Any] = {
+                "encoder_name": config.dinomaly_encoder_name,
+                "decoder_depth": 8,
+                "bottleneck_dropout": 0.2,
+                "use_context_recentering": False,
+            }
+            if definition.key == "dinomaly_dinov3":
+                model_kwargs["pre_processor"] = model_class.configure_pre_processor(
+                    image_size=(512, 512),
+                    crop_size=512,
+                )
             return model_class(
-                encoder_name=config.dinomaly_encoder_name,
-                decoder_depth=8,
-                bottleneck_dropout=0.2,
-                use_context_recentering=False,
+                **model_kwargs,
             )
         raise RuntimeError(f"No model factory is registered for {definition.display_name}.")
 

@@ -2,7 +2,7 @@
 
 ## Application purpose
 
-Anomalib Trainer is a Windows desktop application for creating reproducible anomaly-detection training runs from inspection images. It supports exactly four stock Anomalib 2.5.1 configurations: PatchCore, PaDiM, Dinomaly-DINOv2, and Dinomaly-DINOv3. Production validation requires a real train, evaluation, Torch export, reload, and score-parity pass for each configuration; unit tests alone are not production evidence.
+Anomalib Trainer is a Windows desktop application for creating reproducible anomaly-detection training runs from inspection images. It supports exactly four stock Anomalib 2.6.0 configurations: PatchCore, PaDiM, Dinomaly-DINOv2, and Dinomaly-DINOv3. Production validation requires a real train, evaluation, Torch export, reload, and score-parity pass for each configuration; unit tests alone are not production evidence.
 
 ## Screenshots
 

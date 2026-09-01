@@ -11,4 +11,7 @@ requires-python = ">=3.11,<3.12"
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+markers = [
+	"anomalib_smoke: real Anomalib train, export, reload, and parity integration tests",
+]
 

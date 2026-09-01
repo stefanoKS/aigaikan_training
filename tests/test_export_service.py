@@ -137,7 +137,7 @@ def test_export_model_uses_configured_formats_native_preprocessing_and_names(tmp
     deployment_manifest = json.loads((report.package_directory / "deployment_manifest.json").read_text(encoding="utf-8"))
     assert deployment_manifest["threshold_metadata"]["threshold_method"] == "normal_only_conformal"
     assert deployment_manifest["threshold_metadata"]["threshold_revision"] == "revision-001"
-    assert deployment_manifest["anomalib_version"] == "2.5.1"
+    assert deployment_manifest["anomalib_version"] == "2.6.0"
     assert deployment_manifest["model"]["profile"]["preprocessing"] == "anomalib-native"
     assert deployment_manifest["exports"][0]["validation"]["maximum_score_delta"] == 0.0
     validation_report = json.loads(report.exported[0].validation_report.read_text(encoding="utf-8"))

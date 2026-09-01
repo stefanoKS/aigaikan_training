@@ -19,7 +19,7 @@ class DeviceMode(StrEnum):
     CPU = "cpu"
 
 
-_SUPPORTED_MODEL_NAMES = frozenset({"patchcore", "padim", "dinomaly", "dinomalydinov2", "dinomalydinov3"})
+_SUPPORTED_MODEL_NAMES = frozenset({"patchcore", "padim", "dinomalydinov2", "dinomalydinov3"})
 
 
 @dataclass(slots=True)
@@ -29,7 +29,7 @@ class TrainingConfig:
     model_name: str = "patchcore"
     device: DeviceMode = DeviceMode.AUTO
     batch_size: int = 8
-    max_epochs: int = 1
+    max_epochs: int = 2
     target_training_steps: int = 3000
     validation_every_n_epochs: int = 1
     gradient_clip_val: float = 0.0
@@ -44,6 +44,15 @@ class TrainingConfig:
     threshold_method: ThresholdMethod = ThresholdMethod.AUTO
     target_normal_false_reject_rate: float = 0.005
     minimum_required_ng_recall: float | None = None
+
+    def __post_init__(self) -> None:
+        """Apply defaults that do not depend on the selected dataset size."""
+        if self.is_patchcore:
+            if self.batch_size > 0:
+                self.batch_size = 8
+            self.max_epochs = 1
+        elif self.is_dinomaly and self.max_epochs < 2:
+            self.max_epochs = 2
 
     def validate(self) -> None:
         """Validate configuration values."""
@@ -91,6 +100,11 @@ class TrainingConfig:
         return self._normalized_model_name == "patchcore"
 
     @property
+    def is_padim(self) -> bool:
+        """Return whether this config represents the production PaDiM path."""
+        return self._normalized_model_name == "padim"
+
+    @property
     def is_dinomaly(self) -> bool:
         """Return whether this config represents either explicit Dinomaly variant."""
         return self.is_dinomaly_dinov2 or self.is_dinomaly_dinov3
@@ -98,7 +112,7 @@ class TrainingConfig:
     @property
     def is_dinomaly_dinov2(self) -> bool:
         """Return whether this config selects stock Anomalib Dinomaly."""
-        return self._normalized_model_name in {"dinomaly", "dinomalydinov2"}
+        return self._normalized_model_name == "dinomalydinov2"
 
     @property
     def is_dinomaly_dinov3(self) -> bool:
@@ -129,7 +143,7 @@ class TrainingConfig:
                 "max_epochs": 1,
                 "preprocessing": "anomalib-native",
             }
-        if self._normalized_model_name == "padim":
+        if self.is_padim:
             return {
                 "backbone": "resnet18",
                 "layers": ["layer1", "layer2", "layer3"],
@@ -141,7 +155,11 @@ class TrainingConfig:
             "bottleneck_dropout": 0.2,
             "use_context_recentering": False,
             "training": "step-based",
-            "preprocessing": "anomalib-native",
+            "preprocessing": (
+                "anomalib-native-512px-patch16"
+                if self.is_dinomaly_dinov3
+                else "anomalib-native-448px-crop392-patch14"
+            ),
         }
 
     def recommended_epochs(self, training_image_count: int) -> int:
@@ -165,8 +183,7 @@ class TrainingConfig:
             self.dinomaly_decoder_depth = 8
             self.dinomaly_bottleneck_dropout = 0.2
             self.dinomaly_context_recentering = False
-            if self.max_epochs == 1:
-                self.max_epochs = self.recommended_epochs(training_image_count)
+            self.max_epochs = self.recommended_epochs(training_image_count)
 
     @property
     def _normalized_model_name(self) -> str:
@@ -198,7 +215,7 @@ class TrainingConfig:
             model_name=model_name,
             device=DeviceMode(payload.get("device", DeviceMode.AUTO.value)),
             batch_size=int(payload.get("batch_size", 8)),
-            max_epochs=int(payload.get("max_epochs", 1)),
+            max_epochs=int(payload.get("max_epochs", 2)),
             target_training_steps=int(payload.get("target_training_steps", 3000)),
             validation_every_n_epochs=int(payload.get("validation_every_n_epochs", 1)),
             gradient_clip_val=float(payload.get("gradient_clip_val", 0.0)),

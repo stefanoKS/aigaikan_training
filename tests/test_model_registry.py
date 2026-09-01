@@ -19,6 +19,12 @@ def test_registry_contains_only_the_supported_production_configurations() -> Non
         "Padim",
         "Dinomaly",
     }
+    assert [definition.key for definition in registry.production_models()] == [
+        "patchcore",
+        "padim",
+        "dinomaly_dinov2",
+        "dinomaly_dinov3",
+    ]
 
 
 def test_dinomaly_variants_have_distinct_encoder_identities_and_share_stock_implementation() -> None:
@@ -32,7 +38,8 @@ def test_dinomaly_variants_have_distinct_encoder_identities_and_share_stock_impl
     assert dinov3.anomalib_class_name == "Dinomaly"
     assert dinov2.official_anomalib_implementation
     assert dinov3.official_anomalib_implementation
-    assert dinov3.support_level is ModelSupportLevel.SUPPORTED
+    assert dinov3.support_level is ModelSupportLevel.PRODUCTION_VALIDATED
     assert dinov2.encoder_family == "DINOv2"
     assert dinov3.encoder_family == "DINOv3"
-    assert registry.get("Dinomaly").model_variant == "dinomaly_dinov2"
+    with pytest.raises(ValueError, match="Unsupported Anomalib model"):
+        registry.get("Dinomaly")

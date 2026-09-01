@@ -107,3 +107,26 @@ def test_normal_only_split_has_held_out_calibration_and_no_ng_snapshot(tmp_path:
     }
     assert staged.training_config.folders[DatasetRole.NG_TEST].resolved_path() is None
     assert staged.final_test_config.folders[DatasetRole.NG_TEST].resolved_path() is None
+
+
+def test_normal_only_split_keeps_two_training_images_with_the_minimum_split_size(tmp_path: Path) -> None:
+    config = _dataset_config(tmp_path)
+    for index in range(4):
+        _save_image(tmp_path / "ok_train" / f"ok_{index}.png", (index + 10, 0, 0))
+
+    split = build_effective_split(config, seed=42)
+
+    assert split.counts() == {
+        "training": {"ok": 2, "ng": 0},
+        "validation": {"ok": 1, "ng": 0},
+        "final_test": {"ok": 1, "ng": 0},
+    }
+
+
+def test_normal_only_split_rejects_too_few_images_for_three_disjoint_roles(tmp_path: Path) -> None:
+    config = _dataset_config(tmp_path)
+    for index in range(3):
+        _save_image(tmp_path / "ok_train" / f"ok_{index}.png", (index + 10, 0, 0))
+
+    with pytest.raises(ValueError, match="At least four OK training images"):
+        build_effective_split(config, seed=42)

@@ -1,4 +1,4 @@
-"""Catalog of supported Anomalib 2.5.1 model configurations."""
+"""Catalog of supported Anomalib 2.6.0 model configurations."""
 
 from __future__ import annotations
 
@@ -61,7 +61,7 @@ class ModelRegistry:
             "Patchcore",
             algorithm="PatchCore",
             model_variant="patchcore",
-            support_level=ModelSupportLevel.SUPPORTED,
+            support_level=ModelSupportLevel.PRODUCTION_VALIDATED,
         ),
         ModelDefinition(
             "padim",
@@ -69,7 +69,7 @@ class ModelRegistry:
             "Padim",
             algorithm="PaDiM",
             model_variant="padim",
-            support_level=ModelSupportLevel.SUPPORTED,
+            support_level=ModelSupportLevel.PRODUCTION_VALIDATED,
         ),
         ModelDefinition(
             "dinomaly_dinov2",
@@ -78,7 +78,7 @@ class ModelRegistry:
             algorithm="Dinomaly",
             model_variant="dinomaly_dinov2",
             encoder_family="DINOv2",
-            support_level=ModelSupportLevel.SUPPORTED,
+            support_level=ModelSupportLevel.PRODUCTION_VALIDATED,
         ),
         ModelDefinition(
             "dinomaly_dinov3",
@@ -87,8 +87,8 @@ class ModelRegistry:
             algorithm="Dinomaly",
             model_variant="dinomaly_dinov3",
             encoder_family="DINOv3",
-            requirement="Stock Anomalib 2.5.1 Dinomaly with a DINOv3 timm encoder.",
-            support_level=ModelSupportLevel.SUPPORTED,
+            requirement="Stock Anomalib 2.6.0 Dinomaly with a DINOv3 timm encoder.",
+            support_level=ModelSupportLevel.PRODUCTION_VALIDATED,
         ),
     )
 
@@ -97,14 +97,9 @@ class ModelRegistry:
         self._aliases = {
             self._normalize(identifier): definition
             for definition in self._MODEL_DEFINITIONS
-            for identifier in (definition.key, definition.display_name, definition.anomalib_class_name)
+            for identifier in (definition.key, definition.display_name)
             if identifier
         }
-        self._aliases.update(
-            {
-                "dinomaly": self._models["dinomaly_dinov2"],
-            }
-        )
 
     def all(self) -> list[ModelDefinition]:
         """Return every current Anomalib model definition."""
@@ -131,7 +126,7 @@ class ModelRegistry:
         ]
 
     def get(self, identifier: str) -> ModelDefinition:
-        """Get a definition by stored key, display name, or Anomalib class name."""
+        """Get a definition by one of the app's permanent IDs or display names."""
         try:
             return self._aliases[self._normalize(identifier)]
         except KeyError as exc:
