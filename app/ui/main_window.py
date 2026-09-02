@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import cast
 
-from PySide6.QtCore import Qt, QUrl
+from PySide6.QtCore import QSize, Qt, QUrl
 from PySide6.QtGui import QDesktopServices, QFont, QFontDatabase, QPixmap
 from PySide6.QtWidgets import (
     QFileDialog,
@@ -33,9 +33,12 @@ from app.core.run_comparison import compare_training_runs
 from app.core.threshold_calibrator import ThresholdMethod
 from app.core.project_manager import ProjectManager
 from app.core.result_parser import ResultParser
+from app.core.inspection_region import inspection_region_hash
+from app.core.run_artifacts import read_canonical_checkpoint, read_persisted_threshold, read_verified_inspection_region
 from app.core.settings_manager import SettingsManager
 from app.core.training_controller import TrainingController
-from app.models.dataset_config import DatasetRole, FolderImportMode
+from app.models.dataset_config import DatasetRole, FolderImportMode, SUPPORTED_IMAGE_EXTENSIONS
+from app.models.inspection_region import InspectionRegionConfig
 from app.models.project_config import ProjectConfig
 from app.models.training_config import DeviceMode, TrainingConfig
 from app.models.training_run import TrainingRun
@@ -45,6 +48,7 @@ from app.ui.pages.config_page import ConfigPage
 from app.ui.pages.dataset_page import DatasetPage
 from app.ui.pages.home_page import HomePage
 from app.ui.pages.inference_page import InferencePage
+from app.ui.pages.inspection_region_page import InspectionRegionPage
 from app.ui.pages.results_page import ResultsPage
 from app.ui.pages.training_page import TrainingPage
 from app.ui.styles import APP_STYLE
@@ -56,6 +60,7 @@ class MainWindow(QMainWindow):
     PAGE_DEFINITIONS = (
         ("Home / Projects", HomePage),
         ("Dataset", DatasetPage),
+        ("Inspection Region", InspectionRegionPage),
         ("Training Configuration", ConfigPage),
         ("Training", TrainingPage),
         ("Results", ResultsPage),
@@ -80,7 +85,6 @@ class MainWindow(QMainWindow):
         self._inference_input_path: Path | None = None
         self.setWindowTitle("Anomalib Trainer")
         self.resize(1400, 900)
-        self.setStyleSheet(APP_STYLE)
 
         splitter = QSplitter()
         self.navigation = QListWidget()
@@ -92,7 +96,9 @@ class MainWindow(QMainWindow):
         self.page_scroll_areas: dict[str, QScrollArea] = {}
 
         for index, (title, page_type) in enumerate(self.PAGE_DEFINITIONS):
-            self.navigation.addItem(QListWidgetItem(title))
+            navigation_item = QListWidgetItem(title)
+            navigation_item.setSizeHint(QSize(0, 46))
+            self.navigation.addItem(navigation_item)
             page = ConfigPage(self.model_registry) if page_type is ConfigPage else page_type()
             page.setObjectName("WorkspacePage")
             self.page_instances[title] = page
@@ -141,6 +147,7 @@ class MainWindow(QMainWindow):
 
         self.home_page = cast(HomePage, self.page_instances["Home / Projects"])
         self.dataset_page = cast(DatasetPage, self.page_instances["Dataset"])
+        self.inspection_region_page = cast(InspectionRegionPage, self.page_instances["Inspection Region"])
         self.config_page = cast(ConfigPage, self.page_instances["Training Configuration"])
         self.training_page = cast(TrainingPage, self.page_instances["Training"])
         self.results_page = cast(ResultsPage, self.page_instances["Results"])
@@ -216,6 +223,7 @@ class MainWindow(QMainWindow):
             browse_button.clicked.connect(lambda _checked=False, selected_role=role: self._open_dataset_folder(selected_role))
         self.dataset_page.validate_button.clicked.connect(lambda: self._validate_dataset(show_dialog=True))
         self.dataset_page.clear_button.clicked.connect(self._clear_dataset)
+        self.inspection_region_page.save_button.clicked.connect(self._save_inspection_region)
 
         self.config_page.save_button.clicked.connect(lambda: self._save_training_config(show_dialog=True))
         self.config_page.load_button.clicked.connect(self._refresh_config_page)
@@ -271,7 +279,11 @@ class MainWindow(QMainWindow):
         self._set_current_project(project)
 
     def _choose_project_to_open(self) -> None:
-        selected = QFileDialog.getExistingDirectory(self, "Open Anomalib Project")
+        selected = QFileDialog.getExistingDirectory(
+            self,
+            "Open Anomalib Project",
+            str(self._default_dialog_directory()),
+        )
         if selected:
             self._open_project_path(Path(selected))
 
@@ -297,7 +309,7 @@ class MainWindow(QMainWindow):
     def _choose_model_export_directory(self) -> None:
         default_directory = self.results_page.export_directory()
         if default_directory is None:
-            default_directory = self.current_project.root_path if self.current_project else Path.home()
+            default_directory = self.current_project.root_path if self.current_project else self._default_dialog_directory()
         selected = QFileDialog.getExistingDirectory(self, "Select Model Export Folder", str(default_directory))
         if selected:
             self.results_page.export_directory_edit.setText(selected)
@@ -341,9 +353,11 @@ class MainWindow(QMainWindow):
                 self.results_page.current_run.metrics["Export Size (bytes)"] = sum(
                     result.exported_path.stat().st_size for result in report.exported
                 )
-            torch_validated = any(result.export_format == "torch" for result in report.exported)
-            self.results_page.current_run.aigaikan_compatibility_status = (
-                "Validated with Anomalib TorchInferencer" if torch_validated else "Torch compatibility not requested"
+            parity_formats = ", ".join(result.export_format.upper() for result in report.exported)
+            self.results_page.current_run.anomalib_export_parity_status = (
+                f"Validated with Anomalib deployment inferencer: {parity_formats}"
+                if parity_formats
+                else "Not validated"
             )
             self.result_parser.write_training_run(
                 run_directory / "results.json",
@@ -356,7 +370,12 @@ class MainWindow(QMainWindow):
         if run is None:
             QMessageBox.information(self, "No Training Run", "Complete or load a training run before exporting results.")
             return
-        selected, _ = QFileDialog.getSaveFileName(self, "Export Results CSV", f"{run.run_name}_predictions.csv", "CSV Files (*.csv)")
+        selected, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Results CSV",
+            str(self._default_dialog_directory() / f"{run.run_name}_predictions.csv"),
+            "CSV Files (*.csv)",
+        )
         if selected:
             self.result_parser.export_predictions_csv(Path(selected), self.results_page.filtered_predictions())
 
@@ -365,7 +384,12 @@ class MainWindow(QMainWindow):
         if run is None:
             QMessageBox.information(self, "No Training Run", "Complete or load a training run before exporting results.")
             return
-        selected, _ = QFileDialog.getSaveFileName(self, "Export Results JSON", f"{run.run_name}_results.json", "JSON Files (*.json)")
+        selected, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Results JSON",
+            str(self._default_dialog_directory() / f"{run.run_name}_results.json"),
+            "JSON Files (*.json)",
+        )
         if selected:
             self.result_parser.write_training_run(Path(selected), run)
 
@@ -384,7 +408,7 @@ class MainWindow(QMainWindow):
         selected_paths, _ = QFileDialog.getOpenFileNames(
             self,
             "Select Two or More Results JSON Files to Compare",
-            "",
+            str(self._default_dialog_directory()),
             "JSON Files (*.json)",
         )
         if not selected_paths:
@@ -448,9 +472,17 @@ class MainWindow(QMainWindow):
             self.home_page.status_label.setText(project.last_training_status)
             self.project_indicator.setText(project.name.upper())
         self._refresh_dataset_page()
+        self._refresh_inspection_region_page()
         self._refresh_config_page()
         self._load_latest_results(project)
         self._load_default_inference_run(project)
+
+    @staticmethod
+    def _default_dialog_directory() -> Path:
+        """Return a familiar starting directory for dialogs without a project path."""
+        home_directory = Path.home()
+        documents_directory = home_directory / "Documents"
+        return documents_directory if documents_directory.is_dir() else home_directory
 
     def _set_active_page(self, index: int) -> None:
         """Keep the workspace header aligned with the selected navigation page."""
@@ -502,6 +534,7 @@ class MainWindow(QMainWindow):
         self.dataset_page.set_validation_rows([])
         self.dataset_page.validation_summary.clear()
         self._refresh_dataset_page()
+        self._refresh_inspection_region_page()
 
     def _validate_dataset(self, show_dialog: bool) -> DatasetValidationReport | None:
         project = self.current_project
@@ -509,7 +542,7 @@ class MainWindow(QMainWindow):
             if show_dialog:
                 QMessageBox.information(self, "No Project", "Create or open a project before validating data.")
             return None
-        report = self.dataset_validator.validate(project.dataset)
+        report = self.dataset_validator.validate(project.dataset, project.inspection_region)
         self._update_dataset_metadata(report)
         rows = [
             (issue.level, issue.role, issue.message, issue.path)
@@ -529,12 +562,14 @@ class MainWindow(QMainWindow):
                 f"OK: {counts['validation']['ok']}  NG: {counts['validation']['ng']}\n\n"
                 "Final Test\n"
                 f"OK: {counts['final_test']['ok']}  NG: {counts['final_test']['ng']}\n\n"
-                f"Split Seed: {split.seed}"
+                f"Split Seed: {split.seed}\n"
+                f"Evaluation Method: {split.evaluation_method}"
             )
         except ValueError as exc:
             self.dataset_page.effective_split_summary.setPlainText(f"Split unavailable: {exc}")
         self._save_project(show_dialog=False)
         self._refresh_dataset_page()
+        self._refresh_inspection_region_page()
         if show_dialog:
             if report.is_valid:
                 QMessageBox.information(self, "Dataset Ready", "The selected dataset is ready for training.")
@@ -569,6 +604,56 @@ class MainWindow(QMainWindow):
             cast(QLabel, widgets["resolution"]).setText(folder.typical_resolution if folder and folder.typical_resolution else "-")
             cast(QLabel, widgets["color"]).setText(folder.color_mode if folder and folder.color_mode else "-")
             self._set_dataset_preview(cast(QLabel, widgets["preview"]), folder.thumbnail_paths if folder else [])
+
+    def _refresh_inspection_region_page(self) -> None:
+        """Load configured original images into the ROI editor without changing project data."""
+        project = self.current_project
+        source_paths: list[Path] = []
+        if project is not None:
+            for role, folder in project.dataset.folders.items():
+                if role is DatasetRole.MASKS:
+                    continue
+                directory = folder.resolved_path()
+                if directory is not None and directory.is_dir():
+                    source_paths.extend(
+                        path.resolve()
+                        for path in directory.rglob("*")
+                        if path.is_file() and path.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS
+                    )
+        self.inspection_region_page.set_inspection_region(
+            project.inspection_region if project is not None else InspectionRegionConfig()
+        )
+        self.inspection_region_page.set_dataset_images(tuple(dict.fromkeys(sorted(source_paths))))
+
+    def _save_inspection_region(self) -> None:
+        project = self.current_project
+        if project is None:
+            QMessageBox.information(self, "No Project", "Create or open a project before saving an inspection ROI.")
+            return
+        try:
+            inspection_region = self.inspection_region_page.inspection_region()
+        except ValueError as exc:
+            QMessageBox.warning(self, "Invalid Inspection ROI", str(exc))
+            return
+        roi_errors = [
+            issue
+            for issue in self.dataset_validator.validate(project.dataset, inspection_region).errors
+            if issue.role == "inspection_region"
+        ]
+        if roi_errors:
+            QMessageBox.warning(self, "Invalid Inspection ROI", "\n".join(issue.message for issue in roi_errors[:3]))
+            return
+        previous_hash = inspection_region_hash(project.inspection_region)
+        project.inspection_region = inspection_region
+        if inspection_region_hash(inspection_region) != previous_hash:
+            project.last_training_status = "Retraining required"
+            self.results_page.clear_results()
+            self._inference_run_directory = None
+            self.inference_page.set_training_run(Path("-"), "-")
+            self.inference_page.set_status("Retraining required")
+        self._save_project(show_dialog=False)
+        self._refresh_project_views()
+        QMessageBox.information(self, "Inspection ROI Saved", "The fixed inspection region was saved to the project.")
 
     @staticmethod
     def _set_dataset_preview(preview: QLabel, thumbnail_paths: list[str]) -> None:
@@ -608,7 +693,8 @@ class MainWindow(QMainWindow):
         config.accumulate_grad_batches = self.config_page.accumulate_grad_batches_spin.value()
         config.random_seed = self.config_page.seed_spin.value()
         config.split_seed = self.config_page.split_seed_spin.value()
-        config.target_training_steps = self.config_page.target_training_steps_spin.value()
+        target_training_steps = self.config_page.target_training_steps_spin.value()
+        config.target_training_steps = target_training_steps or None
         config.num_workers = self.config_page.workers_spin.value()
         config.threshold_method = ThresholdMethod(str(self.config_page.threshold_method_combo.currentData()))
         config.target_normal_false_reject_rate = self.config_page.threshold_false_reject_rate()
@@ -617,6 +703,9 @@ class MainWindow(QMainWindow):
             if self.config_page.minimum_ng_recall_check.isChecked()
             else None
         )
+        config.maximum_final_test_false_reject_rate = self.config_page.maximum_final_test_false_reject_spin.value() / 100
+        config.minimum_final_test_ok_images = self.config_page.minimum_final_test_ok_images_spin.value()
+        config.minimum_final_test_ng_images = self.config_page.minimum_final_test_ng_images_spin.value()
         config.apply_model_defaults(self._training_image_count())
         try:
             config.validate()
@@ -647,7 +736,7 @@ class MainWindow(QMainWindow):
         self.config_page.seed_spin.setValue(config.random_seed)
         self.config_page.split_seed_spin.setValue(config.split_seed)
         self.config_page.workers_spin.setValue(config.num_workers)
-        self.config_page.target_training_steps_spin.setValue(config.target_training_steps)
+        self.config_page.target_training_steps_spin.setValue(config.target_training_steps or 0)
         threshold_method_index = self.config_page.threshold_method_combo.findData(config.threshold_method.value)
         self.config_page.threshold_method_combo.setCurrentIndex(max(threshold_method_index, 0))
         target_rate_index = self.config_page.threshold_fpr_combo.findData(config.target_normal_false_reject_rate)
@@ -656,6 +745,9 @@ class MainWindow(QMainWindow):
         self.config_page.minimum_ng_recall_check.setChecked(config.minimum_required_ng_recall is not None)
         if config.minimum_required_ng_recall is not None:
             self.config_page.minimum_ng_recall_spin.setValue(config.minimum_required_ng_recall * 100)
+        self.config_page.maximum_final_test_false_reject_spin.setValue(config.maximum_final_test_false_reject_rate * 100)
+        self.config_page.minimum_final_test_ok_images_spin.setValue(config.minimum_final_test_ok_images)
+        self.config_page.minimum_final_test_ng_images_spin.setValue(config.minimum_final_test_ng_images)
         self.config_page._update_threshold_controls()
         self.training_page.active_model_label.setText(definition.display_name)
         self.training_page.active_device_label.setText(config.device.value)
@@ -679,7 +771,7 @@ class MainWindow(QMainWindow):
             model_name=model_key,
             batch_size=self.config_page.batch_size_spin.value(),
             max_epochs=self.config_page.max_epochs_spin.value(),
-            target_training_steps=self.config_page.target_training_steps_spin.value(),
+            target_training_steps=self.config_page.target_training_steps_spin.value() or None,
         )
         config.apply_model_defaults(self._training_image_count())
         self.config_page.set_estimated_training_steps(
@@ -751,7 +843,7 @@ class MainWindow(QMainWindow):
         self.training_page.stage_progress.setValue(min(current, max(total, 1)))
 
     def _append_training_log(self, level: str, message: str) -> None:
-        self.training_page.log_output.appendPlainText(f"[{level.upper()}] {message}")
+        self.training_page.append_log(level, message)
 
     def _record_metric(self, name: str, value: object) -> None:
         self._run_metrics[name] = str(value)
@@ -790,6 +882,7 @@ class MainWindow(QMainWindow):
         if project is None:
             self.results_page.clear_results()
             return
+        expected_roi_hash = inspection_region_hash(project.inspection_region)
         summaries = sorted(
             (project.root_path / "runs").glob("*/results.json"),
             key=lambda path: path.stat().st_mtime,
@@ -798,10 +891,15 @@ class MainWindow(QMainWindow):
         if not summaries:
             self.results_page.clear_results()
             return
-        try:
-            self.results_page.set_training_run(self.result_parser.read_training_run(summaries[0]))
-        except (OSError, ValueError, TypeError):
-            self.results_page.clear_results()
+        for summary_path in summaries:
+            try:
+                run = self.result_parser.read_training_run(summary_path)
+                if run.inspection_region_hash == expected_roi_hash:
+                    self.results_page.set_training_run(run)
+                    return
+            except (OSError, ValueError, TypeError):
+                continue
+        self.results_page.clear_results()
 
     def _training_failed(self, message: str, details: str) -> None:
         if self.current_project is not None:
@@ -819,37 +917,54 @@ class MainWindow(QMainWindow):
             self._inference_run_directory = None
             self.inference_page.set_training_run(Path("-"), "-")
             return
-        run_configs = list((project.root_path / "runs").glob("*/config.json"))
-        if not run_configs:
-            return
-        latest_config = max(run_configs, key=lambda path: path.stat().st_mtime)
         if self._inference_run_directory is None or not self._inference_run_directory.is_relative_to(project.root_path):
-            self._set_inference_run(latest_config.parent, show_error=False)
+            run_configs = sorted(
+                (project.root_path / "runs").glob("*/config.json"),
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+            for config_path in run_configs:
+                if self._set_inference_run(config_path.parent, show_error=False):
+                    return
+            self._inference_run_directory = None
+            self.inference_page.set_training_run(Path("-"), "-")
 
     def _choose_inference_run(self) -> None:
-        initial_directory = self.current_project.root_path / "runs" if self.current_project else Path.home()
+        initial_directory = (
+            self.current_project.root_path / "runs" if self.current_project else self._default_dialog_directory()
+        )
         selected = QFileDialog.getExistingDirectory(self, "Select Completed Training Run", str(initial_directory))
         if selected:
             self._set_inference_run(Path(selected), show_error=True)
 
     def _set_inference_run(self, run_directory: Path, show_error: bool) -> bool:
         run_directory = run_directory.expanduser().resolve()
-        checkpoint_exists = any(run_directory.glob("**/weights/lightning/*.ckpt"))
         config_path = run_directory / "config.json"
-        if not config_path.is_file() or not checkpoint_exists:
+        if not config_path.is_file():
             if show_error:
                 QMessageBox.warning(
                     self,
                     "Invalid Training Run",
-                    "Select a training run containing config.json and a Lightning model checkpoint.",
+                    "Select a training run containing config.json and run_manifest.json.",
                 )
             return False
         try:
+            read_canonical_checkpoint(run_directory)
+            read_persisted_threshold(run_directory)
+            run_inspection_region = read_verified_inspection_region(run_directory)
+            if self.current_project is not None and inspection_region_hash(run_inspection_region) != inspection_region_hash(
+                self.current_project.inspection_region
+            ):
+                raise ValueError("The run inspection ROI does not match the current project. Train a new compatible run.")
             config = TrainingConfig.from_dict(__import__("json").loads(config_path.read_text(encoding="utf-8")))
             model_name = self.model_registry.get(config.model_name).display_name
         except (OSError, ValueError, TypeError):
             if show_error:
-                QMessageBox.warning(self, "Invalid Training Run", "The training configuration could not be loaded.")
+                QMessageBox.warning(
+                    self,
+                    "Invalid Training Run",
+                    "Select a completed run with a manifest-verified canonical checkpoint and valid configuration.",
+                )
             return False
         self._inference_run_directory = run_directory
         self.inference_page.set_training_run(run_directory, model_name)
@@ -860,7 +975,7 @@ class MainWindow(QMainWindow):
         selected, _ = QFileDialog.getOpenFileName(
             self,
             "Select Image for Inference",
-            str(self.current_project.root_path if self.current_project else Path.home()),
+            str(self.current_project.root_path if self.current_project else self._default_dialog_directory()),
             "Images (*.bmp *.jpeg *.jpg *.png *.tif *.tiff *.webp)",
         )
         if selected:
@@ -870,7 +985,7 @@ class MainWindow(QMainWindow):
         selected = QFileDialog.getExistingDirectory(
             self,
             "Select Image Folder for Inference",
-            str(self.current_project.root_path if self.current_project else Path.home()),
+            str(self.current_project.root_path if self.current_project else self._default_dialog_directory()),
         )
         if selected:
             self._set_inference_input(Path(selected))
@@ -888,6 +1003,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "No Inference Input", "Select an image or image folder first.")
             return
         self.inference_page.clear_predictions()
+        self.inference_page.clear_log()
         self.inference_page.set_progress(0, 1)
         self.inference_page.set_status("Running inference")
         try:
@@ -896,10 +1012,11 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Could Not Start Inference", str(exc))
 
     def _append_inference_log(self, level: str, message: str) -> None:
+        self.inference_page.append_log(level, message)
         if level == "error":
             self.inference_page.set_status("Inference failed")
         elif message:
-            self.inference_page.set_status(message)
+            self.inference_page.set_status(message.splitlines()[0])
 
     def _record_inference_prediction(self, prediction: PredictionResult) -> None:
         self.inference_page.append_prediction(prediction)
@@ -907,16 +1024,20 @@ class MainWindow(QMainWindow):
     def _inference_completed(self, output_directory: str) -> None:
         self.inference_page.set_status(f"Completed: {Path(output_directory).name}")
         self.inference_page.set_progress(len(self.inference_page.predictions), len(self.inference_page.predictions))
+        self.inference_page.append_log("info", f"Results saved to {output_directory}")
 
     def _inference_failed(self, message: str, details: str) -> None:
         self.inference_page.set_status("Inference failed")
-        QMessageBox.warning(self, "Inference Failed", details or message)
+        self.inference_page.append_log("error", details or message)
+        QMessageBox.warning(self, "Inference Failed", message)
 
     def _export_inference_csv(self) -> None:
         if not self.inference_page.predictions:
             QMessageBox.information(self, "No Inference Results", "Run inference before exporting predictions.")
             return
-        initial_directory = self.current_project.root_path / "exports" if self.current_project else Path.home()
+        initial_directory = (
+            self.current_project.root_path / "exports" if self.current_project else self._default_dialog_directory()
+        )
         selected, _ = QFileDialog.getSaveFileName(
             self,
             "Export Inference Results",

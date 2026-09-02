@@ -8,6 +8,7 @@ from PIL import Image
 
 from app.core.dataset_validator import DatasetValidator
 from app.models.dataset_config import DatasetConfig, DatasetRole
+from app.models.inspection_region import InspectionRegionConfig
 
 
 def _config_for(root: Path) -> DatasetConfig:
@@ -90,4 +91,55 @@ def test_normal_only_dataset_is_valid_with_an_unverified_defect_warning(tmp_path
 
     assert report.is_valid
     assert any("No genuine NG test data" in issue.message for issue in report.warnings)
+
+
+def test_validator_recursively_checks_the_same_files_used_by_manifests(tmp_path: Path) -> None:
+    root = tmp_path / "dataset"
+    for role in DatasetRole:
+        (root / role.value).mkdir(parents=True)
+    for index in range(2):
+        Image.new("RGB", (64, 64), (20 + index, 30, 40)).save(root / "ok_train" / f"top_{index}.png")
+    nested = root / "ok_train" / "nested"
+    nested.mkdir()
+    Image.new("RGB", (64, 64), (80, 90, 100)).save(nested / "valid.png")
+    (nested / "unsupported.txt").write_text("not an image", encoding="utf-8")
+    (nested / "corrupt.png").write_bytes(b"not a valid png")
+
+    config = _config_for(root)
+    report = DatasetValidator().validate(config)
+
+    assert report.stats["ok_train"]["image_count"] == 3
+    assert {(issue.message, Path(issue.path).name) for issue in report.errors} >= {
+        ("Unsupported file type", "unsupported.txt"),
+        ("Corrupt image", "corrupt.png"),
+    }
+
+
+def test_validator_marks_explicit_independent_evaluation_as_production_quality(tmp_path: Path) -> None:
+    root = tmp_path / "dataset"
+    for role in DatasetRole:
+        (root / role.value).mkdir(parents=True)
+    for folder_name in ("ok_train", "ok_validation", "ok_test", "ng_validation", "ng_test"):
+        Image.new("RGB", (64, 64), (40, 50, 60)).save(root / folder_name / f"{folder_name}.png")
+    Image.new("RGB", (64, 64), (70, 80, 90)).save(root / "ok_train" / "second.png")
+
+    report = DatasetValidator().validate(_config_for(root))
+
+    assert report.stats["evaluation"]["method"] == "independent_explicit"
+    assert not any(issue.role == "evaluation" for issue in report.warnings)
+
+
+def test_enabled_inspection_region_requires_matching_source_resolution(synthetic_dataset: Path) -> None:
+    config = _config_for(synthetic_dataset)
+    inspection_region = InspectionRegionConfig(
+        enabled=True,
+        source_width=80,
+        source_height=64,
+        points_px=((4, 4), (75, 4), (75, 59), (4, 59)),
+    )
+
+    report = DatasetValidator().validate(config, inspection_region)
+
+    assert not report.is_valid
+    assert any(issue.role == "inspection_region" and "does not match" in issue.message for issue in report.errors)
 

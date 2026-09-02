@@ -18,13 +18,34 @@ class QualityReport:
     warning: str = ""
 
 
-def calculate_quality_metrics(predictions: Iterable[PredictionResult]) -> QualityReport:
+@dataclass(frozen=True, slots=True)
+class FinalTestAcceptancePolicy:
+    """Production acceptance limits applied only to independent final-test evidence."""
+
+    maximum_false_reject_rate: float
+    minimum_ok_test_images: int
+    minimum_ng_test_images: int
+
+    def validate(self) -> None:
+        """Reject ambiguous or unachievable acceptance-policy settings."""
+        if not 0 <= self.maximum_false_reject_rate <= 1:
+            raise ValueError("Maximum false reject rate must be between zero and one.")
+        if self.minimum_ok_test_images <= 0 or self.minimum_ng_test_images <= 0:
+            raise ValueError("Minimum final-test evidence counts must be positive.")
+
+
+def calculate_quality_metrics(
+    predictions: Iterable[PredictionResult],
+    acceptance_policy: FinalTestAcceptancePolicy | None = None,
+) -> QualityReport:
     """Calculate quality metrics without treating AUROC as the primary safety signal."""
     items = list(predictions)
     if not items:
         raise ValueError("Cannot calculate quality metrics without final-test predictions.")
     if any(not isfinite(prediction.anomaly_score) for prediction in items):
         raise ValueError("Prediction scores must all be finite.")
+    if acceptance_policy is not None:
+        acceptance_policy.validate()
 
     actual_ng = [item for item in items if item.ground_truth_label.upper() == "NG"]
     actual_ok = [item for item in items if item.ground_truth_label.upper() == "OK"]
@@ -57,8 +78,16 @@ def calculate_quality_metrics(predictions: Iterable[PredictionResult]) -> Qualit
         "F1": f1 if actual_ng else "NOT MEASURED",
         "AUROC": _auroc(items) if actual_ng else "NOT MEASURED",
         "Decision Threshold": threshold,
+        "Final-Test Acceptance Policy": (
+            "NOT CONFIGURED"
+            if acceptance_policy is None
+            else (
+                f"False reject rate <= {acceptance_policy.maximum_false_reject_rate:.6g}; "
+                f"OK >= {acceptance_policy.minimum_ok_test_images}; NG >= {acceptance_policy.minimum_ng_test_images}"
+            )
+        ),
     }
-    status = "PASS"
+    status = "WARNING"
     warning = ""
     if not actual_ng:
         status = "NOT VERIFIED"
@@ -66,8 +95,24 @@ def calculate_quality_metrics(predictions: Iterable[PredictionResult]) -> Qualit
         metrics["Defect Detection Evidence"] = "NOT MEASURED"
     elif escaped_ng:
         status = "FAIL"
-    elif len(actual_ng) < 10 or len(actual_ok) < 10:
-        status = "WARNING"
+        warning = "Escaped NG final-test images exceed the zero-escape requirement."
+    elif acceptance_policy is None:
+        warning = "Final-test acceptance policy is not configured; false-reject acceptability is not established."
+    elif len(actual_ok) < acceptance_policy.minimum_ok_test_images or len(actual_ng) < acceptance_policy.minimum_ng_test_images:
+        evidence_gaps = []
+        if len(actual_ok) < acceptance_policy.minimum_ok_test_images:
+            evidence_gaps.append(f"OK {len(actual_ok)}/{acceptance_policy.minimum_ok_test_images}")
+        if len(actual_ng) < acceptance_policy.minimum_ng_test_images:
+            evidence_gaps.append(f"NG {len(actual_ng)}/{acceptance_policy.minimum_ng_test_images}")
+        warning = f"Final-test evidence is insufficient for acceptance: {', '.join(evidence_gaps)}."
+    elif false_reject / len(actual_ok) > acceptance_policy.maximum_false_reject_rate:
+        status = "FAIL"
+        warning = (
+            f"False reject rate {false_reject / len(actual_ok):.6g} exceeds the configured maximum "
+            f"{acceptance_policy.maximum_false_reject_rate:.6g}."
+        )
+    else:
+        status = "PASS"
     return QualityReport(metrics=metrics, status=status, warning=warning)
 
 

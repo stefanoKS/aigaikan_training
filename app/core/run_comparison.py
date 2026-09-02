@@ -47,15 +47,16 @@ def compare_training_runs(runs: Iterable[TrainingRun]) -> RunComparisonReport:
             run.dataset_manifest_sha256,
             run.calibration_manifest_sha256,
             run.final_test_manifest_sha256,
+            run.inspection_region_hash,
         )
         for run in selected_runs
     }
     complete_identity = all(all(identity) for identity in split_identities)
     direct_allowed = complete_identity and len(split_identities) == 1
     reason = (
-        "All runs use the same source dataset and train/calibration/final-test assignments."
+        "All runs use the same source dataset, train/calibration/final-test assignments, and inspection ROI."
         if direct_allowed
-        else "DIRECT QUALITY COMPARISON NOT ALLOWED: runs do not share the same complete source split manifest."
+        else "DIRECT QUALITY COMPARISON NOT ALLOWED: runs do not share the same complete source split manifest and inspection ROI."
     )
     metric_rows: dict[str, tuple[object, ...]] = {}
     for metric in COMPARISON_METRICS:

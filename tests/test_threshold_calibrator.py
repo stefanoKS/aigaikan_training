@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from math import nextafter
+
 from app.core.threshold_calibrator import (
     CalibrationSample,
     ThresholdCalibrationConfig,
@@ -45,10 +47,33 @@ def test_normal_only_conformal_uses_deterministic_finite_sample_order_statistic(
     first = ThresholdCalibrator().calibrate(samples, config)
     second = ThresholdCalibrator().calibrate(list(reversed(samples)), config)
 
-    assert first.threshold_value == 0.5
+    assert first.threshold_raw == 0.5
+    assert first.threshold_deployed == nextafter(0.5, float("inf"))
+    assert first.threshold_value == first.threshold_deployed
     assert first == second
     assert first.calibration_sample_count == 4
-    assert first.observed_calibration_false_reject_rate == 0.5
+    assert first.observed_calibration_false_reject_rate == 0.25
+
+
+def test_normal_only_conformal_lifts_a_tied_raw_quantile_for_greater_equal_decisions() -> None:
+    result = ThresholdCalibrator().calibrate(
+        _samples((0.1, "OK"), (0.5, "OK"), (0.5, "OK")),
+        ThresholdCalibrationConfig(ThresholdMethod.NORMAL_ONLY_CONFORMAL, target_normal_false_reject_rate=0.5),
+    )
+
+    assert result.threshold_raw == 0.5
+    assert result.threshold_value > result.threshold_raw
+    assert all(score < result.threshold_value for score in (0.1, 0.5, 0.5))
+    assert result.observed_calibration_false_reject_rate == 0.0
+
+
+def test_normal_only_conformal_warns_when_the_sample_count_cannot_resolve_alpha() -> None:
+    result = ThresholdCalibrator().calibrate(
+        _samples(*((0.1, "OK"),) * 199),
+        ThresholdCalibrationConfig(ThresholdMethod.NORMAL_ONLY_CONFORMAL, target_normal_false_reject_rate=0.005),
+    )
+
+    assert "at least 200" in result.warning
 
 
 def test_normal_only_calibration_has_no_ng_dependent_metrics() -> None:

@@ -32,6 +32,10 @@ class TrainingRun:
     dataset_manifest_sha256: str = ""
     calibration_manifest_sha256: str = ""
     final_test_manifest_sha256: str = ""
+    inspection_region_hash: str = ""
+    roi_contract_version: int = 0
+    rectified_roi_width: int = 0
+    rectified_roi_height: int = 0
     evaluation_revision_id: str = ""
     model_variant: str = ""
     encoder_family: str = ""
@@ -41,6 +45,7 @@ class TrainingRun:
     peak_gpu_memory_mb: float | None = None
     quality_status: str = ""
     export_status: str = "Not exported"
-    aigaikan_compatibility_status: str = "Not validated"
+    anomalib_export_parity_status: str = "Not validated"
+    aigaikan_compatibility_status: str = "Pending AIGAIKAN runtime validation"
     metrics: dict[str, float | str | None] = field(default_factory=dict)
     predictions: list[PredictionResult] = field(default_factory=list)

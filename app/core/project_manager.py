@@ -10,6 +10,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile, TemporaryDirectory
 from typing import Any
 
+from app.core.inspection_region import read_inspection_region, write_inspection_region
 from app.models.project_config import ProjectConfig
 
 LOGGER = logging.getLogger(__name__)
@@ -20,6 +21,7 @@ class ProjectManager:
 
     PROJECTS_ROOT_NAME = "AnomalibProjects"
     PROJECT_FILE_NAME = "project.json"
+    INSPECTION_REGION_FILE_NAME = "inspection_region.json"
     REQUIRED_DIRECTORIES = (
         "dataset/ok_train",
         "dataset/ok_validation",
@@ -57,6 +59,9 @@ class ProjectManager:
         project_file = path if path.name == self.PROJECT_FILE_NAME else path / self.PROJECT_FILE_NAME
         payload = self._read_project_payload(project_file)
         project = ProjectConfig.from_dict(payload)
+        inspection_region_path = project.root_path / self.INSPECTION_REGION_FILE_NAME
+        if inspection_region_path.is_file():
+            project.inspection_region = read_inspection_region(inspection_region_path)
         project.mark_opened()
         self.save_project(project)
         LOGGER.info("Loaded project '%s' from %s", project.name, project_file)
@@ -67,6 +72,7 @@ class ProjectManager:
         project_root = Path(project.project_path).expanduser().resolve()
         project_root.mkdir(parents=True, exist_ok=True)
         project_file = project_root / self.PROJECT_FILE_NAME
+        write_inspection_region(project_root / self.INSPECTION_REGION_FILE_NAME, project.inspection_region)
         payload = project.to_dict()
         self._atomic_write_json(project_file, payload)
         return project_file

@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QPlainTextEdit,
     QProgressBar,
     QPushButton,
     QTableWidget,
@@ -70,6 +71,14 @@ class InferencePage(QWidget):
         self.progress_bar.setValue(0)
         root.addWidget(self.progress_bar)
 
+        log_group = QGroupBox("Inference Log")
+        log_layout = QVBoxLayout(log_group)
+        self.log_output = QPlainTextEdit()
+        self.log_output.setReadOnly(True)
+        self.log_output.setMinimumHeight(140)
+        log_layout.addWidget(self.log_output)
+        root.addWidget(log_group)
+
         self.results_table = QTableWidget(0, 5)
         self.results_table.setHorizontalHeaderLabels(["Source", "Prediction", "Score", "Threshold", "Heat Map"])
         self.results_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -122,6 +131,18 @@ class InferencePage(QWidget):
         for label in self.preview_labels.values():
             label.clear()
             label.setText("No image")
+
+    def clear_log(self) -> None:
+        """Clear messages from the prior inference request."""
+        self.log_output.clear()
+
+    def append_log(self, level: str, message: str) -> None:
+        """Append worker output and follow the newest message in the scrollable log."""
+        scrollbar = self.log_output.verticalScrollBar()
+        follow_latest = scrollbar.value() >= scrollbar.maximum()
+        self.log_output.appendPlainText(f"[{level.upper()}] {message}")
+        if follow_latest:
+            scrollbar.setValue(scrollbar.maximum())
 
     def append_prediction(self, prediction: PredictionResult) -> None:
         """Add one streamed prediction to the table and preview it."""

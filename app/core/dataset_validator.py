@@ -10,6 +10,7 @@ from pathlib import Path
 
 from PIL import Image, UnidentifiedImageError
 
+from app.models.inspection_region import InspectionRegionConfig
 from app.models.dataset_config import SUPPORTED_IMAGE_EXTENSIONS, DatasetConfig, DatasetRole
 
 LOGGER = logging.getLogger(__name__)
@@ -52,7 +53,11 @@ class DatasetValidator:
         DatasetRole.MASKS,
     )
 
-    def validate(self, config: DatasetConfig) -> DatasetValidationReport:
+    def validate(
+        self,
+        config: DatasetConfig,
+        inspection_region: InspectionRegionConfig | None = None,
+    ) -> DatasetValidationReport:
         """Validate all configured dataset folders."""
         report = DatasetValidationReport()
         role_files: dict[DatasetRole, list[Path]] = {}
@@ -67,8 +72,10 @@ class DatasetValidator:
             self._validate_folder(role, path, report, role_files)
 
         self._validate_counts(role_files, report)
+        self._describe_evaluation_method(role_files, report)
         self._validate_cross_role_duplicates(role_files, report)
         self._validate_source_resolution(role_files, report)
+        self._validate_inspection_region(inspection_region, role_files, report)
         self._validate_masks(config, role_files, report)
         return report
 
@@ -88,7 +95,7 @@ class DatasetValidator:
             report.errors.append(ValidationIssue("error", role.value, "Path is not a folder", str(path)))
             return
 
-        all_files = sorted(item for item in path.iterdir() if item.is_file())
+        all_files = sorted((item for item in path.rglob("*") if item.is_file()), key=lambda item: str(item).casefold())
         if not all_files:
             if role is DatasetRole.MASKS:
                 role_files[role] = []
@@ -196,6 +203,36 @@ class DatasetValidator:
             )
 
     @staticmethod
+    def _describe_evaluation_method(
+        role_files: dict[DatasetRole, list[Path]],
+        report: DatasetValidationReport,
+    ) -> None:
+        """Mark independent evidence and warn when a development partition will be created."""
+        has_explicit_ok_evidence = bool(role_files.get(DatasetRole.OK_VALIDATION)) and bool(
+            role_files.get(DatasetRole.OK_TEST)
+        )
+        has_ng_test = bool(role_files.get(DatasetRole.NG_TEST))
+        has_explicit_ng_evidence = not has_ng_test or bool(role_files.get(DatasetRole.NG_VALIDATION))
+        if has_explicit_ok_evidence and has_explicit_ng_evidence:
+            report.stats["evaluation"] = {
+                "method": "independent_explicit",
+                "description": "Production-quality independent validation and final-test folders are configured.",
+            }
+            return
+        report.stats["evaluation"] = {
+            "method": "deterministic_partition",
+            "description": "Development-grade deterministic random partition of configured source folders.",
+        }
+        report.warnings.append(
+            ValidationIssue(
+                "warning",
+                "evaluation",
+                "Development-grade evaluation: deterministic random partitioning will create calibration and/or final-test evidence. "
+                "Configure independent validation and final-test folders for production-quality evaluation.",
+            )
+        )
+
+    @staticmethod
     def _validate_cross_role_duplicates(
         role_files: dict[DatasetRole, list[Path]],
         report: DatasetValidationReport,
@@ -252,6 +289,44 @@ class DatasetValidator:
             report.errors.append(
                 ValidationIssue("error", "dataset", f"Inconsistent source resolutions: {details}")
             )
+
+    @staticmethod
+    def _validate_inspection_region(
+        inspection_region: InspectionRegionConfig | None,
+        role_files: dict[DatasetRole, list[Path]],
+        report: DatasetValidationReport,
+    ) -> None:
+        """Require enabled ROIs to apply exactly to every original training/evaluation image."""
+        if inspection_region is None or not inspection_region.enabled:
+            return
+        try:
+            inspection_region.validate()
+        except ValueError as exc:
+            report.errors.append(ValidationIssue("error", "inspection_region", str(exc)))
+            return
+        source_images = [
+            path
+            for role, paths in role_files.items()
+            if role is not DatasetRole.MASKS
+            for path in paths
+        ]
+        for path in source_images:
+            with Image.open(path) as image:
+                if image.size != (inspection_region.source_width, inspection_region.source_height):
+                    report.errors.append(
+                        ValidationIssue(
+                            "error",
+                            "inspection_region",
+                            (
+                                "Source image resolution does not match the inspection ROI contract: "
+                                f"expected {inspection_region.source_width}x{inspection_region.source_height}, "
+                                f"received {image.width}x{image.height}."
+                            ),
+                            str(path),
+                        )
+                    )
+        for message in inspection_region.warnings():
+            report.warnings.append(ValidationIssue("warning", "inspection_region", message))
 
     def _validate_masks(
         self,

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .dataset_config import DatasetConfig
+from .inspection_region import InspectionRegionConfig
 from .training_config import TrainingConfig
 
 ISO_FORMAT = "%Y-%m-%dT%H:%M:%S.%f%z"
@@ -39,6 +40,7 @@ class ProjectConfig:
     last_training_status: str = "Not trained"
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
+    inspection_region: InspectionRegionConfig = field(default_factory=InspectionRegionConfig)
 
     @property
     def root_path(self) -> Path:
@@ -54,6 +56,7 @@ class ProjectConfig:
         payload = asdict(self)
         payload["dataset"] = self.dataset.to_dict()
         payload["training"] = self.training.to_dict()
+        payload.pop("inspection_region", None)
         return payload
 
     @classmethod
@@ -67,4 +70,5 @@ class ProjectConfig:
             last_training_status=payload.get("last_training_status", "Not trained"),
             dataset=DatasetConfig.from_dict(payload.get("dataset", {})),
             training=TrainingConfig.from_dict(payload.get("training", {})),
+            inspection_region=InspectionRegionConfig.from_dict(payload.get("inspection_region", {})),
         )

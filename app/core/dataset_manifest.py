@@ -38,6 +38,7 @@ class EffectiveSplit:
     final_test_ok: tuple[Path, ...]
     final_test_ng: tuple[Path, ...]
     seed: int
+    evaluation_method: str = "deterministic_partition"
 
     def counts(self) -> dict[str, dict[str, int]]:
         """Return UI-friendly class counts for the effective split."""
@@ -128,6 +129,7 @@ def build_effective_split(config: DatasetConfig, seed: int) -> EffectiveSplit:
         final_test_ok=tuple(final_test_ok),
         final_test_ng=tuple(final_test_ng),
         seed=seed,
+        evaluation_method=_evaluation_method(images),
     )
     validate_effective_split(split)
     return split
@@ -279,6 +281,14 @@ def _split_for_optional_validation(paths: Iterable[Path], seed: int) -> tuple[tu
     if len(values) < 2:
         return tuple(values), ()
     return _split_for_validation(values, seed)
+
+
+def _evaluation_method(images: Mapping[DatasetRole, list[Path]]) -> str:
+    """Classify whether final-test evidence comes from independent configured folders."""
+    has_explicit_ok_evidence = bool(images.get(DatasetRole.OK_VALIDATION)) and bool(images.get(DatasetRole.OK_TEST))
+    has_ng_test = bool(images.get(DatasetRole.NG_TEST))
+    has_explicit_ng_evidence = not has_ng_test or bool(images.get(DatasetRole.NG_VALIDATION))
+    return "independent_explicit" if has_explicit_ok_evidence and has_explicit_ng_evidence else "deterministic_partition"
 
 
 def _stage_images(paths: Iterable[Path], destination: Path) -> dict[Path, Path]:

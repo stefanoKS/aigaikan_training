@@ -1,6 +1,7 @@
 """Typed data models for Anomalib Trainer."""
 
 from .dataset_config import DatasetConfig, DatasetRole, FolderImportMode, ImportedFolder
+from .inspection_region import InspectionRegionConfig
 from .prediction_result import PredictionResult
 from .project_config import ProjectConfig, RecentProject
 from .training_config import DeviceMode, TrainingConfig
@@ -11,6 +12,7 @@ __all__ = [
     "DatasetRole",
     "FolderImportMode",
     "ImportedFolder",
+    "InspectionRegionConfig",
     "PredictionResult",
     "ProjectConfig",
     "RecentProject",

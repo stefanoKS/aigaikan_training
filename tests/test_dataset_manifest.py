@@ -44,6 +44,7 @@ def test_effective_split_is_deterministic_and_disjoint(tmp_path: Path) -> None:
         "validation": {"ok": 1, "ng": 3},
         "final_test": {"ok": 1, "ng": 3},
     }
+    assert first.evaluation_method == "deterministic_partition"
 
 
 def test_effective_split_rejects_cross_split_content_duplicates(tmp_path: Path) -> None:

@@ -9,10 +9,13 @@ import pytest
 from app.core.run_artifacts import (
     read_canonical_checkpoint,
     read_persisted_threshold_metadata,
+    read_verified_inspection_region,
     resolve_canonical_checkpoint,
     write_evaluation_revision,
     write_run_manifest,
 )
+from app.core.inspection_region import inspection_region_hash, write_inspection_region
+from app.models.inspection_region import InspectionRegionConfig
 
 
 class FakeEngine:
@@ -72,3 +75,55 @@ def test_threshold_revision_preserves_the_canonical_model_hash(tmp_path: Path) -
     assert revision["canonical_checkpoint"]["sha256"] == canonical.sha256
     assert revision["threshold_metadata"]["threshold_revision"] == "revision-001"
     assert read_persisted_threshold_metadata(tmp_path)["threshold_revision"] == "revision-001"
+
+
+def test_threshold_metadata_preserves_distinct_raw_and_deployed_thresholds(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "model.ckpt"
+    checkpoint.write_bytes(b"trusted model")
+    canonical = resolve_canonical_checkpoint(FakeEngine(checkpoint))
+    metadata = {
+        "threshold_value": 0.5000000000000001,
+        "threshold_raw": 0.5,
+        "threshold_deployed": 0.5000000000000001,
+        "threshold_method": "normal_only_conformal",
+    }
+
+    write_run_manifest(
+        tmp_path / "run_manifest.json",
+        canonical_checkpoint=canonical,
+        dataset_manifest_sha256="a" * 64,
+        split_counts={"final_test": {"ok": 1, "ng": 0}},
+        threshold=0.5000000000000001,
+        threshold_metadata=metadata,
+    )
+
+    restored = read_persisted_threshold_metadata(tmp_path)
+    assert restored["threshold_raw"] == 0.5
+    assert restored["threshold_deployed"] == restored["threshold_value"]
+
+
+def test_run_roi_sidecar_must_match_its_manifest_hash(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "model.ckpt"
+    checkpoint.write_bytes(b"trusted model")
+    canonical = resolve_canonical_checkpoint(FakeEngine(checkpoint))
+    roi = InspectionRegionConfig()
+    write_inspection_region(tmp_path / "inspection_region.json", roi)
+    write_run_manifest(
+        tmp_path / "run_manifest.json",
+        canonical_checkpoint=canonical,
+        dataset_manifest_sha256="a" * 64,
+        split_counts={"final_test": {"ok": 1, "ng": 0}},
+        threshold=0.5,
+        extra={
+            "inspection_region_hash": inspection_region_hash(roi),
+            "inspection_preprocessing": {
+                "roi_contract_version": roi.roi_contract_version,
+                "metadata_file": "inspection_region.json",
+                "metadata_sha256": inspection_region_hash(roi),
+                "source_size": [0, 0],
+                "rectified_size": [0, 0],
+            }
+        },
+    )
+
+    assert read_verified_inspection_region(tmp_path) == roi

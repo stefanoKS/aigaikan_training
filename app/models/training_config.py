@@ -29,8 +29,8 @@ class TrainingConfig:
     model_name: str = "patchcore"
     device: DeviceMode = DeviceMode.AUTO
     batch_size: int = 8
-    max_epochs: int = 2
-    target_training_steps: int = 3000
+    max_epochs: int = 1
+    target_training_steps: int | None = None
     validation_every_n_epochs: int = 1
     gradient_clip_val: float = 0.0
     accumulate_grad_batches: int = 1
@@ -44,6 +44,9 @@ class TrainingConfig:
     threshold_method: ThresholdMethod = ThresholdMethod.AUTO
     target_normal_false_reject_rate: float = 0.005
     minimum_required_ng_recall: float | None = None
+    maximum_final_test_false_reject_rate: float = 0.005
+    minimum_final_test_ok_images: int = 10
+    minimum_final_test_ng_images: int = 10
 
     def __post_init__(self) -> None:
         """Apply defaults that do not depend on the selected dataset size."""
@@ -51,8 +54,8 @@ class TrainingConfig:
             if self.batch_size > 0:
                 self.batch_size = 8
             self.max_epochs = 1
-        elif self.is_dinomaly and self.max_epochs < 2:
-            self.max_epochs = 2
+        elif self.is_padim:
+            self.max_epochs = 1
 
     def validate(self) -> None:
         """Validate configuration values."""
@@ -62,8 +65,8 @@ class TrainingConfig:
             raise ValueError("Batch size must be positive")
         if self.max_epochs <= 0:
             raise ValueError("Maximum epochs must be positive")
-        if self.target_training_steps < 1000:
-            raise ValueError("Dinomaly target training steps must be at least 1000")
+        if self.target_training_steps is not None and self.target_training_steps <= 0:
+            raise ValueError("Dinomaly training-step override must be positive")
         if self.validation_every_n_epochs <= 0:
             raise ValueError("Validation frequency must be positive")
         if self.gradient_clip_val < 0:
@@ -78,8 +81,12 @@ class TrainingConfig:
             raise ValueError("Dinomaly decoder depth must be greater than one")
         if not 0 <= self.dinomaly_bottleneck_dropout < 1:
             raise ValueError("Dinomaly bottleneck dropout must be between 0 and 1")
+        if not 0 <= self.maximum_final_test_false_reject_rate <= 1:
+            raise ValueError("Maximum final-test false reject rate must be between zero and one")
+        if self.minimum_final_test_ok_images <= 0 or self.minimum_final_test_ng_images <= 0:
+            raise ValueError("Minimum final-test evidence counts must be positive")
         if self.uses_fixed_one_pass and self.max_epochs != 1:
-            raise ValueError("PatchCore uses exactly one epoch to build its memory bank")
+            raise ValueError("PatchCore and PaDiM use exactly one epoch with their Anomalib trainer arguments")
         if self.is_patchcore and self.batch_size != 8:
             raise ValueError("PatchCore uses a batch size of 8")
         if self.is_dinomaly and (
@@ -122,7 +129,7 @@ class TrainingConfig:
     @property
     def uses_fixed_one_pass(self) -> bool:
         """Return whether the selected model builds a memory bank in one pass."""
-        return self.is_patchcore
+        return self.is_patchcore or self.is_padim
 
     @property
     def dinomaly_encoder_name(self) -> str:
@@ -147,6 +154,7 @@ class TrainingConfig:
             return {
                 "backbone": "resnet18",
                 "layers": ["layer1", "layer2", "layer3"],
+                "max_epochs": 1,
                 "preprocessing": "anomalib-native",
             }
         return {
@@ -155,35 +163,48 @@ class TrainingConfig:
             "bottleneck_dropout": 0.2,
             "use_context_recentering": False,
             "training": "step-based",
-            "preprocessing": (
-                "anomalib-native-512px-patch16"
-                if self.is_dinomaly_dinov3
-                else "anomalib-native-448px-crop392-patch14"
-            ),
+            "max_steps": self.target_training_steps if self.target_training_steps is not None else "auto",
+            "preprocessing": "anomalib-native",
         }
+
+    def resolved_dinomaly_training_steps(self, training_image_count: int) -> int:
+        """Return the baseline or explicitly overridden Dinomaly optimizer-step budget."""
+        if not self.is_dinomaly:
+            raise ValueError("Dinomaly training steps are available only for Dinomaly configurations")
+        if self.target_training_steps is not None:
+            return self.target_training_steps
+        steps_per_epoch = max(ceil(max(training_image_count, 1) / self.batch_size), 1)
+        return max(5000, steps_per_epoch)
 
     def recommended_epochs(self, training_image_count: int) -> int:
         """Return the model-specific epoch recommendation for the selected data volume."""
         if self.uses_fixed_one_pass:
             return 1
         steps_per_epoch = max(ceil(max(training_image_count, 1) / self.batch_size), 1)
-        return min(max(ceil(self.target_training_steps / steps_per_epoch), 1), 10000)
+        if self.is_dinomaly:
+            return min(max(ceil(self.resolved_dinomaly_training_steps(training_image_count) / steps_per_epoch), 1), 10000)
+        return self.max_epochs
 
     def estimated_training_steps(self, training_image_count: int) -> int:
         """Return the number of optimizer steps expected from the persisted configuration."""
         steps_per_epoch = max(ceil(max(training_image_count, 1) / self.batch_size), 1)
-        return steps_per_epoch if self.uses_fixed_one_pass else steps_per_epoch * self.max_epochs
+        if self.uses_fixed_one_pass:
+            return steps_per_epoch
+        if self.is_dinomaly:
+            return self.resolved_dinomaly_training_steps(training_image_count)
+        return steps_per_epoch * self.max_epochs
 
     def apply_model_defaults(self, training_image_count: int) -> None:
         """Apply only model-required defaults before persisting a configuration."""
         if self.is_patchcore:
             self.batch_size = 8
             self.max_epochs = 1
+        elif self.is_padim:
+            self.max_epochs = 1
         elif self.is_dinomaly:
             self.dinomaly_decoder_depth = 8
             self.dinomaly_bottleneck_dropout = 0.2
             self.dinomaly_context_recentering = False
-            self.max_epochs = self.recommended_epochs(training_image_count)
 
     @property
     def _normalized_model_name(self) -> str:
@@ -215,8 +236,12 @@ class TrainingConfig:
             model_name=model_name,
             device=DeviceMode(payload.get("device", DeviceMode.AUTO.value)),
             batch_size=int(payload.get("batch_size", 8)),
-            max_epochs=int(payload.get("max_epochs", 2)),
-            target_training_steps=int(payload.get("target_training_steps", 3000)),
+            max_epochs=int(payload.get("max_epochs", 1)),
+            target_training_steps=(
+                int(payload["target_training_steps"])
+                if payload.get("target_training_steps") not in (None, 0, "")
+                else None
+            ),
             validation_every_n_epochs=int(payload.get("validation_every_n_epochs", 1)),
             gradient_clip_val=float(payload.get("gradient_clip_val", 0.0)),
             accumulate_grad_batches=int(payload.get("accumulate_grad_batches", 1)),
@@ -234,4 +259,7 @@ class TrainingConfig:
                 if payload.get("minimum_required_ng_recall") is not None
                 else None
             ),
+            maximum_final_test_false_reject_rate=float(payload.get("maximum_final_test_false_reject_rate", 0.005)),
+            minimum_final_test_ok_images=int(payload.get("minimum_final_test_ok_images", 10)),
+            minimum_final_test_ng_images=int(payload.get("minimum_final_test_ng_images", 10)),
         )

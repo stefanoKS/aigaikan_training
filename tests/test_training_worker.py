@@ -2,7 +2,12 @@
 
 from pathlib import Path
 
-from app.workers.training_worker import TrainingProgressReporter, _peak_gpu_memory_mb, calibration_samples_from_predictions
+from app.workers.training_worker import (
+    TrainingProgressReporter,
+    _peak_gpu_memory_mb,
+    calibration_samples_from_predictions,
+    configure_worker_stdio,
+)
 
 
 class _FakeTrainer:
@@ -51,3 +56,7 @@ def test_calibration_samples_reject_final_test_predictions(tmp_path: Path) -> No
 
 def test_cpu_prediction_does_not_claim_gpu_peak_memory() -> None:
     assert _peak_gpu_memory_mb("cpu") is None
+
+
+def test_worker_stdio_configuration_is_safe_under_pytest_capture() -> None:
+    configure_worker_stdio()

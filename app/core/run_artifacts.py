@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from app.core.dataset_manifest import sha256_file
+from app.core.inspection_region import inspection_region_hash, read_inspection_region
+from app.models.inspection_region import InspectionRegionConfig
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,16 +170,51 @@ def read_canonical_checkpoint(run_directory: Path) -> CanonicalCheckpoint:
     return CanonicalCheckpoint(path=checkpoint_path, sha256=current_hash)
 
 
+def read_verified_inspection_region(run_directory: Path) -> InspectionRegionConfig:
+    """Load the immutable ROI sidecar and verify it is the contract recorded for this run."""
+    manifest = read_run_manifest(run_directory)
+    preprocessing = manifest.get("inspection_preprocessing")
+    if not isinstance(preprocessing, dict):
+        raise ValueError("Run manifest does not contain inspection ROI preprocessing provenance.")
+    if preprocessing.get("metadata_file") != "inspection_region.json":
+        raise ValueError("Run manifest does not reference the required inspection_region.json metadata file.")
+    config = read_inspection_region(run_directory / "inspection_region.json")
+    metadata_hash = str(preprocessing.get("metadata_sha256", ""))
+    if not metadata_hash or inspection_region_hash(config) != metadata_hash:
+        raise ValueError("Inspection ROI metadata hash does not match run_manifest.json.")
+    if str(manifest.get("inspection_region_hash", "")) != metadata_hash:
+        raise ValueError("Run inspection ROI hash does not match inspection preprocessing metadata.")
+    if config.roi_contract_version != preprocessing.get("roi_contract_version"):
+        raise ValueError("Inspection ROI contract version does not match run_manifest.json.")
+    if preprocessing.get("source_size") != [config.source_width, config.source_height]:
+        raise ValueError("Inspection ROI source size does not match run_manifest.json.")
+    if preprocessing.get("rectified_size") != list(config.rectified_size()):
+        raise ValueError("Inspection ROI rectified size does not match run_manifest.json.")
+    return config
+
+
 def _validated_threshold_metadata(metadata: Mapping[str, object], expected_threshold: float) -> dict[str, object]:
     """Validate the exact deployed threshold while preserving all calibration provenance."""
     payload = dict(metadata)
-    try:
-        threshold = float(payload.get("threshold_value"))
-    except (TypeError, ValueError) as exc:
-        raise ValueError("Threshold metadata must contain a finite threshold_value.") from exc
-    if not isfinite(threshold):
-        raise ValueError("Threshold metadata must contain a finite threshold_value.")
-    if isfinite(expected_threshold) and threshold != expected_threshold:
+    threshold = _finite_threshold_value(payload.get("threshold_value"), "threshold_value")
+    raw_threshold = _finite_threshold_value(payload.get("threshold_raw", threshold), "threshold_raw")
+    deployed_threshold = _finite_threshold_value(payload.get("threshold_deployed", threshold), "threshold_deployed")
+    if deployed_threshold != threshold:
+        raise ValueError("Threshold metadata threshold_deployed must match threshold_value.")
+    if isfinite(expected_threshold) and deployed_threshold != expected_threshold:
         raise ValueError("Threshold metadata does not match the persisted decision threshold.")
     payload["threshold_value"] = threshold
+    payload["threshold_raw"] = raw_threshold
+    payload["threshold_deployed"] = deployed_threshold
     return payload
+
+
+def _finite_threshold_value(value: object, name: str) -> float:
+    """Parse one persisted threshold value without accepting nonfinite artifacts."""
+    try:
+        threshold = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Threshold metadata must contain a finite {name}.") from exc
+    if not isfinite(threshold):
+        raise ValueError(f"Threshold metadata must contain a finite {name}.")
+    return threshold

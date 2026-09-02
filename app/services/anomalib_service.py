@@ -9,6 +9,7 @@ import warnings
 
 from app.core.model_registry import ModelDefinition, ModelExecutionMode, ModelRegistry
 from app.models.dataset_config import DatasetConfig, DatasetRole, SUPPORTED_IMAGE_EXTENSIONS
+from app.models.inspection_region import InspectionRegionConfig
 from app.models.training_config import DeviceMode, TrainingConfig
 
 REQUIRED_ANOMALIB_VERSION = "2.6.0"
@@ -39,8 +40,8 @@ class AnomalibService:
         try:
             import anomalib
             from anomalib.data import Folder  # noqa: F401
-            from anomalib.engine import Engine  # noqa: F401
-            import anomalib.models as anomalib_models
+            self._anomalib_engine()
+            anomalib_models = self._anomalib_models()
         except Exception as exc:
             return AnomalibApiInfo(
                 available=False,
@@ -139,6 +140,7 @@ class AnomalibService:
         run_directory: Path | None = None,
         callbacks: list[Any] | None = None,
         calibration_mode: bool = False,
+        inspection_region: InspectionRegionConfig | None = None,
     ) -> dict[str, Any]:
         """Instantiate current Anomalib components from the project configuration."""
         ok_train = self._required_folder(dataset, DatasetRole.OK_TRAIN)
@@ -153,28 +155,29 @@ class AnomalibService:
             raise ValueError(
                 f"{definition.display_name} requires a video dataset and cannot run in an image-folder project."
             )
-        from anomalib.engine import Engine
+        Engine = self._anomalib_engine()
 
         model = self._create_model(definition, config)
         device = self.resolve_device(config.device)
         if device == "gpu":
             self._configure_gpu_precision()
 
-        datamodule = self.create_datamodule(dataset, config, calibration_mode=calibration_mode)
+        datamodule = self.create_datamodule(
+            dataset,
+            config,
+            calibration_mode=calibration_mode,
+            inspection_region=inspection_region,
+        )
         engine_kwargs: dict[str, Any] = {
-            "max_epochs": config.max_epochs,
-            "check_val_every_n_epoch": config.validation_every_n_epochs,
-            "gradient_clip_val": config.gradient_clip_val,
-            "accumulate_grad_batches": config.accumulate_grad_batches,
             "accelerator": device,
             "devices": 1,
             "default_root_dir": str(run_directory or config.resolved_output_dir(ok_train.parent)),
             "enable_progress_bar": False,
-            "enable_model_summary": False,
-            "logger": False,
         }
+        if config.uses_fixed_one_pass:
+            engine_kwargs["max_epochs"] = 1
         if config.is_dinomaly:
-            engine_kwargs["max_steps"] = config.target_training_steps
+            engine_kwargs["max_steps"] = config.resolved_dinomaly_training_steps(training_image_count)
         if callbacks:
             engine_kwargs["callbacks"] = callbacks
         engine = Engine(
@@ -195,6 +198,7 @@ class AnomalibService:
         config: TrainingConfig,
         *,
         calibration_mode: bool,
+        inspection_region: InspectionRegionConfig | None = None,
     ) -> Any:
         """Create an explicit Folder datamodule without Anomalib-side random splitting."""
         from anomalib.data import Folder
@@ -203,6 +207,7 @@ class AnomalibService:
         ng_test = self._optional_folder(dataset, DatasetRole.NG_TEST)
         ok_test = self._optional_folder(dataset, DatasetRole.OK_TEST)
         masks = self._optional_folder(dataset, DatasetRole.MASKS)
+        inspection_transform = self._inspection_transform(inspection_region)
         return Folder(
             name="custom",
             normal_dir=ok_train,
@@ -212,10 +217,20 @@ class AnomalibService:
             train_batch_size=config.batch_size,
             eval_batch_size=config.batch_size,
             num_workers=config.num_workers,
+            augmentations=inspection_transform,
             test_split_mode="from_dir",
             val_split_mode="same_as_test" if calibration_mode else "none",
             seed=config.split_seed,
         )
+
+    @staticmethod
+    def _inspection_transform(inspection_region: InspectionRegionConfig | None) -> Any | None:
+        """Create the one fixed ROI transform shared by every Anomalib dataset stage."""
+        if inspection_region is None or not inspection_region.enabled:
+            return None
+        from app.core.inspection_region import InspectionRegionProcessor
+
+        return InspectionRegionProcessor(inspection_region)
 
     def create_inference_components(self, config: TrainingConfig, output_directory: Path) -> dict[str, Any]:
         """Create a model and engine for prediction from a saved checkpoint."""
@@ -225,7 +240,7 @@ class AnomalibService:
             raise ValueError(
                 f"{definition.display_name} requires a video dataset and cannot run on image files."
             )
-        from anomalib.engine import Engine
+        Engine = self._anomalib_engine()
 
         device = self.resolve_device(config.device)
         if device == "gpu":
@@ -235,8 +250,6 @@ class AnomalibService:
             devices=1,
             default_root_dir=str(output_directory),
             enable_progress_bar=False,
-            enable_model_summary=False,
-            logger=False,
         )
         return {
             "model": self._create_model(definition, config),
@@ -273,8 +286,7 @@ class AnomalibService:
 
     def _create_model(self, definition: ModelDefinition, config: TrainingConfig) -> Any:
         """Instantiate a model with its supported project-level options."""
-        import anomalib.models as anomalib_models
-
+        anomalib_models = self._anomalib_models()
         model_class = getattr(anomalib_models, definition.anomalib_class_name, None)
         if model_class is None:
             raise RuntimeError(
@@ -295,21 +307,43 @@ class AnomalibService:
                 pre_trained=True,
             )
         if definition.key in {"dinomaly_dinov2", "dinomaly_dinov3"}:
-            model_kwargs: dict[str, Any] = {
-                "encoder_name": config.dinomaly_encoder_name,
-                "decoder_depth": 8,
-                "bottleneck_dropout": 0.2,
-                "use_context_recentering": False,
-            }
-            if definition.key == "dinomaly_dinov3":
-                model_kwargs["pre_processor"] = model_class.configure_pre_processor(
-                    image_size=(512, 512),
-                    crop_size=512,
-                )
             return model_class(
-                **model_kwargs,
+                encoder_name=config.dinomaly_encoder_name,
+                decoder_depth=8,
+                bottleneck_dropout=0.2,
+                use_context_recentering=False,
             )
         raise RuntimeError(f"No model factory is registered for {definition.display_name}.")
+
+    @staticmethod
+    def _anomalib_models() -> Any:
+        """Import model classes without surfacing unrelated Dinomaly deprecation notices."""
+        with warnings.catch_warnings():
+            AnomalibService._filter_known_import_warnings()
+            import anomalib.models as anomalib_models
+        return anomalib_models
+
+    @staticmethod
+    def _anomalib_engine() -> Any:
+        """Import the prediction engine without unrelated dependency deprecation notices."""
+        with warnings.catch_warnings():
+            AnomalibService._filter_known_import_warnings()
+            from anomalib.engine import Engine
+        return Engine
+
+    @staticmethod
+    def _filter_known_import_warnings() -> None:
+        """Hide Anomalib 2.6.0 dependency warnings unrelated to the selected model."""
+        warnings.filterwarnings(
+            "ignore",
+            message="Importing from timm.models.layers is deprecated, please import via timm.layers",
+            category=FutureWarning,
+        )
+        warnings.filterwarnings(
+            "ignore",
+            message="The anomalib.models.components.dinov2 package is deprecated.*",
+            category=FutureWarning,
+        )
 
     def _required_folder(self, dataset: DatasetConfig, role: DatasetRole) -> Path:
         path = self._optional_folder(dataset, role)

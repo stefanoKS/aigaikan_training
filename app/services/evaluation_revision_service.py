@@ -8,12 +8,14 @@ from pathlib import Path
 from typing import Any
 
 from app.core.dataset_manifest import build_dataset_manifest, write_dataset_manifest
+from app.core.inspection_region import validate_inspection_region_sources
 from app.core.prediction_adapter import iter_anomalib_predictions
-from app.core.quality_metrics import QualityReport, calculate_quality_metrics
+from app.core.quality_metrics import FinalTestAcceptancePolicy, QualityReport, calculate_quality_metrics
 from app.core.result_parser import ResultParser
 from app.core.run_artifacts import (
     CanonicalCheckpoint,
     read_canonical_checkpoint,
+    read_verified_inspection_region,
     write_evaluation_revision,
 )
 from app.core.threshold_calibrator import CalibrationSample, ThresholdCalibrationConfig, ThresholdCalibrator
@@ -60,7 +62,17 @@ class EvaluationRevisionService:
         run_directory = run_directory.expanduser().resolve()
         canonical_checkpoint = read_canonical_checkpoint(run_directory)
         config = self._load_training_config(run_directory)
+        inspection_region = read_verified_inspection_region(run_directory)
         resolved = self._validate_directories(directories)
+        validate_inspection_region_sources(
+            inspection_region,
+            [
+                *self._images(resolved.calibration_ok),
+                *self._images(resolved.calibration_ng),
+                *self._images(resolved.final_test_ok),
+                *self._images(resolved.final_test_ng),
+            ],
+        )
         revisions_directory = run_directory / "evaluation_revisions"
         revisions_directory.mkdir(parents=True, exist_ok=True)
         components = self.anomalib_service.create_inference_components(config, revisions_directory)
@@ -68,6 +80,7 @@ class EvaluationRevisionService:
             self._dataset_config(resolved.calibration_ok, resolved.calibration_ok, resolved.calibration_ng),
             config,
             calibration_mode=False,
+            inspection_region=inspection_region,
         )
         calibration_output = components["engine"].predict(
             model=components["model"],
@@ -91,6 +104,7 @@ class EvaluationRevisionService:
             self._dataset_config(resolved.calibration_ok, resolved.final_test_ok, resolved.final_test_ng),
             config,
             calibration_mode=False,
+            inspection_region=inspection_region,
         )
         final_predictions = self._final_predictions(
             components["engine"].predict(
@@ -103,7 +117,14 @@ class EvaluationRevisionService:
             abnormal_directory=resolved.final_test_ng,
             threshold=calibration_result.threshold_value,
         )
-        quality_report = calculate_quality_metrics(final_predictions)
+        quality_report = calculate_quality_metrics(
+            final_predictions,
+            FinalTestAcceptancePolicy(
+                maximum_false_reject_rate=config.maximum_final_test_false_reject_rate,
+                minimum_ok_test_images=config.minimum_final_test_ok_images,
+                minimum_ng_test_images=config.minimum_final_test_ng_images,
+            ),
+        )
         final_test_manifest = build_dataset_manifest(
             {
                 "final_test_ok": self._images(resolved.final_test_ok),

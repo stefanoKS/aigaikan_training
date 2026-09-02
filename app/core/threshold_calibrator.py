@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
-from math import ceil, isfinite
+from math import ceil, isfinite, nextafter
 from typing import Iterable
 
 
@@ -60,6 +60,7 @@ class ThresholdCalibrationResult:
     threshold_method: str
     threshold_value: float
     threshold_raw: float
+    threshold_deployed: float
     calibration_sample_count: int
     normal_calibration_sample_count: int
     abnormal_calibration_sample_count: int
@@ -190,6 +191,7 @@ class ThresholdCalibrator:
             threshold_method=method.value,
             threshold_value=threshold,
             threshold_raw=threshold,
+            threshold_deployed=threshold,
             calibration_sample_count=len(normal_scores) + len(abnormal_scores),
             normal_calibration_sample_count=len(normal_scores),
             abnormal_calibration_sample_count=len(abnormal_scores),
@@ -213,22 +215,30 @@ class ThresholdCalibrator:
         ordered_scores = sorted(normal_scores)
         rank = ceil((len(ordered_scores) + 1) * (1 - alpha))
         index = min(max(rank, 1), len(ordered_scores)) - 1
-        threshold = ordered_scores[index]
+        raw_threshold = ordered_scores[index]
+        deployed_threshold = nextafter(raw_threshold, float("inf"))
+        resolution_warning = _calibration_resolution_warning(len(normal_scores), alpha)
         return ThresholdCalibrationResult(
             threshold_method=ThresholdMethod.NORMAL_ONLY_CONFORMAL.value,
-            threshold_value=threshold,
-            threshold_raw=threshold,
+            threshold_value=deployed_threshold,
+            threshold_raw=raw_threshold,
+            threshold_deployed=deployed_threshold,
             calibration_sample_count=len(normal_scores),
             normal_calibration_sample_count=len(normal_scores),
             abnormal_calibration_sample_count=0,
             target_false_reject_rate=alpha,
-            observed_calibration_false_reject_rate=sum(score >= threshold for score in normal_scores) / len(normal_scores),
+            observed_calibration_false_reject_rate=(
+                sum(score >= deployed_threshold for score in normal_scores) / len(normal_scores)
+            ),
             ng_recall=None,
             precision=None,
             f1=None,
             normal_score_quantiles=_score_quantiles(normal_scores),
             normal_score_iqr=_score_iqr(normal_scores),
-            warning="Threshold was estimated from normal calibration images only; defect separation has not been calibrated.",
+            warning=(
+                "Threshold was estimated from normal calibration images only; defect separation has not been calibrated."
+                f" {resolution_warning}"
+            ).strip(),
         )
 
     @staticmethod
@@ -239,6 +249,7 @@ class ThresholdCalibrator:
             threshold_method=ThresholdMethod.NORMAL_ONLY_MAX.value,
             threshold_value=threshold,
             threshold_raw=threshold,
+            threshold_deployed=threshold,
             calibration_sample_count=len(normal_scores),
             normal_calibration_sample_count=len(normal_scores),
             abnormal_calibration_sample_count=0,
@@ -282,3 +293,14 @@ def _quantile(ordered_scores: list[float], fraction: float) -> float:
     """Use a deterministic nearest-rank observed score rather than interpolated values."""
     index = min(max(ceil(len(ordered_scores) * fraction), 1), len(ordered_scores)) - 1
     return ordered_scores[index]
+
+
+def _calibration_resolution_warning(sample_count: int, alpha: float) -> str:
+    """Describe when finite calibration data cannot resolve the requested false-reject target."""
+    minimum_sample_count = ceil(1 / alpha)
+    if sample_count >= minimum_sample_count:
+        return ""
+    return (
+        f"The {alpha:.6g} false-reject target cannot be resolved with {sample_count} normal calibration images; "
+        f"at least {minimum_sample_count} are needed to observe one false reject at that rate."
+    )

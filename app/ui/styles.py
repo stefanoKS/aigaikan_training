@@ -122,6 +122,30 @@ QLabel#MaskFormat {
     color: #ffdc9a;
     padding: 7px 9px;
 }
+QDialog, QMessageBox, QMenu {
+    background: #151b1e;
+    border: 1px solid #38565a;
+    color: #e7eff0;
+}
+QDialog QLabel, QMessageBox QLabel, QMenu::item {
+    background: transparent;
+    color: #e7eff0;
+}
+QDialogButtonBox {
+    background: #151b1e;
+}
+QFileDialog QListView, QFileDialog QTreeView, QFileDialog QSidebar {
+    background: #101518;
+    border: 1px solid #38565a;
+    color: #e7eff0;
+    selection-background-color: #153438;
+    selection-color: #dcfffb;
+}
+QToolTip {
+    background: #151b1e;
+    border: 1px solid #38565a;
+    color: #e7eff0;
+}
 QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QTextEdit, QPlainTextEdit {
     background: #101518;
     border: 1px solid #38565a;

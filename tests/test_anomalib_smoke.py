@@ -70,16 +70,12 @@ def test_stock_model_train_export_reload_score_and_decision_parity(model_id: str
     )
     assert type(components["model"]).__name__ in {"Patchcore", "Padim", "Dinomaly"}
     if config.is_dinomaly:
-        assert config.max_epochs > 1
+        assert config.resolved_dinomaly_training_steps(training_image_count=4) == 5000
         engine = Engine(
             accelerator="cpu",
             devices=1,
-            max_epochs=2,
             max_steps=1,
             default_root_dir=tmp_path / "smoke",
-            enable_progress_bar=False,
-            enable_model_summary=False,
-            logger=False,
         )
     else:
         engine = components["engine"]

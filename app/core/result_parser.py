@@ -135,6 +135,10 @@ class ResultParser:
             dataset_manifest_sha256=str(payload.get("dataset_manifest_sha256", "")),
             calibration_manifest_sha256=str(payload.get("calibration_manifest_sha256", "")),
             final_test_manifest_sha256=str(payload.get("final_test_manifest_sha256", "")),
+            inspection_region_hash=str(payload.get("inspection_region_hash", "")),
+            roi_contract_version=int(payload.get("roi_contract_version", 0)),
+            rectified_roi_width=int(payload.get("rectified_roi_width", 0)),
+            rectified_roi_height=int(payload.get("rectified_roi_height", 0)),
             evaluation_revision_id=str(payload.get("evaluation_revision_id", "")),
             model_variant=str(payload.get("model_variant", "")),
             encoder_family=str(payload.get("encoder_family", "")),
@@ -148,7 +152,10 @@ class ResultParser:
             peak_gpu_memory_mb=_optional_float(payload.get("peak_gpu_memory_mb")),
             quality_status=str(payload.get("quality_status", "")),
             export_status=str(payload.get("export_status", "Not exported")),
-            aigaikan_compatibility_status=str(payload.get("aigaikan_compatibility_status", "Not validated")),
+            anomalib_export_parity_status=str(payload.get("anomalib_export_parity_status", "Not validated")),
+            aigaikan_compatibility_status=str(
+                payload.get("aigaikan_compatibility_status", "Pending AIGAIKAN runtime validation")
+            ),
             metrics=metrics if isinstance(metrics, dict) else {},
             predictions=predictions,
         )

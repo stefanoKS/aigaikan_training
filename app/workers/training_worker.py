@@ -13,10 +13,12 @@ from typing import Any, Callable
 
 from app.core.environment_info import collect_environment_info
 from app.core.dataset_manifest import build_dataset_manifest, build_effective_split, stage_effective_split, write_dataset_manifest
+from app.core.dataset_validator import DatasetValidator
+from app.core.inspection_region import inspection_region_hash, validate_inspection_region_sources, write_inspection_region
 from app.core.model_registry import ModelExecutionMode
 from app.core.prediction_adapter import iter_anomalib_predictions
 from app.core.project_manager import ProjectManager
-from app.core.quality_metrics import calculate_quality_metrics
+from app.core.quality_metrics import FinalTestAcceptancePolicy, calculate_quality_metrics
 from app.core.result_parser import ResultParser
 from app.core.run_artifacts import resolve_canonical_checkpoint, write_evaluation_revision, write_run_manifest
 from app.core.threshold_calibrator import CalibrationSample, ThresholdCalibrationConfig, ThresholdCalibrator
@@ -37,6 +39,14 @@ STAGES = [
     "Generating visualizations",
     "Saving results",
 ]
+
+
+def configure_worker_stdio() -> None:
+    """Use UTF-8 JSON Lines streams when the Windows locale is not Unicode-safe."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8", errors="backslashreplace")
 
 
 class TrainingProgressReporter:
@@ -222,6 +232,7 @@ def _peak_gpu_memory_mb(device: str) -> float | None:
 
 def run(project_file: Path) -> int:
     """Run training for the given project."""
+    configure_worker_stdio()
     manager = ProjectManager(project_file.parent.parent)
     project = manager.load_project(project_file)
     service = AnomalibService()
@@ -236,6 +247,12 @@ def run(project_file: Path) -> int:
         )
         return 1
 
+    validation_report = DatasetValidator().validate(project.dataset, project.inspection_region)
+    if not validation_report.is_valid:
+        summary = "; ".join(issue.message for issue in validation_report.errors[:3])
+        emit({"type": "error", "message": "Dataset validation failed", "details": summary})
+        return 1
+
     run_dir = manager.create_run_directory(project, project.training.model_name)
     emit({"type": "stage", "name": STAGES[0]})
     emit({"type": "progress", "current": 1, "total": len(STAGES)})
@@ -247,6 +264,13 @@ def run(project_file: Path) -> int:
 
     try:
         effective_split = build_effective_split(project.dataset, project.training.split_seed)
+        validate_inspection_region_sources(
+            project.inspection_region,
+            (path for paths in effective_split.roles().values() for path in paths),
+        )
+        roi_hash = inspection_region_hash(project.inspection_region)
+        rectified_width, rectified_height = project.inspection_region.rectified_size()
+        write_inspection_region(run_dir / "inspection_region.json", project.inspection_region)
         project.training.apply_model_defaults(len(effective_split.training_ok))
         manifest = build_dataset_manifest(effective_split.roles(), Path(project.project_path))
         write_dataset_manifest(run_dir / "dataset_manifest.json", manifest)
@@ -286,6 +310,7 @@ def run(project_file: Path) -> int:
             run_directory=run_dir,
             callbacks=[progress_callback],
             calibration_mode=True,
+            inspection_region=project.inspection_region,
         )
         device_note = str(components["device_note"])
         if device_note:
@@ -361,6 +386,7 @@ def run(project_file: Path) -> int:
             staged_dataset.final_test_config,
             project.training,
             calibration_mode=False,
+            inspection_region=project.inspection_region,
         )
         _reset_gpu_peak_memory(str(components["device"]))
         emit({"type": "stage", "name": STAGES[6]})
@@ -390,7 +416,14 @@ def run(project_file: Path) -> int:
             "Model Size (bytes)": canonical_checkpoint.path.stat().st_size,
         }
         result_parser.export_predictions_csv(run_dir / "predictions.csv", predictions)
-        quality_report = calculate_quality_metrics(predictions)
+        quality_report = calculate_quality_metrics(
+            predictions,
+            FinalTestAcceptancePolicy(
+                maximum_false_reject_rate=project.training.maximum_final_test_false_reject_rate,
+                minimum_ok_test_images=project.training.minimum_final_test_ok_images,
+                minimum_ng_test_images=project.training.minimum_final_test_ng_images,
+            ),
+        )
         run_metrics.update(quality_report.metrics)
         run_metrics["Quality Status"] = quality_report.status
         run_metrics["Threshold Method"] = calibration_result.threshold_method
@@ -423,6 +456,8 @@ def run(project_file: Path) -> int:
         )
         threshold_metadata["threshold_revision"] = revision_path.stem
         run_metrics["Threshold Revision"] = revision_path.stem
+        run_metrics["Inspection Region SHA-256"] = roi_hash
+        run_metrics["Inspection ROI Rectified Size"] = f"{rectified_width}x{rectified_height}"
         result_parser.write_training_run(
             run_dir / "results.json",
             TrainingRun(
@@ -438,6 +473,10 @@ def run(project_file: Path) -> int:
                 dataset_manifest_sha256=str(manifest["manifest_sha256"]),
                 calibration_manifest_sha256=str(calibration_manifest["manifest_sha256"]),
                 final_test_manifest_sha256=str(final_test_manifest["manifest_sha256"]),
+                inspection_region_hash=roi_hash,
+                roi_contract_version=project.inspection_region.roi_contract_version,
+                rectified_roi_width=rectified_width,
+                rectified_roi_height=rectified_height,
                 evaluation_revision_id=revision_path.stem,
                 model_variant=definition.model_variant or definition.key,
                 encoder_family=definition.encoder_family,
@@ -464,7 +503,20 @@ def run(project_file: Path) -> int:
                 "final_test_manifest_path": str(run_dir / "final_test_manifest.json"),
                 "evaluation_revision_path": str(revision_path),
                 "predictions_path": str(run_dir / "predictions.csv"),
+                "inspection_region_hash": roi_hash,
+                "roi_contract_version": project.inspection_region.roi_contract_version,
+                "rectified_roi_size": {"width": rectified_width, "height": rectified_height},
+                "inspection_preprocessing": {
+                    "roi_contract_version": project.inspection_region.roi_contract_version,
+                    "enabled": project.inspection_region.enabled,
+                    "type": project.inspection_region.region_type,
+                    "metadata_file": "inspection_region.json",
+                    "metadata_sha256": roi_hash,
+                    "source_size": [project.inspection_region.source_width, project.inspection_region.source_height],
+                    "rectified_size": [rectified_width, rectified_height],
+                },
                 "quality_status": quality_report.status,
+                "evaluation_method": effective_split.evaluation_method,
             },
         )
         emit({"type": "stage", "name": STAGES[7]})

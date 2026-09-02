@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 import json
@@ -14,12 +14,19 @@ from typing import Any, Iterable
 
 from app.core.dataset_manifest import sha256_file
 from app.core.result_parser import ResultParser
-from app.core.run_artifacts import read_canonical_checkpoint, read_persisted_threshold_metadata
+from app.core.inspection_region import InspectionRegionProcessor, inspection_region_hash
+from app.core.run_artifacts import read_canonical_checkpoint, read_persisted_threshold_metadata, read_verified_inspection_region
 from app.models.prediction_result import PredictionResult
 from app.models.training_config import TrainingConfig
 from app.services.anomalib_service import AnomalibService, REQUIRED_ANOMALIB_VERSION
 
-DEFAULT_SCORE_TOLERANCE = 1e-4
+DEPLOYMENT_CONTRACT_VERSION = 1
+FORMAT_SCORE_TOLERANCES: dict[str, float] = {
+    "torch": 1e-4,
+    "onnx": 1e-3,
+    "openvino": 1e-3,
+}
+DEFAULT_SCORE_TOLERANCE = FORMAT_SCORE_TOLERANCES["torch"]
 
 
 class ModelExportFormat(StrEnum):
@@ -57,13 +64,19 @@ class ExportService:
         self,
         anomalib_service: AnomalibService | None = None,
         deployment_validator: Callable[[Path, str, list[PredictionResult], float, float], dict[str, object]] | None = None,
-        score_tolerance: float = DEFAULT_SCORE_TOLERANCE,
+        score_tolerances: Mapping[str, float] | None = None,
     ) -> None:
-        if not isfinite(score_tolerance) or score_tolerance < 0:
-            raise ValueError("Export score tolerance must be a finite non-negative value.")
         self.anomalib_service = anomalib_service or AnomalibService()
+        self._has_custom_deployment_validator = deployment_validator is not None
         self._deployment_validator = deployment_validator or self._validate_deployment
-        self.score_tolerance = score_tolerance
+        self.score_tolerances = dict(FORMAT_SCORE_TOLERANCES)
+        if score_tolerances is not None:
+            unknown_formats = set(score_tolerances).difference(self.score_tolerances)
+            if unknown_formats:
+                raise ValueError(f"Unknown export score tolerance formats: {', '.join(sorted(unknown_formats))}")
+            self.score_tolerances.update(score_tolerances)
+        if any(not isfinite(tolerance) or tolerance < 0 for tolerance in self.score_tolerances.values()):
+            raise ValueError("Export score tolerances must be finite non-negative values.")
 
     def export_model(
         self,
@@ -80,6 +93,8 @@ class ExportService:
         config = self._load_training_config(run_directory)
         checkpoint_path = read_canonical_checkpoint(run_directory).path
         threshold_metadata = read_persisted_threshold_metadata(run_directory)
+        inspection_region = read_verified_inspection_region(run_directory)
+        inspection_processor = InspectionRegionProcessor(inspection_region)
         decision_threshold = float(threshold_metadata["threshold_value"])
         final_test_predictions = self._load_final_test_predictions(run_directory)
         export_directory = export_directory.expanduser().resolve()
@@ -103,12 +118,23 @@ class ExportService:
                 if exported_path is None:
                     raise RuntimeError("Anomalib did not return an exported model path.")
                 result = self.verify_export(Path(exported_path), export_format.value)
-                validation = self._deployment_validator(
-                    result.exported_path,
-                    result.export_format,
-                    final_test_predictions,
-                    decision_threshold,
-                    self.score_tolerance,
+                validation = (
+                    self._validate_deployment(
+                        result.exported_path,
+                        result.export_format,
+                        final_test_predictions,
+                        decision_threshold,
+                        self.score_tolerances[result.export_format],
+                        inspection_processor,
+                    )
+                    if not self._has_custom_deployment_validator
+                    else self._deployment_validator(
+                        result.exported_path,
+                        result.export_format,
+                        final_test_predictions,
+                        decision_threshold,
+                        self.score_tolerances[result.export_format],
+                    )
                 )
                 result.validation = validation
                 result.validation_report = self._write_validation_report(
@@ -129,6 +155,15 @@ class ExportService:
             failures=failures,
             included_artifacts=included_artifacts,
             threshold_metadata=threshold_metadata,
+            score_tolerances=self.score_tolerances,
+            inspection_preprocessing={
+                "roi_contract_version": inspection_region.roi_contract_version,
+                "type": inspection_region.region_type,
+                "metadata_file": "inspection_region.json",
+                "metadata_sha256": inspection_region_hash(inspection_region),
+                "source_size": [inspection_region.source_width, inspection_region.source_height],
+                "rectified_size": list(inspection_region.rectified_size()),
+            },
         )
         return ModelExportReport(exported=exported, failures=failures, package_directory=package_directory)
 
@@ -147,6 +182,7 @@ class ExportService:
             "run_manifest.json",
             "results.json",
             "predictions.csv",
+            "inspection_region.json",
         )
         optional_names = ("calibration_manifest.json", "final_test_manifest.json")
         copied: dict[str, str] = {}
@@ -172,9 +208,12 @@ class ExportService:
         failures: dict[str, str],
         included_artifacts: dict[str, str],
         threshold_metadata: dict[str, object],
+        score_tolerances: Mapping[str, float],
+        inspection_preprocessing: Mapping[str, object],
     ) -> Path:
         """Record deployment package provenance and every verified file digest."""
         payload = {
+            "deployment_contract_version": DEPLOYMENT_CONTRACT_VERSION,
             "anomalib_version": REQUIRED_ANOMALIB_VERSION,
             "model": {
                 "id": config.model_name,
@@ -184,6 +223,8 @@ class ExportService:
             "canonical_checkpoint_sha256": sha256_file(canonical_checkpoint_path),
             "final_test_prediction_count": len(final_test_predictions),
             "threshold_metadata": threshold_metadata,
+            "inspection_preprocessing": dict(inspection_preprocessing),
+            "format_score_tolerances": dict(score_tolerances),
             "included_run_artifacts": included_artifacts,
             "exports": [
                 {
@@ -226,6 +267,7 @@ class ExportService:
         report_path.write_text(
             json.dumps(
                 {
+                    "deployment_contract_version": DEPLOYMENT_CONTRACT_VERSION,
                     "artifact": str(result.exported_path),
                     "artifact_sha256": result.sha256,
                     "format": result.export_format,
@@ -246,6 +288,7 @@ class ExportService:
         expected_predictions: list[PredictionResult],
         threshold: float,
         score_tolerance: float = DEFAULT_SCORE_TOLERANCE,
+        inspection_processor: InspectionRegionProcessor | None = None,
     ) -> dict[str, object]:
         """Reload an export and require numerical and threshold-decision final-test parity."""
         if export_format == ModelExportFormat.TORCH.value:
@@ -262,7 +305,10 @@ class ExportService:
         score_mismatches: list[str] = []
         score_deltas: list[float] = []
         for expected in expected_predictions:
-            score = ExportService._deployment_score(inferencer.predict(expected.source_path))
+            deployment_input: str | Any = expected.source_path
+            if inspection_processor is not None:
+                deployment_input = inspection_processor.apply_path(Path(expected.source_path))
+            score = ExportService._deployment_score(inferencer.predict(deployment_input))
             expected_score = float(expected.anomaly_score)
             if not isfinite(expected_score):
                 raise ValueError(f"Persisted checkpoint score must be finite: {expected.source_path}")

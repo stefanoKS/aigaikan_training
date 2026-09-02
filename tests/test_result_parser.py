@@ -8,7 +8,7 @@ from app.core.result_parser import ResultParser
 from app.core.run_artifacts import CanonicalCheckpoint, read_canonical_checkpoint, read_persisted_threshold, write_run_manifest
 from app.models.prediction_result import PredictionResult
 from app.models.training_run import TrainingRun
-from app.workers.inference_worker import _count_images
+from app.workers.inference_worker import _count_images, configure_worker_stdio
 
 
 def test_parse_worker_json_messages() -> None:
@@ -56,6 +56,8 @@ def test_write_and_read_training_run(tmp_path: Path) -> None:
             run_date="2026-08-12T03:47:12+00:00",
             training_duration_seconds=12.5,
             evaluation_duration_seconds=3.25,
+            anomalib_export_parity_status="Validated with Anomalib deployment inferencer: TORCH",
+            aigaikan_compatibility_status="Pending AIGAIKAN runtime validation",
             metrics={"Image AUROC": 1.0, "Image F1": 0.98},
         ),
     )
@@ -64,6 +66,8 @@ def test_write_and_read_training_run(tmp_path: Path) -> None:
 
     assert restored.model_name == "PaDiM"
     assert restored.metrics == {"Image AUROC": 1.0, "Image F1": 0.98}
+    assert restored.anomalib_export_parity_status == "Validated with Anomalib deployment inferencer: TORCH"
+    assert restored.aigaikan_compatibility_status == "Pending AIGAIKAN runtime validation"
 
 
 def test_inference_worker_uses_manifest_checkpoint_and_counts_images(tmp_path: Path) -> None:
@@ -73,6 +77,8 @@ def test_inference_worker_uses_manifest_checkpoint_and_counts_images(tmp_path: P
     (tmp_path / "images").mkdir()
     (tmp_path / "images" / "one.png").touch()
     (tmp_path / "images" / "ignored.txt").touch()
+    (tmp_path / "images" / "nested").mkdir()
+    (tmp_path / "images" / "nested" / "two.jpg").touch()
     write_run_manifest(
         tmp_path / "run_manifest.json",
         canonical_checkpoint=CanonicalCheckpoint(checkpoint.resolve(), ""),
@@ -92,5 +98,9 @@ def test_inference_worker_uses_manifest_checkpoint_and_counts_images(tmp_path: P
     )
     assert read_canonical_checkpoint(tmp_path) == canonical
     assert read_persisted_threshold(tmp_path) == 128.47
-    assert _count_images(tmp_path / "images") == 1
+    assert _count_images(tmp_path / "images") == 2
+
+
+def test_inference_worker_stdio_configuration_is_safe_under_pytest_capture() -> None:
+    configure_worker_stdio()
 

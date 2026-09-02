@@ -67,22 +67,24 @@ class ResultsPage(QWidget):
         export_directory_row.addWidget(self.export_directory_edit, stretch=1)
         export_directory_row.addWidget(self.browse_export_directory_button)
         self.export_format_checks: dict[ModelExportFormat, QCheckBox] = {}
-        export_format_row = QHBoxLayout()
+        torch_checkbox = QCheckBox("Torch (.pt)")
+        torch_checkbox.setChecked(True)
+        self.export_format_checks[ModelExportFormat.TORCH] = torch_checkbox
+        advanced_format_row = QHBoxLayout()
         for export_format, label in (
             (ModelExportFormat.OPENVINO, "OpenVINO IR (.xml + .bin)"),
             (ModelExportFormat.ONNX, "ONNX (.onnx)"),
-            (ModelExportFormat.TORCH, "Torch (.pt)"),
         ):
             checkbox = QCheckBox(label)
-            checkbox.setChecked(export_format is ModelExportFormat.OPENVINO)
             self.export_format_checks[export_format] = checkbox
-            export_format_row.addWidget(checkbox)
-        export_format_row.addStretch(1)
-        self.export_model_button = QPushButton("Export Selected Formats")
+            advanced_format_row.addWidget(checkbox)
+        advanced_format_row.addStretch(1)
+        self.export_model_button = QPushButton("Export for AIGAIKAN")
         self.export_model_button.setObjectName("PrimaryButton")
         self.export_model_button.setEnabled(False)
         export_form.addRow("Destination", export_directory_row)
-        export_form.addRow("Formats", export_format_row)
+        export_form.addRow("Export for AIGAIKAN", torch_checkbox)
+        export_form.addRow("Advanced Formats", advanced_format_row)
         export_form.addRow("", self.export_model_button)
         root.addWidget(export_group)
 
@@ -124,6 +126,7 @@ class ResultsPage(QWidget):
             "Calibration False Reject Observed",
             "Canonical Checkpoint",
             "Export Status",
+            "Anomalib Export Parity",
             "AIGAIKAN Compatibility",
         ):
             label = QLabel("Not available")
@@ -191,6 +194,7 @@ class ResultsPage(QWidget):
             "Quality Status": run.quality_status or "Not available",
             "Canonical Checkpoint": Path(run.final_checkpoint_path).name if run.final_checkpoint_path else "Not available",
             "Export Status": run.export_status,
+            "Anomalib Export Parity": run.anomalib_export_parity_status,
             "AIGAIKAN Compatibility": run.aigaikan_compatibility_status,
             "Defect Detection Evidence": run.metrics.get("Defect Detection Evidence", "Measured"),
             "Threshold Method": str(

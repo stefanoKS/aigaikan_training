@@ -10,6 +10,7 @@ import pytest
 
 from app.core.model_registry import ModelRegistry
 from app.models.dataset_config import DatasetConfig, DatasetRole
+from app.models.inspection_region import InspectionRegionConfig
 from app.models.training_config import DeviceMode, TrainingConfig
 from app.services.anomalib_service import AnomalibService
 
@@ -118,8 +119,14 @@ def test_padim_uses_the_fixed_stock_profile(tmp_path: Path, monkeypatch) -> None
     assert isinstance(components["model"], FakePadim)
     assert components["engine"].kwargs["default_root_dir"] == str(tmp_path / "run")
     assert components["engine"].kwargs["callbacks"] == ["progress-callback"]
-    assert components["engine"].kwargs["max_epochs"] == 2
-    assert components["engine"].kwargs["check_val_every_n_epoch"] == 1
+    assert components["engine"].kwargs == {
+        "accelerator": "cpu",
+        "devices": 1,
+        "default_root_dir": str(tmp_path / "run"),
+        "enable_progress_bar": False,
+        "max_epochs": 1,
+        "callbacks": ["progress-callback"],
+    }
     assert components["model"].kwargs == {
         "backbone": "resnet18",
         "layers": ["layer1", "layer2", "layer3"],
@@ -140,10 +147,6 @@ def test_patchcore_uses_fixed_profile_and_native_preprocessing(tmp_path: Path, m
     class FakePatchcore:
         def __init__(self, **kwargs) -> None:
             self.kwargs = kwargs
-
-        @staticmethod
-        def configure_pre_processor(**kwargs) -> dict[str, object]:
-            return kwargs
 
     anomalib_data = ModuleType("anomalib.data")
     anomalib_engine = ModuleType("anomalib.engine")
@@ -205,15 +208,88 @@ def test_dinomaly_variants_use_stock_class_and_explicit_encoder(
     )
 
     assert isinstance(model, FakeDinomaly)
-    expected_kwargs: dict[str, object] = {
+    assert model.kwargs == {
         "encoder_name": encoder_name,
         "decoder_depth": 8,
         "bottleneck_dropout": 0.2,
         "use_context_recentering": False,
     }
-    if model_name == "dinomaly_dinov3":
-        expected_kwargs["pre_processor"] = {"image_size": (512, 512), "crop_size": 512}
-    assert model.kwargs == expected_kwargs
+
+
+def test_dinomaly_preserves_native_trainer_arguments_except_max_steps(tmp_path: Path, monkeypatch) -> None:
+    class FakeFolder:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+    class FakeEngine:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+    class FakeDinomaly:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+    anomalib_data = ModuleType("anomalib.data")
+    anomalib_engine = ModuleType("anomalib.engine")
+    anomalib_models = ModuleType("anomalib.models")
+    anomalib_data.Folder = FakeFolder
+    anomalib_engine.Engine = FakeEngine
+    anomalib_models.Dinomaly = FakeDinomaly
+    monkeypatch.setitem(sys.modules, "anomalib.data", anomalib_data)
+    monkeypatch.setitem(sys.modules, "anomalib.engine", anomalib_engine)
+    monkeypatch.setitem(sys.modules, "anomalib.models", anomalib_models)
+
+    ok_folder = tmp_path / "ok"
+    ok_folder.mkdir()
+    for index in range(9):
+        (ok_folder / f"ok_{index}.png").write_bytes(b"image")
+    dataset = DatasetConfig()
+    dataset.folders[DatasetRole.OK_TRAIN].path = str(ok_folder)
+
+    components = AnomalibService().create_components(
+        dataset,
+        TrainingConfig(model_name="dinomaly_dinov2", device=DeviceMode.CPU),
+        run_directory=tmp_path / "run",
+        callbacks=["progress-callback"],
+    )
+
+    assert components["engine"].kwargs == {
+        "accelerator": "cpu",
+        "devices": 1,
+        "default_root_dir": str(tmp_path / "run"),
+        "enable_progress_bar": False,
+        "max_steps": 5000,
+        "callbacks": ["progress-callback"],
+    }
+
+
+def test_inference_components_disable_console_progress(tmp_path: Path, monkeypatch) -> None:
+    class FakeEngine:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+    class FakePatchcore:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+    anomalib_engine = ModuleType("anomalib.engine")
+    anomalib_models = ModuleType("anomalib.models")
+    anomalib_engine.Engine = FakeEngine
+    anomalib_models.Patchcore = FakePatchcore
+    monkeypatch.setitem(sys.modules, "anomalib.engine", anomalib_engine)
+    monkeypatch.setitem(sys.modules, "anomalib.models", anomalib_models)
+
+    components = AnomalibService().create_inference_components(
+        TrainingConfig(model_name="patchcore", device=DeviceMode.CPU),
+        tmp_path / "inference",
+    )
+
+    assert components["engine"].kwargs == {
+        "accelerator": "cpu",
+        "devices": 1,
+        "default_root_dir": str(tmp_path / "inference"),
+        "enable_progress_bar": False,
+    }
 
 
 def test_calibration_datamodule_never_splits_the_final_test_subset(tmp_path: Path, monkeypatch) -> None:
@@ -240,6 +316,37 @@ def test_calibration_datamodule_never_splits_the_final_test_subset(tmp_path: Pat
 
     assert datamodule.kwargs["test_split_mode"] == "from_dir"
     assert datamodule.kwargs["val_split_mode"] == "same_as_test"
+
+
+def test_enabled_inspection_roi_is_applied_to_every_datamodule_stage(tmp_path: Path, monkeypatch) -> None:
+    class FakeFolder:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+    anomalib_data = ModuleType("anomalib.data")
+    anomalib_data.Folder = FakeFolder
+    monkeypatch.setitem(sys.modules, "anomalib.data", anomalib_data)
+    for folder_name in ("ok_train", "ok_test"):
+        (tmp_path / folder_name).mkdir()
+    dataset = DatasetConfig()
+    dataset.folders[DatasetRole.OK_TRAIN].path = str(tmp_path / "ok_train")
+    dataset.folders[DatasetRole.OK_TEST].path = str(tmp_path / "ok_test")
+    roi = InspectionRegionConfig(
+        enabled=True,
+        source_width=64,
+        source_height=64,
+        points_px=((4, 4), (59, 4), (59, 59), (4, 59)),
+    )
+
+    datamodule = AnomalibService().create_datamodule(
+        dataset,
+        TrainingConfig(device=DeviceMode.CPU),
+        calibration_mode=True,
+        inspection_region=roi,
+    )
+
+    transform = datamodule.kwargs["augmentations"]
+    assert transform.config == roi
 
 
 def test_retired_models_are_rejected_before_training() -> None:

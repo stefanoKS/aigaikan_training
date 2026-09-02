@@ -66,7 +66,7 @@ class ConfigPage(QWidget):
         trainer_form = QFormLayout(self.trainer_group)
         self.max_epochs_spin = QSpinBox()
         self.max_epochs_spin.setRange(1, 10000)
-        self.max_epochs_spin.setValue(2)
+        self.max_epochs_spin.setValue(1)
         self.estimated_steps_label = QLabel("-")
         self.estimated_steps_label.setObjectName("EstimatedSteps")
         self.validation_every_n_epochs_spin = QSpinBox()
@@ -92,10 +92,11 @@ class ConfigPage(QWidget):
         self.dinomaly_group = QGroupBox("Dinomaly Training")
         dinomaly_form = QFormLayout(self.dinomaly_group)
         self.target_training_steps_spin = QSpinBox()
-        self.target_training_steps_spin.setRange(1000, 1000000)
+        self.target_training_steps_spin.setRange(0, 1000000)
         self.target_training_steps_spin.setSingleStep(500)
-        self.target_training_steps_spin.setValue(3000)
-        dinomaly_form.addRow("Target Training Steps", self.target_training_steps_spin)
+        self.target_training_steps_spin.setSpecialValueText("Automatic baseline")
+        self.target_training_steps_spin.setValue(0)
+        dinomaly_form.addRow("Training Steps Override", self.target_training_steps_spin)
         root.addWidget(self.dinomaly_group)
 
         self.threshold_group = QGroupBox("Decision Threshold Calibration")
@@ -134,6 +135,24 @@ class ConfigPage(QWidget):
         threshold_form.addRow("Required NG Recall", self.minimum_ng_recall_spin)
         threshold_form.addRow(self.normal_only_calibration_note)
         root.addWidget(self.threshold_group)
+
+        self.acceptance_group = QGroupBox("Final-Test Acceptance Policy")
+        acceptance_form = QFormLayout(self.acceptance_group)
+        self.maximum_final_test_false_reject_spin = QDoubleSpinBox()
+        self.maximum_final_test_false_reject_spin.setRange(0.0, 100.0)
+        self.maximum_final_test_false_reject_spin.setDecimals(3)
+        self.maximum_final_test_false_reject_spin.setSuffix("%")
+        self.maximum_final_test_false_reject_spin.setValue(0.5)
+        self.minimum_final_test_ok_images_spin = QSpinBox()
+        self.minimum_final_test_ok_images_spin.setRange(1, 1000000)
+        self.minimum_final_test_ok_images_spin.setValue(10)
+        self.minimum_final_test_ng_images_spin = QSpinBox()
+        self.minimum_final_test_ng_images_spin.setRange(1, 1000000)
+        self.minimum_final_test_ng_images_spin.setValue(10)
+        acceptance_form.addRow("Maximum False Reject Rate", self.maximum_final_test_false_reject_spin)
+        acceptance_form.addRow("Minimum OK Test Images", self.minimum_final_test_ok_images_spin)
+        acceptance_form.addRow("Minimum NG Test Images", self.minimum_final_test_ng_images_spin)
+        root.addWidget(self.acceptance_group)
 
         button_row = QHBoxLayout()
         self.save_button = QPushButton("Save Configuration")
@@ -199,11 +218,14 @@ class ConfigPage(QWidget):
         is_training_model = self._model_definitions[model_key].execution_mode is ModelExecutionMode.TRAIN
         self.trainer_group.setEnabled(is_training_model)
         self.trainer_group.setTitle("Trainer Settings" if is_training_model else "Trainer Settings (Not used for zero-shot evaluation)")
-        uses_fixed_one_pass = model_key == "patchcore"
+        uses_fixed_one_pass = model_key in {"patchcore", "padim"}
         self.max_epochs_spin.setValue(1 if uses_fixed_one_pass else self.max_epochs_spin.value())
-        if is_dinomaly and self.max_epochs_spin.value() < 2:
-            self.max_epochs_spin.setValue(2)
-        self.max_epochs_spin.setEnabled(not uses_fixed_one_pass and is_training_model)
+        self.max_epochs_spin.setEnabled(not uses_fixed_one_pass and not is_dinomaly and is_training_model)
+        self.max_epochs_spin.setToolTip(
+            "Dinomaly uses its Anomalib trainer defaults and the configured step budget."
+            if is_dinomaly
+            else ""
+        )
         self.batch_size_spin.setValue(8 if model_key == "patchcore" else self.batch_size_spin.value())
         self.batch_size_spin.setEnabled(is_training_model)
 

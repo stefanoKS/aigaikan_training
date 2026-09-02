@@ -57,3 +57,11 @@ class TrainingPage(QWidget):
         self.log_output.setReadOnly(True)
         root.addWidget(self.log_output, stretch=1)
 
+    def append_log(self, level: str, message: str) -> None:
+        """Append an event and keep the active training view on the newest line."""
+        scrollbar = self.log_output.verticalScrollBar()
+        follow_latest = scrollbar.value() >= scrollbar.maximum()
+        self.log_output.appendPlainText(f"[{level.upper()}] {message}")
+        if follow_latest:
+            scrollbar.setValue(scrollbar.maximum())
+

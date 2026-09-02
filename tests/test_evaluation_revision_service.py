@@ -6,6 +6,8 @@ from pathlib import Path
 from PIL import Image
 
 from app.core.dataset_manifest import sha256_file
+from app.core.inspection_region import inspection_region_hash, write_inspection_region
+from app.models.inspection_region import InspectionRegionConfig
 from app.core.run_artifacts import CanonicalCheckpoint, write_run_manifest
 from app.core.threshold_calibrator import ThresholdCalibrationConfig, ThresholdMethod
 from app.models.dataset_config import DatasetConfig, DatasetRole
@@ -43,8 +45,15 @@ class _FakeAnomalibService:
         return {"model": object(), "engine": self.engine}
 
     @staticmethod
-    def create_datamodule(dataset: DatasetConfig, _config: TrainingConfig, *, calibration_mode: bool) -> DatasetConfig:
+    def create_datamodule(
+        dataset: DatasetConfig,
+        _config: TrainingConfig,
+        *,
+        calibration_mode: bool,
+        inspection_region: InspectionRegionConfig | None = None,
+    ) -> DatasetConfig:
         assert not calibration_mode
+        assert inspection_region is not None
         return dataset
 
 
@@ -53,12 +62,24 @@ def test_reevaluation_revises_threshold_without_retraining_the_canonical_model(t
     checkpoint.write_bytes(b"canonical-model")
     canonical = CanonicalCheckpoint(checkpoint.resolve(), sha256_file(checkpoint))
     (tmp_path / "config.json").write_text(json.dumps(TrainingConfig().to_dict()), encoding="utf-8")
+    inspection_region = InspectionRegionConfig()
+    write_inspection_region(tmp_path / "inspection_region.json", inspection_region)
     write_run_manifest(
         tmp_path / "run_manifest.json",
         canonical_checkpoint=canonical,
         dataset_manifest_sha256="a" * 64,
         split_counts={"final_test": {"ok": 1, "ng": 1}},
         threshold=0.5,
+        extra={
+            "inspection_region_hash": inspection_region_hash(inspection_region),
+            "inspection_preprocessing": {
+                "roi_contract_version": inspection_region.roi_contract_version,
+                "metadata_file": "inspection_region.json",
+                "metadata_sha256": inspection_region_hash(inspection_region),
+                "source_size": [0, 0],
+                "rectified_size": [0, 0],
+            }
+        },
     )
     _image(tmp_path / "calibration_ok" / "ok.png", (10, 10, 10))
     _image(tmp_path / "final_ok" / "ok.png", (20, 20, 20))
