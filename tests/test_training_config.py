@@ -26,7 +26,11 @@ def test_training_config_round_trip() -> None:
     assert restored.model_name == "dinomaly_dinov3"
     assert restored.dinomaly_decoder_depth == 8
     assert restored.dinomaly_encoder_name == "vit_base_patch16_dinov3.lvd1689m"
-    assert payload["model_profile"]["preprocessing"] == "anomalib-native"
+    assert payload["model_profile"]["preprocessing"] == {
+        "resize_size": [448, 448],
+        "center_crop_size": [384, 384],
+        "encoder_patch_size": 16,
+    }
     restored.validate()
 
 
@@ -71,7 +75,11 @@ def test_dinomaly_step_override_remains_available() -> None:
 
 def test_dinomaly_preprocessing_defaults_match_the_selected_encoder_patch_size() -> None:
     assert TrainingConfig(model_name="dinomaly_dinov2").model_profile()["preprocessing"] == "anomalib-native"
-    assert TrainingConfig(model_name="dinomaly_dinov3").model_profile()["preprocessing"] == "anomalib-native"
+    assert TrainingConfig(model_name="dinomaly_dinov3").model_profile()["preprocessing"] == {
+        "resize_size": [448, 448],
+        "center_crop_size": [384, 384],
+        "encoder_patch_size": 16,
+    }
 
 
 def test_legacy_dinomaly_dinov3_encoder_migrates_to_its_explicit_variant() -> None:

@@ -13,6 +13,8 @@ from app.models.inspection_region import InspectionRegionConfig
 from app.models.training_config import DeviceMode, TrainingConfig
 
 REQUIRED_ANOMALIB_VERSION = "2.6.0"
+DINOMALY_DINOV3_RESIZE_SIZE = (448, 448)
+DINOMALY_DINOV3_CROP_SIZE = 384
 
 
 @dataclass(slots=True)
@@ -307,12 +309,18 @@ class AnomalibService:
                 pre_trained=True,
             )
         if definition.key in {"dinomaly_dinov2", "dinomaly_dinov3"}:
-            return model_class(
-                encoder_name=config.dinomaly_encoder_name,
-                decoder_depth=8,
-                bottleneck_dropout=0.2,
-                use_context_recentering=False,
-            )
+            model_kwargs: dict[str, Any] = {
+                "encoder_name": config.dinomaly_encoder_name,
+                "decoder_depth": 8,
+                "bottleneck_dropout": 0.2,
+                "use_context_recentering": False,
+            }
+            if config.is_dinomaly_dinov3:
+                model_kwargs["pre_processor"] = model_class.configure_pre_processor(
+                    image_size=DINOMALY_DINOV3_RESIZE_SIZE,
+                    crop_size=DINOMALY_DINOV3_CROP_SIZE,
+                )
+            return model_class(**model_kwargs)
         raise RuntimeError(f"No model factory is registered for {definition.display_name}.")
 
     @staticmethod

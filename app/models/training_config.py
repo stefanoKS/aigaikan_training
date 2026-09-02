@@ -157,7 +157,7 @@ class TrainingConfig:
                 "max_epochs": 1,
                 "preprocessing": "anomalib-native",
             }
-        return {
+        profile: dict[str, object] = {
             "encoder_name": self.dinomaly_encoder_name,
             "decoder_depth": 8,
             "bottleneck_dropout": 0.2,
@@ -166,6 +166,13 @@ class TrainingConfig:
             "max_steps": self.target_training_steps if self.target_training_steps is not None else "auto",
             "preprocessing": "anomalib-native",
         }
+        if self.is_dinomaly_dinov3:
+            profile["preprocessing"] = {
+                "resize_size": [448, 448],
+                "center_crop_size": [384, 384],
+                "encoder_patch_size": 16,
+            }
+        return profile
 
     def resolved_dinomaly_training_steps(self, training_image_count: int) -> int:
         """Return the baseline or explicitly overridden Dinomaly optimizer-step budget."""

@@ -12,7 +12,11 @@ from app.core.model_registry import ModelRegistry
 from app.models.dataset_config import DatasetConfig, DatasetRole
 from app.models.inspection_region import InspectionRegionConfig
 from app.models.training_config import DeviceMode, TrainingConfig
-from app.services.anomalib_service import AnomalibService
+from app.services.anomalib_service import (
+    DINOMALY_DINOV3_CROP_SIZE,
+    DINOMALY_DINOV3_RESIZE_SIZE,
+    AnomalibService,
+)
 
 
 def test_dinomaly_uses_selected_folders_and_omits_missing_masks(tmp_path: Path, monkeypatch) -> None:
@@ -179,15 +183,20 @@ def test_patchcore_uses_fixed_profile_and_native_preprocessing(tmp_path: Path, m
 
 
 @pytest.mark.parametrize(
-    ("model_name", "encoder_name"),
+    ("model_name", "encoder_name", "expected_pre_processor"),
     (
-        ("dinomaly_dinov2", "vit_base_patch14_reg4_dinov2"),
-        ("dinomaly_dinov3", "vit_base_patch16_dinov3.lvd1689m"),
+        ("dinomaly_dinov2", "vit_base_patch14_reg4_dinov2", None),
+        (
+            "dinomaly_dinov3",
+            "vit_base_patch16_dinov3.lvd1689m",
+            {"image_size": DINOMALY_DINOV3_RESIZE_SIZE, "crop_size": DINOMALY_DINOV3_CROP_SIZE},
+        ),
     ),
 )
 def test_dinomaly_variants_use_stock_class_and_explicit_encoder(
     model_name: str,
     encoder_name: str,
+    expected_pre_processor: dict[str, object] | None,
     monkeypatch,
 ) -> None:
     class FakeDinomaly:
@@ -208,12 +217,15 @@ def test_dinomaly_variants_use_stock_class_and_explicit_encoder(
     )
 
     assert isinstance(model, FakeDinomaly)
-    assert model.kwargs == {
+    expected_kwargs = {
         "encoder_name": encoder_name,
         "decoder_depth": 8,
         "bottleneck_dropout": 0.2,
         "use_context_recentering": False,
     }
+    if expected_pre_processor is not None:
+        expected_kwargs["pre_processor"] = expected_pre_processor
+    assert model.kwargs == expected_kwargs
 
 
 def test_dinomaly_preserves_native_trainer_arguments_except_max_steps(tmp_path: Path, monkeypatch) -> None:
