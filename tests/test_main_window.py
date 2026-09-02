@@ -11,6 +11,7 @@ from PySide6.QtWidgets import QApplication
 from PIL import Image
 
 from app.models.dataset_config import DatasetRole, FolderImportMode
+from app.core.preprocessing_contract import read_preprocessing_config
 from app.core.project_manager import ProjectManager
 from app.core.settings_manager import SettingsManager
 from app.models.project_config import ProjectConfig
@@ -126,4 +127,30 @@ def test_inspection_roi_is_ready_to_adjust_after_dataset_selection_before_traini
     assert window.inspection_region_page.save_button.isEnabled()
     assert project.last_training_status == "Not trained"
 
+    window.close()
+
+
+def test_saving_preprocessing_policy_marks_existing_results_for_retraining(tmp_path: Path) -> None:
+    application = QApplication.instance() or QApplication([])
+    manager = ProjectManager(tmp_path / "projects")
+    window = MainWindow(SettingsManager(), manager)
+    project = manager.create_project("preprocessing-policy")
+    window._set_current_project(project)
+    model_index = window.config_page.model_combo.findData("dinomaly_dinov3")
+    window.config_page.model_combo.setCurrentIndex(model_index)
+    window.config_page.tiling_check.setChecked(True)
+    aggregation_index = window.config_page.score_aggregation_combo.findData("top_k_mean")
+    window.config_page.score_aggregation_combo.setCurrentIndex(aggregation_index)
+    window.config_page.top_k_fraction_spin.setValue(2.5)
+    application.processEvents()
+
+    assert window._save_training_config(show_dialog=False)
+
+    persisted = read_preprocessing_config(project.root_path / "preprocessing.json")
+    assert persisted.tiling.enabled
+    assert persisted.score_aggregation.value == "top_k_mean"
+    assert persisted.top_k_fraction == 0.025
+    assert project.training.dinomaly_encoder_id == "vit_base_patch16_dinov3.lvd1689m"
+    assert project.last_training_status == "Retraining required"
+    assert window.inference_page.status_label.text() == "Retraining required"
     window.close()

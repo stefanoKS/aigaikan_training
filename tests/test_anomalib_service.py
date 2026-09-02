@@ -11,6 +11,7 @@ import pytest
 from app.core.model_registry import ModelRegistry
 from app.models.dataset_config import DatasetConfig, DatasetRole
 from app.models.inspection_region import InspectionRegionConfig
+from app.models.preprocessing_config import PreprocessingConfig
 from app.models.training_config import DeviceMode, TrainingConfig
 from app.services.anomalib_service import (
     DINOMALY_DINOV3_CROP_SIZE,
@@ -128,6 +129,10 @@ def test_padim_uses_the_fixed_stock_profile(tmp_path: Path, monkeypatch) -> None
         "devices": 1,
         "default_root_dir": str(tmp_path / "run"),
         "enable_progress_bar": False,
+        "check_val_every_n_epoch": 1,
+        "gradient_clip_val": 0.0,
+        "accumulate_grad_batches": 1,
+        "deterministic": True,
         "max_epochs": 1,
         "callbacks": ["progress-callback"],
     }
@@ -258,9 +263,18 @@ def test_dinomaly_preserves_native_trainer_arguments_except_max_steps(tmp_path: 
     dataset = DatasetConfig()
     dataset.folders[DatasetRole.OK_TRAIN].path = str(ok_folder)
 
+    seeds: list[int] = []
+    monkeypatch.setattr(AnomalibService, "_seed_everything", staticmethod(seeds.append))
     components = AnomalibService().create_components(
         dataset,
-        TrainingConfig(model_name="dinomaly_dinov2", device=DeviceMode.CPU),
+        TrainingConfig(
+            model_name="dinomaly_dinov2",
+            device=DeviceMode.CPU,
+            validation_every_n_epochs=3,
+            gradient_clip_val=0.5,
+            accumulate_grad_batches=2,
+            random_seed=17,
+        ),
         run_directory=tmp_path / "run",
         callbacks=["progress-callback"],
     )
@@ -270,9 +284,14 @@ def test_dinomaly_preserves_native_trainer_arguments_except_max_steps(tmp_path: 
         "devices": 1,
         "default_root_dir": str(tmp_path / "run"),
         "enable_progress_bar": False,
+        "check_val_every_n_epoch": 3,
+        "gradient_clip_val": 0.5,
+        "accumulate_grad_batches": 2,
+        "deterministic": True,
         "max_steps": 5000,
         "callbacks": ["progress-callback"],
     }
+    assert seeds == [17]
 
 
 def test_inference_components_disable_console_progress(tmp_path: Path, monkeypatch) -> None:
@@ -361,7 +380,94 @@ def test_enabled_inspection_roi_is_applied_to_every_datamodule_stage(tmp_path: P
     assert transform.config == roi
 
 
-def test_retired_models_are_rejected_before_training() -> None:
+def test_preprocessing_v2_uses_explicit_model_geometry_without_a_second_folder_transform(tmp_path: Path, monkeypatch) -> None:
+    class FakeFolder:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+    class FakeDinomaly:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+    anomalib_data = ModuleType("anomalib.data")
+    anomalib_models = ModuleType("anomalib.models")
+    anomalib_data.Folder = FakeFolder
+    anomalib_models.Dinomaly = FakeDinomaly
+    monkeypatch.setitem(sys.modules, "anomalib.data", anomalib_data)
+    monkeypatch.setitem(sys.modules, "anomalib.models", anomalib_models)
+    model_preprocessor = object()
+    monkeypatch.setattr(AnomalibService, "_create_v2_pre_processor", staticmethod(lambda *_args: model_preprocessor))
+    for folder_name in ("ok_train", "ok_test"):
+        (tmp_path / folder_name).mkdir()
+    dataset = DatasetConfig()
+    dataset.folders[DatasetRole.OK_TRAIN].path = str(tmp_path / "ok_train")
+    dataset.folders[DatasetRole.OK_TEST].path = str(tmp_path / "ok_test")
+    config = TrainingConfig(model_name="dinomaly_dinov3", device=DeviceMode.CPU)
+    plan = PreprocessingConfig().resolve("dinomaly_dinov3", (639, 177))
+
+    model = AnomalibService()._create_model(ModelRegistry().get(config.model_name), config, plan)
+    datamodule = AnomalibService().create_datamodule(
+        dataset,
+        config,
+        calibration_mode=True,
+        inspection_region=InspectionRegionConfig(
+            enabled=True,
+            source_width=64,
+            source_height=64,
+            points_px=((4, 4), (59, 4), (59, 59), (4, 59)),
+        ),
+        preprocessing_plan=plan,
+    )
+
+    assert model.kwargs["pre_processor"] is model_preprocessor
+    assert datamodule.kwargs["augmentations"] is None
+
+
+@pytest.mark.parametrize(
+    ("model_name", "class_name", "expected_kwargs"),
+    (
+        (
+            "anomaly_dino",
+            "AnomalyDINO",
+            {"num_neighbours": 1, "encoder_name": "vit_small_patch14_dinov2", "sampling_ratio": 0.1},
+        ),
+        (
+            "super_add",
+            "SuperADD",
+            {"backbone": "vit_huge_plus_patch16_dinov3", "patch_size": 448, "patch_overlap": 16},
+        ),
+        ("efficient_ad", "EfficientAd", {}),
+        (
+            "supersimplenet",
+            "Supersimplenet",
+            {"backbone": "wide_resnet50_2.tv_in1k", "layers": ["layer2", "layer3"]},
+        ),
+    ),
+)
+def test_new_model_adapters_use_their_verified_stock_constructor_arguments(
+    model_name: str,
+    class_name: str,
+    expected_kwargs: dict[str, object],
+    monkeypatch,
+) -> None:
+    class FakeModel:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+
+    anomalib_models = ModuleType("anomalib.models")
+    setattr(anomalib_models, class_name, FakeModel)
+    monkeypatch.setitem(sys.modules, "anomalib.models", anomalib_models)
+
+    model = AnomalibService()._create_model(
+        ModelRegistry().get(model_name),
+        TrainingConfig(model_name=model_name, device=DeviceMode.CPU),
+    )
+
+    assert isinstance(model, FakeModel)
+    assert model.kwargs == expected_kwargs
+
+
+def test_unregistered_model_ids_are_rejected_before_training() -> None:
     with pytest.raises(ValueError, match="Unsupported production model"):
         TrainingConfig(model_name="superadd_dinov3").validate()
 

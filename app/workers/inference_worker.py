@@ -8,13 +8,23 @@ import sys
 import traceback
 from datetime import datetime
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
+import numpy as np
+
 from app.core.inspection_region import InspectionRegionProcessor
-from app.core.prediction_adapter import iter_anomalib_predictions
+from app.core.prediction_adapter import iter_anomalib_predictions, iter_preprocessed_predictions
+from app.core.preprocessing_pipeline import PreprocessingPipeline
 from app.core.result_parser import ResultParser
-from app.core.run_artifacts import read_canonical_checkpoint, read_persisted_threshold, read_verified_inspection_region
+from app.core.run_artifacts import (
+    read_canonical_checkpoint,
+    read_persisted_threshold,
+    read_verified_inspection_region,
+    read_verified_preprocessing_plan,
+)
 from app.models.prediction_result import PredictionResult
+from app.models.preprocessing_config import PreprocessingTile
 from app.models.training_config import TrainingConfig
 from app.services.anomalib_service import AnomalibService
 
@@ -96,6 +106,36 @@ def _expected_source_path(predicted_path: Path, expected_paths: set[Path]) -> Pa
     return None
 
 
+def _stage_preprocessed_inputs(
+    source_paths: tuple[Path, ...],
+    preprocessing_pipeline: PreprocessingPipeline,
+    destination: Path,
+) -> tuple[Path, dict[Path, Path], dict[Path, PreprocessingTile], dict[Path, Path]]:
+    """Prepare inputs once and keep only temporary prepared/rectified files for prediction and overlays."""
+    from PIL import Image
+
+    prepared_directory = destination / "prepared"
+    preview_directory = destination / "rectified"
+    prepared_directory.mkdir(parents=True)
+    preview_directory.mkdir()
+    source_path_by_staged_path: dict[Path, Path] = {}
+    preprocessing_tile_by_staged_path: dict[Path, PreprocessingTile] = {}
+    preview_path_by_source: dict[Path, Path] = {}
+    for source_index, source_path in enumerate(source_paths):
+        prepared_images, rectified_image = preprocessing_pipeline.prepare_path_with_rectified(source_path)
+        preview_path = (preview_directory / f"{source_index:06d}.png").resolve()
+        Image.fromarray(rectified_image, "RGB").save(preview_path)
+        preview_path_by_source[source_path] = preview_path
+        for prepared in prepared_images:
+            staged_path = (
+                prepared_directory / f"{source_index:06d}_tile{prepared.tile.index:02d}_{source_path.stem}.png"
+            ).resolve()
+            Image.fromarray(prepared.image_rgb, "RGB").save(staged_path)
+            source_path_by_staged_path[staged_path] = source_path
+            preprocessing_tile_by_staged_path[staged_path] = prepared.tile
+    return prepared_directory, source_path_by_staged_path, preprocessing_tile_by_staged_path, preview_path_by_source
+
+
 def run(run_directory: Path, input_path: Path) -> int:
     configure_worker_stdio()
     run_directory = run_directory.expanduser().resolve()
@@ -112,21 +152,26 @@ def run(run_directory: Path, input_path: Path) -> int:
     checkpoint_path = read_canonical_checkpoint(run_directory).path
     threshold = read_persisted_threshold(run_directory)
     inspection_region = read_verified_inspection_region(run_directory)
-    inspection_processor = InspectionRegionProcessor(inspection_region)
+    preprocessing_plan = read_verified_preprocessing_plan(run_directory)
+    preprocessing_pipeline = (
+        PreprocessingPipeline(inspection_region, preprocessing_plan) if preprocessing_plan is not None else None
+    )
+    inspection_processor = InspectionRegionProcessor(inspection_region) if preprocessing_pipeline is None else None
     rectified_images = {
         source_path: inspection_processor.apply_path(source_path)
         for source_path in source_paths
-    } if inspection_region.enabled else {}
-    from anomalib.data import PredictDataset
-
-    prediction_dataset = PredictDataset(input_path, transform=inspection_processor)
+    } if inspection_processor is not None and inspection_region.enabled else {}
     output_directory = run_directory / "inference" / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     output_directory.mkdir(parents=True, exist_ok=False)
     visualizations_directory = output_directory / "visualizations"
     visualizations_directory.mkdir()
     config = TrainingConfig.from_dict(json.loads(config_path.read_text(encoding="utf-8")))
     service = AnomalibService()
-    components = service.create_inference_components(config, output_directory)
+    components = (
+        service.create_inference_components(config, output_directory, preprocessing_plan)
+        if preprocessing_plan is not None
+        else service.create_inference_components(config, output_directory)
+    )
     device_note = str(components["device_note"])
     if device_note:
         emit({"type": "log", "level": "warning", "message": device_note})
@@ -137,48 +182,100 @@ def run(run_directory: Path, input_path: Path) -> int:
             "message": (
                 f"Loaded {components['definition'].display_name} on {components['device']}; "
                 f"run={run_directory}; checkpoint={checkpoint_path}; input={input_path}; images={total_images}; "
-                f"roi={'enabled' if inspection_region.enabled else 'disabled'}"
+                f"roi={'enabled' if inspection_region.enabled else 'disabled'}; "
+                f"preprocessing={'v2' if preprocessing_plan is not None else 'legacy'}"
             ),
         }
     )
     emit({"type": "progress", "current": 0, "total": total_images})
-    output = components["engine"].predict(
-        model=components["model"],
-        dataset=prediction_dataset,
-        return_predictions=True,
-        ckpt_path=checkpoint_path,
-    )
     predictions: list[PredictionResult] = []
     expected_paths = set(source_paths)
     predicted_paths: set[Path] = set()
-    for anomalib_prediction in iter_anomalib_predictions(output):
-        source_path = _expected_source_path(anomalib_prediction.image_path, expected_paths)
-        if source_path is None:
-            raise ValueError(f"Anomalib returned a prediction outside the selected input: {anomalib_prediction.image_path}")
-        if source_path in predicted_paths:
-            raise ValueError(f"Anomalib returned more than one prediction for: {source_path}")
-        predicted_paths.add(source_path)
-        predicted_label = "NG" if anomalib_prediction.score >= threshold else "OK"
-        heatmap_path, overlay_path = _save_visualizations(
-            source_path,
-            anomalib_prediction.anomaly_map,
-            visualizations_directory,
-            len(predictions),
-            rectified_images.get(source_path),
+    if preprocessing_pipeline is None:
+        from anomalib.data import PredictDataset
+
+        output = components["engine"].predict(
+            model=components["model"],
+            dataset=PredictDataset(input_path, transform=inspection_processor),
+            return_predictions=True,
+            ckpt_path=checkpoint_path,
         )
-        prediction = PredictionResult(
-            source_path=str(source_path),
-            predicted_label=predicted_label,
-            ground_truth_label="Unknown",
-            anomaly_score=anomalib_prediction.score,
-            threshold=threshold,
-            original_image=str(source_path),
-            anomaly_map=heatmap_path,
-            overlay_image=overlay_path,
-        )
-        predictions.append(prediction)
-        emit({"type": "prediction", **prediction.to_dict()})
-        emit({"type": "progress", "current": len(predictions), "total": total_images})
+        for anomalib_prediction in iter_anomalib_predictions(output):
+            source_path = _expected_source_path(anomalib_prediction.image_path, expected_paths)
+            if source_path is None:
+                raise ValueError(f"Anomalib returned a prediction outside the selected input: {anomalib_prediction.image_path}")
+            if source_path in predicted_paths:
+                raise ValueError(f"Anomalib returned more than one prediction for: {source_path}")
+            predicted_paths.add(source_path)
+            heatmap_path, overlay_path = _save_visualizations(
+                source_path,
+                anomalib_prediction.anomaly_map,
+                visualizations_directory,
+                len(predictions),
+                rectified_images.get(source_path),
+            )
+            prediction = PredictionResult(
+                source_path=str(source_path),
+                predicted_label="NG" if anomalib_prediction.score >= threshold else "OK",
+                ground_truth_label="Unknown",
+                anomaly_score=anomalib_prediction.score,
+                threshold=threshold,
+                original_image=str(source_path),
+                anomaly_map=heatmap_path,
+                overlay_image=overlay_path,
+            )
+            predictions.append(prediction)
+            emit({"type": "prediction", **prediction.to_dict()})
+            emit({"type": "progress", "current": len(predictions), "total": total_images})
+    else:
+        from PIL import Image
+        from anomalib.data import PredictDataset
+
+        with TemporaryDirectory(prefix="aigaikan-preprocessing-v2-") as temporary_directory:
+            (
+                prepared_directory,
+                source_path_by_staged_path,
+                preprocessing_tile_by_staged_path,
+                preview_path_by_source,
+            ) = _stage_preprocessed_inputs(source_paths, preprocessing_pipeline, Path(temporary_directory))
+            output = components["engine"].predict(
+                model=components["model"],
+                dataset=PredictDataset(prepared_directory),
+                return_predictions=True,
+                ckpt_path=checkpoint_path,
+            )
+            for anomalib_prediction in iter_preprocessed_predictions(
+                output,
+                source_path_by_staged_path,
+                preprocessing_tile_by_staged_path,
+                preprocessing_pipeline,
+            ):
+                source_path = anomalib_prediction.source_path
+                if source_path in predicted_paths:
+                    raise ValueError(f"Anomalib returned more than one prediction for: {source_path}")
+                predicted_paths.add(source_path)
+                with Image.open(preview_path_by_source[source_path]) as preview:
+                    rectified_image = np.asarray(preview.convert("RGB"))
+                heatmap_path, overlay_path = _save_visualizations(
+                    source_path,
+                    anomalib_prediction.anomaly_map,
+                    visualizations_directory,
+                    len(predictions),
+                    rectified_image,
+                )
+                prediction = PredictionResult(
+                    source_path=str(source_path),
+                    predicted_label="NG" if anomalib_prediction.score >= threshold else "OK",
+                    ground_truth_label="Unknown",
+                    anomaly_score=anomalib_prediction.score,
+                    threshold=threshold,
+                    original_image=str(source_path),
+                    anomaly_map=heatmap_path,
+                    overlay_image=overlay_path,
+                )
+                predictions.append(prediction)
+                emit({"type": "prediction", **prediction.to_dict()})
+                emit({"type": "progress", "current": len(predictions), "total": total_images})
     if predicted_paths != expected_paths:
         missing_paths = sorted(expected_paths - predicted_paths)
         missing_summary = ", ".join(str(path) for path in missing_paths[:3])

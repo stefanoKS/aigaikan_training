@@ -5,22 +5,26 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 from app.core.dataset_manifest import build_dataset_manifest, write_dataset_manifest
 from app.core.inspection_region import validate_inspection_region_sources
-from app.core.prediction_adapter import iter_anomalib_predictions
+from app.core.prediction_adapter import iter_anomalib_predictions, iter_preprocessed_predictions
+from app.core.preprocessing_pipeline import PreprocessingPipeline
 from app.core.quality_metrics import FinalTestAcceptancePolicy, QualityReport, calculate_quality_metrics
 from app.core.result_parser import ResultParser
 from app.core.run_artifacts import (
     CanonicalCheckpoint,
     read_canonical_checkpoint,
     read_verified_inspection_region,
+    read_verified_preprocessing_plan,
     write_evaluation_revision,
 )
 from app.core.threshold_calibrator import CalibrationSample, ThresholdCalibrationConfig, ThresholdCalibrator
 from app.models.dataset_config import DatasetConfig, DatasetRole
 from app.models.prediction_result import PredictionResult
+from app.models.preprocessing_config import PreprocessingTile
 from app.models.training_config import TrainingConfig
 from app.services.anomalib_service import AnomalibService
 
@@ -63,6 +67,10 @@ class EvaluationRevisionService:
         canonical_checkpoint = read_canonical_checkpoint(run_directory)
         config = self._load_training_config(run_directory)
         inspection_region = read_verified_inspection_region(run_directory)
+        preprocessing_plan = read_verified_preprocessing_plan(run_directory)
+        preprocessing_pipeline = (
+            PreprocessingPipeline(inspection_region, preprocessing_plan) if preprocessing_plan is not None else None
+        )
         resolved = self._validate_directories(directories)
         validate_inspection_region_sources(
             inspection_region,
@@ -75,24 +83,39 @@ class EvaluationRevisionService:
         )
         revisions_directory = run_directory / "evaluation_revisions"
         revisions_directory.mkdir(parents=True, exist_ok=True)
-        components = self.anomalib_service.create_inference_components(config, revisions_directory)
-        calibration_datamodule = self.anomalib_service.create_datamodule(
-            self._dataset_config(resolved.calibration_ok, resolved.calibration_ok, resolved.calibration_ng),
-            config,
-            calibration_mode=False,
-            inspection_region=inspection_region,
+        components = (
+            self.anomalib_service.create_inference_components(config, revisions_directory, preprocessing_plan)
+            if preprocessing_plan is not None
+            else self.anomalib_service.create_inference_components(config, revisions_directory)
         )
-        calibration_output = components["engine"].predict(
-            model=components["model"],
-            datamodule=calibration_datamodule,
-            return_predictions=True,
-            ckpt_path=str(canonical_checkpoint.path),
-        )
-        calibration_samples = self._calibration_samples(
-            calibration_output,
-            normal_directory=resolved.calibration_ok,
-            abnormal_directory=resolved.calibration_ng,
-        )
+        if preprocessing_pipeline is None:
+            calibration_datamodule = self.anomalib_service.create_datamodule(
+                self._dataset_config(resolved.calibration_ok, resolved.calibration_ok, resolved.calibration_ng),
+                config,
+                calibration_mode=False,
+                inspection_region=inspection_region,
+            )
+            calibration_samples = self._calibration_samples(
+                components["engine"].predict(
+                    model=components["model"],
+                    datamodule=calibration_datamodule,
+                    return_predictions=True,
+                    ckpt_path=str(canonical_checkpoint.path),
+                ),
+                normal_directory=resolved.calibration_ok,
+                abnormal_directory=resolved.calibration_ng,
+            )
+        else:
+            calibration_samples = self._calibration_samples_from_scores(
+                self._preprocessed_scores(
+                    components,
+                    canonical_checkpoint.path,
+                    [*self._images(resolved.calibration_ok), *self._images(resolved.calibration_ng)],
+                    preprocessing_pipeline,
+                ),
+                normal_directory=resolved.calibration_ok,
+                abnormal_directory=resolved.calibration_ng,
+            )
         calibration_result = ThresholdCalibrator().calibrate(calibration_samples, threshold_config)
         calibration_manifest = build_dataset_manifest(
             {
@@ -100,23 +123,36 @@ class EvaluationRevisionService:
                 "calibration_ng": self._images(resolved.calibration_ng),
             }
         )
-        final_test_datamodule = self.anomalib_service.create_datamodule(
-            self._dataset_config(resolved.calibration_ok, resolved.final_test_ok, resolved.final_test_ng),
-            config,
-            calibration_mode=False,
-            inspection_region=inspection_region,
-        )
-        final_predictions = self._final_predictions(
-            components["engine"].predict(
-                model=components["model"],
-                datamodule=final_test_datamodule,
-                return_predictions=True,
-                ckpt_path=str(canonical_checkpoint.path),
-            ),
-            normal_directory=resolved.final_test_ok,
-            abnormal_directory=resolved.final_test_ng,
-            threshold=calibration_result.threshold_value,
-        )
+        if preprocessing_pipeline is None:
+            final_test_datamodule = self.anomalib_service.create_datamodule(
+                self._dataset_config(resolved.calibration_ok, resolved.final_test_ok, resolved.final_test_ng),
+                config,
+                calibration_mode=False,
+                inspection_region=inspection_region,
+            )
+            final_predictions = self._final_predictions(
+                components["engine"].predict(
+                    model=components["model"],
+                    datamodule=final_test_datamodule,
+                    return_predictions=True,
+                    ckpt_path=str(canonical_checkpoint.path),
+                ),
+                normal_directory=resolved.final_test_ok,
+                abnormal_directory=resolved.final_test_ng,
+                threshold=calibration_result.threshold_value,
+            )
+        else:
+            final_predictions = self._final_predictions_from_scores(
+                self._preprocessed_scores(
+                    components,
+                    canonical_checkpoint.path,
+                    [*self._images(resolved.final_test_ok), *self._images(resolved.final_test_ng)],
+                    preprocessing_pipeline,
+                ),
+                normal_directory=resolved.final_test_ok,
+                abnormal_directory=resolved.final_test_ng,
+                threshold=calibration_result.threshold_value,
+            )
         quality_report = calculate_quality_metrics(
             final_predictions,
             FinalTestAcceptancePolicy(
@@ -207,15 +243,28 @@ class EvaluationRevisionService:
         normal_directory: Path,
         abnormal_directory: Path | None,
     ) -> list[CalibrationSample]:
+        return EvaluationRevisionService._calibration_samples_from_scores(
+            ((prediction.image_path, prediction.score) for prediction in iter_anomalib_predictions(output)),
+            normal_directory=normal_directory,
+            abnormal_directory=abnormal_directory,
+        )
+
+    @staticmethod
+    def _calibration_samples_from_scores(
+        predictions: Any,
+        *,
+        normal_directory: Path,
+        abnormal_directory: Path | None,
+    ) -> list[CalibrationSample]:
         labels = {path: "OK" for path in EvaluationRevisionService._images(normal_directory)}
         labels.update({path: "NG" for path in EvaluationRevisionService._images(abnormal_directory)})
         samples: list[CalibrationSample] = []
-        for prediction in iter_anomalib_predictions(output):
+        for prediction_path, score in predictions:
             try:
-                label = labels[prediction.image_path]
+                label = labels[prediction_path]
             except KeyError as exc:
-                raise ValueError(f"Calibration prediction path is outside the selected revision folders: {prediction.image_path}") from exc
-            samples.append(CalibrationSample(score=prediction.score, label=label))
+                raise ValueError(f"Calibration prediction path is outside the selected revision folders: {prediction_path}") from exc
+            samples.append(CalibrationSample(score=score, label=label))
         if len(samples) != len(labels):
             raise RuntimeError(f"Calibration prediction count mismatch: expected {len(labels)}, received {len(samples)}.")
         return samples
@@ -228,21 +277,36 @@ class EvaluationRevisionService:
         abnormal_directory: Path | None,
         threshold: float,
     ) -> list[PredictionResult]:
+        return EvaluationRevisionService._final_predictions_from_scores(
+            ((prediction.image_path, prediction.score) for prediction in iter_anomalib_predictions(output)),
+            normal_directory=normal_directory,
+            abnormal_directory=abnormal_directory,
+            threshold=threshold,
+        )
+
+    @staticmethod
+    def _final_predictions_from_scores(
+        predictions: Any,
+        *,
+        normal_directory: Path,
+        abnormal_directory: Path | None,
+        threshold: float,
+    ) -> list[PredictionResult]:
         labels = {path: ("OK", "final_test_ok") for path in EvaluationRevisionService._images(normal_directory)}
         labels.update({path: ("NG", "final_test_ng") for path in EvaluationRevisionService._images(abnormal_directory)})
         results: list[PredictionResult] = []
-        for prediction in iter_anomalib_predictions(output):
+        for prediction_path, score in predictions:
             try:
-                ground_truth, role = labels[prediction.image_path]
+                ground_truth, role = labels[prediction_path]
             except KeyError as exc:
-                raise ValueError(f"Final-test prediction path is outside the selected revision folders: {prediction.image_path}") from exc
+                raise ValueError(f"Final-test prediction path is outside the selected revision folders: {prediction_path}") from exc
             results.append(
                 PredictionResult(
-                    source_path=str(prediction.image_path),
-                    original_image=str(prediction.image_path),
-                    predicted_label="NG" if prediction.score >= threshold else "OK",
+                    source_path=str(prediction_path),
+                    original_image=str(prediction_path),
+                    predicted_label="NG" if score >= threshold else "OK",
                     ground_truth_label=ground_truth,
-                    anomaly_score=prediction.score,
+                    anomaly_score=score,
                     threshold=threshold,
                     dataset_role=role,
                 )
@@ -250,3 +314,43 @@ class EvaluationRevisionService:
         if len(results) != len(labels):
             raise RuntimeError(f"Final-test prediction count mismatch: expected {len(labels)}, received {len(results)}.")
         return results
+
+    @staticmethod
+    def _preprocessed_scores(
+        components: dict[str, Any],
+        checkpoint_path: Path,
+        source_paths: list[Path],
+        preprocessing_pipeline: PreprocessingPipeline,
+    ) -> list[tuple[Path, float]]:
+        """Run a saved preprocessing-v2 plan and return one externally-scored result per source."""
+        from PIL import Image
+        from anomalib.data import PredictDataset
+
+        with TemporaryDirectory(prefix="aigaikan-evaluation-v2-") as temporary_directory:
+            prepared_directory = Path(temporary_directory) / "prepared"
+            prepared_directory.mkdir()
+            source_path_by_staged_path: dict[Path, Path] = {}
+            preprocessing_tile_by_staged_path: dict[Path, PreprocessingTile] = {}
+            for source_index, source_path in enumerate(source_paths):
+                for prepared in preprocessing_pipeline.prepare_path(source_path):
+                    staged_path = (
+                        prepared_directory / f"{source_index:06d}_tile{prepared.tile.index:02d}_{source_path.stem}.png"
+                    ).resolve()
+                    Image.fromarray(prepared.image_rgb, "RGB").save(staged_path)
+                    source_path_by_staged_path[staged_path] = source_path
+                    preprocessing_tile_by_staged_path[staged_path] = prepared.tile
+            output = components["engine"].predict(
+                model=components["model"],
+                dataset=PredictDataset(prepared_directory),
+                return_predictions=True,
+                ckpt_path=str(checkpoint_path),
+            )
+            return [
+                (prediction.source_path, prediction.score)
+                for prediction in iter_preprocessed_predictions(
+                    output,
+                    source_path_by_staged_path,
+                    preprocessing_tile_by_staged_path,
+                    preprocessing_pipeline,
+                )
+            ]

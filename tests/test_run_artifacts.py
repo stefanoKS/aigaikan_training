@@ -10,12 +10,15 @@ from app.core.run_artifacts import (
     read_canonical_checkpoint,
     read_persisted_threshold_metadata,
     read_verified_inspection_region,
+    read_verified_preprocessing_plan,
     resolve_canonical_checkpoint,
     write_evaluation_revision,
     write_run_manifest,
 )
 from app.core.inspection_region import inspection_region_hash, write_inspection_region
 from app.models.inspection_region import InspectionRegionConfig
+from app.core.preprocessing_contract import resolved_preprocessing_hash, write_resolved_preprocessing_plan
+from app.models.preprocessing_config import PreprocessingConfig
 
 
 class FakeEngine:
@@ -127,3 +130,46 @@ def test_run_roi_sidecar_must_match_its_manifest_hash(tmp_path: Path) -> None:
     )
 
     assert read_verified_inspection_region(tmp_path) == roi
+
+
+def test_run_preprocessing_v2_sidecar_must_match_its_manifest_hash(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "model.ckpt"
+    checkpoint.write_bytes(b"trusted model")
+    canonical = resolve_canonical_checkpoint(FakeEngine(checkpoint))
+    plan = PreprocessingConfig().resolve("dinomaly_dinov3", (639, 177))
+    write_resolved_preprocessing_plan(tmp_path / "preprocessing_plan.json", plan)
+    write_run_manifest(
+        tmp_path / "run_manifest.json",
+        canonical_checkpoint=canonical,
+        dataset_manifest_sha256="a" * 64,
+        split_counts={"final_test": {"ok": 1, "ng": 0}},
+        threshold=0.5,
+        extra={
+            "preprocessing_contract": {
+                "preprocessing_contract_version": 2,
+                "metadata_file": "preprocessing_plan.json",
+                "metadata_sha256": resolved_preprocessing_hash(plan),
+                "model_id": "dinomaly_dinov3",
+                "model_input_size": [640, 192],
+                "score_aggregation": "max",
+                "tiled": False,
+            }
+        },
+    )
+
+    assert read_verified_preprocessing_plan(tmp_path) == plan
+
+
+def test_completed_legacy_run_has_no_v2_preprocessing_plan(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "model.ckpt"
+    checkpoint.write_bytes(b"trusted model")
+    canonical = resolve_canonical_checkpoint(FakeEngine(checkpoint))
+    write_run_manifest(
+        tmp_path / "run_manifest.json",
+        canonical_checkpoint=canonical,
+        dataset_manifest_sha256="a" * 64,
+        split_counts={"final_test": {"ok": 1, "ng": 0}},
+        threshold=0.5,
+    )
+
+    assert read_verified_preprocessing_plan(tmp_path) is None

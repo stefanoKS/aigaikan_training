@@ -29,16 +29,24 @@ from app.core.dataset_manifest import build_effective_split
 from app.core.dataset_validator import DatasetValidationReport, DatasetValidator
 from app.core.inference_controller import InferenceController
 from app.core.model_registry import ModelExecutionMode, ModelRegistry
+from app.core.preprocessing_contract import preprocessing_hash
 from app.core.run_comparison import compare_training_runs
 from app.core.threshold_calibrator import ThresholdMethod
 from app.core.project_manager import ProjectManager
 from app.core.result_parser import ResultParser
 from app.core.inspection_region import inspection_region_hash
-from app.core.run_artifacts import read_canonical_checkpoint, read_persisted_threshold, read_verified_inspection_region
+from app.core.run_artifacts import (
+    read_canonical_checkpoint,
+    read_persisted_threshold,
+    read_run_manifest,
+    read_verified_inspection_region,
+    read_verified_preprocessing_plan,
+)
 from app.core.settings_manager import SettingsManager
 from app.core.training_controller import TrainingController
 from app.models.dataset_config import DatasetRole, FolderImportMode, SUPPORTED_IMAGE_EXTENSIONS
 from app.models.inspection_region import InspectionRegionConfig
+from app.models.preprocessing_config import PreprocessingConfig, ScoreAggregation, TilingConfig
 from app.models.project_config import ProjectConfig
 from app.models.training_config import DeviceMode, TrainingConfig
 from app.models.training_run import TrainingRun
@@ -646,11 +654,7 @@ class MainWindow(QMainWindow):
         previous_hash = inspection_region_hash(project.inspection_region)
         project.inspection_region = inspection_region
         if inspection_region_hash(inspection_region) != previous_hash:
-            project.last_training_status = "Retraining required"
-            self.results_page.clear_results()
-            self._inference_run_directory = None
-            self.inference_page.set_training_run(Path("-"), "-")
-            self.inference_page.set_status("Retraining required")
+            self._mark_retraining_required()
         self._save_project(show_dialog=False)
         self._refresh_project_views()
         QMessageBox.information(self, "Inspection ROI Saved", "The fixed inspection region was saved to the project.")
@@ -684,6 +688,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self, "No Project", "Create or open a project before saving training settings.")
             return False
         config = project.training
+        previous_preprocessing_hash = preprocessing_hash(project.preprocessing)
         config.model_name = str(self.config_page.model_combo.currentData())
         config.device = DeviceMode(self.config_page.device_combo.currentText().lower())
         config.batch_size = self.config_page.batch_size_spin.value()
@@ -695,6 +700,9 @@ class MainWindow(QMainWindow):
         config.split_seed = self.config_page.split_seed_spin.value()
         target_training_steps = self.config_page.target_training_steps_spin.value()
         config.target_training_steps = target_training_steps or None
+        config.dinomaly_encoder_id = (
+            str(self.config_page.dinomaly_encoder_combo.currentData() or "") if config.is_dinomaly else ""
+        )
         config.num_workers = self.config_page.workers_spin.value()
         config.threshold_method = ThresholdMethod(str(self.config_page.threshold_method_combo.currentData()))
         config.target_normal_false_reject_rate = self.config_page.threshold_false_reject_rate()
@@ -706,13 +714,32 @@ class MainWindow(QMainWindow):
         config.maximum_final_test_false_reject_rate = self.config_page.maximum_final_test_false_reject_spin.value() / 100
         config.minimum_final_test_ok_images = self.config_page.minimum_final_test_ok_images_spin.value()
         config.minimum_final_test_ng_images = self.config_page.minimum_final_test_ng_images_spin.value()
+        preprocessing = project.preprocessing
+        updated_preprocessing = PreprocessingConfig(
+            padding_mode=preprocessing.padding_mode,
+            padding_value_rgb=preprocessing.padding_value_rgb,
+            tiling=TilingConfig(
+                enabled=self.config_page.tiling_check.isChecked(),
+                tile_width=preprocessing.tiling.tile_width,
+                tile_height=preprocessing.tiling.tile_height,
+                overlap_x=preprocessing.tiling.overlap_x,
+                final_tile_alignment=preprocessing.tiling.final_tile_alignment,
+            ),
+            score_aggregation=ScoreAggregation(str(self.config_page.score_aggregation_combo.currentData())),
+            top_k_fraction=self.config_page.top_k_fraction_spin.value() / 100,
+            aspect_ratio_tolerance=preprocessing.aspect_ratio_tolerance,
+        )
         config.apply_model_defaults(self._training_image_count())
         try:
             config.validate()
+            updated_preprocessing.validate()
         except ValueError as exc:
             if show_dialog:
                 QMessageBox.warning(self, "Invalid Training Settings", str(exc))
             return False
+        project.preprocessing = updated_preprocessing
+        if preprocessing_hash(updated_preprocessing) != previous_preprocessing_hash:
+            self._mark_retraining_required()
         self._save_project(show_dialog=False)
         self._refresh_config_page()
         if show_dialog:
@@ -721,6 +748,7 @@ class MainWindow(QMainWindow):
 
     def _refresh_config_page(self) -> None:
         config = self.current_project.training if self.current_project else TrainingConfig()
+        preprocessing = self.current_project.preprocessing if self.current_project else PreprocessingConfig()
         try:
             definition = self.model_registry.get(config.model_name)
         except ValueError:
@@ -737,6 +765,7 @@ class MainWindow(QMainWindow):
         self.config_page.split_seed_spin.setValue(config.split_seed)
         self.config_page.workers_spin.setValue(config.num_workers)
         self.config_page.target_training_steps_spin.setValue(config.target_training_steps or 0)
+        self.config_page.set_dinomaly_encoder(config.dinomaly_encoder_name)
         threshold_method_index = self.config_page.threshold_method_combo.findData(config.threshold_method.value)
         self.config_page.threshold_method_combo.setCurrentIndex(max(threshold_method_index, 0))
         target_rate_index = self.config_page.threshold_fpr_combo.findData(config.target_normal_false_reject_rate)
@@ -748,7 +777,13 @@ class MainWindow(QMainWindow):
         self.config_page.maximum_final_test_false_reject_spin.setValue(config.maximum_final_test_false_reject_rate * 100)
         self.config_page.minimum_final_test_ok_images_spin.setValue(config.minimum_final_test_ok_images)
         self.config_page.minimum_final_test_ng_images_spin.setValue(config.minimum_final_test_ng_images)
+        self.config_page.tiling_check.setChecked(preprocessing.tiling.enabled)
+        aggregation_index = self.config_page.score_aggregation_combo.findData(preprocessing.score_aggregation.value)
+        self.config_page.score_aggregation_combo.setCurrentIndex(max(aggregation_index, 0))
+        self.config_page.top_k_fraction_spin.setValue(preprocessing.top_k_fraction * 100)
         self.config_page._update_threshold_controls()
+        self.config_page._update_preprocessing_controls()
+        self.config_page._update_model_support()
         self.training_page.active_model_label.setText(definition.display_name)
         self.training_page.active_device_label.setText(config.device.value)
         self._update_model_action()
@@ -797,8 +832,22 @@ class MainWindow(QMainWindow):
     def _reset_training_config(self) -> None:
         if self.current_project is None:
             return
+        previous_preprocessing_hash = preprocessing_hash(self.current_project.preprocessing)
         self.current_project.training = TrainingConfig()
+        self.current_project.preprocessing = PreprocessingConfig()
+        if preprocessing_hash(self.current_project.preprocessing) != previous_preprocessing_hash:
+            self._mark_retraining_required()
         self._refresh_config_page()
+
+    def _mark_retraining_required(self) -> None:
+        """Clear current-only views after a project policy affecting model inputs changes."""
+        if self.current_project is None:
+            return
+        self.current_project.last_training_status = "Retraining required"
+        self.results_page.clear_results()
+        self._inference_run_directory = None
+        self.inference_page.set_training_run(Path("-"), "-")
+        self.inference_page.set_status("Retraining required")
 
     def _start_training(self) -> None:
         project = self.current_project
@@ -883,6 +932,7 @@ class MainWindow(QMainWindow):
             self.results_page.clear_results()
             return
         expected_roi_hash = inspection_region_hash(project.inspection_region)
+        expected_preprocessing_hash = preprocessing_hash(project.preprocessing)
         summaries = sorted(
             (project.root_path / "runs").glob("*/results.json"),
             key=lambda path: path.stat().st_mtime,
@@ -894,7 +944,10 @@ class MainWindow(QMainWindow):
         for summary_path in summaries:
             try:
                 run = self.result_parser.read_training_run(summary_path)
-                if run.inspection_region_hash == expected_roi_hash:
+                if (
+                    run.inspection_region_hash == expected_roi_hash
+                    and run.preprocessing_hash == expected_preprocessing_hash
+                ):
                     self.results_page.set_training_run(run)
                     return
             except (OSError, ValueError, TypeError):
@@ -952,12 +1005,20 @@ class MainWindow(QMainWindow):
             read_canonical_checkpoint(run_directory)
             read_persisted_threshold(run_directory)
             run_inspection_region = read_verified_inspection_region(run_directory)
+            run_preprocessing_plan = read_verified_preprocessing_plan(run_directory)
             if self.current_project is not None and inspection_region_hash(run_inspection_region) != inspection_region_hash(
                 self.current_project.inspection_region
             ):
                 raise ValueError("The run inspection ROI does not match the current project. Train a new compatible run.")
             config = TrainingConfig.from_dict(__import__("json").loads(config_path.read_text(encoding="utf-8")))
             model_name = self.model_registry.get(config.model_name).display_name
+            preprocessing_status = "Ready"
+            if run_preprocessing_plan is None:
+                preprocessing_status = "Historical legacy preprocessing"
+            elif self.current_project is not None:
+                preprocessing_contract = read_run_manifest(run_directory).get("preprocessing_contract", {})
+                if preprocessing_contract.get("project_policy_sha256") != preprocessing_hash(self.current_project.preprocessing):
+                    preprocessing_status = "Historical preprocessing policy"
         except (OSError, ValueError, TypeError):
             if show_error:
                 QMessageBox.warning(
@@ -968,7 +1029,7 @@ class MainWindow(QMainWindow):
             return False
         self._inference_run_directory = run_directory
         self.inference_page.set_training_run(run_directory, model_name)
-        self.inference_page.set_status("Ready")
+        self.inference_page.set_status(preprocessing_status)
         return True
 
     def _choose_inference_image(self) -> None:

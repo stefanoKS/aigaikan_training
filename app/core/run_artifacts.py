@@ -10,7 +10,9 @@ from typing import Any, Mapping
 
 from app.core.dataset_manifest import sha256_file
 from app.core.inspection_region import inspection_region_hash, read_inspection_region
+from app.core.preprocessing_contract import read_resolved_preprocessing_plan, resolved_preprocessing_hash
 from app.models.inspection_region import InspectionRegionConfig
+from app.models.preprocessing_config import ResolvedPreprocessingPlan
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,6 +193,33 @@ def read_verified_inspection_region(run_directory: Path) -> InspectionRegionConf
     if preprocessing.get("rectified_size") != list(config.rectified_size()):
         raise ValueError("Inspection ROI rectified size does not match run_manifest.json.")
     return config
+
+
+def read_verified_preprocessing_plan(run_directory: Path) -> ResolvedPreprocessingPlan | None:
+    """Load a v2 plan or return ``None`` for a completed legacy preprocessing-v1 run."""
+    manifest = read_run_manifest(run_directory)
+    metadata = manifest.get("preprocessing_contract")
+    if metadata is None:
+        return None
+    if not isinstance(metadata, dict):
+        raise ValueError("Run manifest preprocessing contract must be an object.")
+    if metadata.get("metadata_file") != "preprocessing_plan.json":
+        raise ValueError("Run manifest does not reference the required preprocessing_plan.json metadata file.")
+    plan = read_resolved_preprocessing_plan(run_directory / "preprocessing_plan.json")
+    metadata_hash = str(metadata.get("metadata_sha256", ""))
+    if not metadata_hash or resolved_preprocessing_hash(plan) != metadata_hash:
+        raise ValueError("Preprocessing plan metadata hash does not match run_manifest.json.")
+    if metadata.get("preprocessing_contract_version") != plan.preprocessing_contract_version:
+        raise ValueError("Preprocessing contract version does not match run_manifest.json.")
+    if metadata.get("model_id") != plan.model_id:
+        raise ValueError("Preprocessing model ID does not match run_manifest.json.")
+    if metadata.get("model_input_size") != list(plan.model_input_size):
+        raise ValueError("Preprocessing model input size does not match run_manifest.json.")
+    if metadata.get("score_aggregation") != plan.score_aggregation.value:
+        raise ValueError("Preprocessing score aggregation does not match run_manifest.json.")
+    if bool(metadata.get("tiled")) != plan.tiled:
+        raise ValueError("Preprocessing tiling flag does not match run_manifest.json.")
+    return plan
 
 
 def _validated_threshold_metadata(metadata: Mapping[str, object], expected_threshold: float) -> dict[str, object]:

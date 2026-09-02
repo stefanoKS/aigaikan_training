@@ -13,9 +13,17 @@ import shutil
 from typing import Any, Iterable
 
 from app.core.dataset_manifest import sha256_file
+from app.core.model_registry import ModelRegistry
 from app.core.result_parser import ResultParser
 from app.core.inspection_region import InspectionRegionProcessor, inspection_region_hash
-from app.core.run_artifacts import read_canonical_checkpoint, read_persisted_threshold_metadata, read_verified_inspection_region
+from app.core.preprocessing_contract import resolved_preprocessing_hash
+from app.core.preprocessing_pipeline import PreprocessingPipeline
+from app.core.run_artifacts import (
+    read_canonical_checkpoint,
+    read_persisted_threshold_metadata,
+    read_verified_inspection_region,
+    read_verified_preprocessing_plan,
+)
 from app.models.prediction_result import PredictionResult
 from app.models.training_config import TrainingConfig
 from app.services.anomalib_service import AnomalibService, REQUIRED_ANOMALIB_VERSION
@@ -91,17 +99,30 @@ class ExportService:
             raise ValueError("Select at least one model export format.")
 
         config = self._load_training_config(run_directory)
+        definition = ModelRegistry().get(config.model_name)
+        if not definition.supports_export:
+            raise ValueError(
+                f"{definition.display_name} export is unavailable until an Anomalib export/reload/parity smoke test passes."
+            )
         checkpoint_path = read_canonical_checkpoint(run_directory).path
         threshold_metadata = read_persisted_threshold_metadata(run_directory)
         inspection_region = read_verified_inspection_region(run_directory)
-        inspection_processor = InspectionRegionProcessor(inspection_region)
+        preprocessing_plan = read_verified_preprocessing_plan(run_directory)
+        preprocessing_pipeline = (
+            PreprocessingPipeline(inspection_region, preprocessing_plan) if preprocessing_plan is not None else None
+        )
+        inspection_processor = InspectionRegionProcessor(inspection_region) if preprocessing_pipeline is None else None
         decision_threshold = float(threshold_metadata["threshold_value"])
         final_test_predictions = self._load_final_test_predictions(run_directory)
         export_directory = export_directory.expanduser().resolve()
         package_directory = export_directory / self.package_directory_name(config.model_name, run_directory.name)
         package_directory.mkdir(parents=True, exist_ok=True)
         included_artifacts = self._copy_run_artifacts(run_directory, package_directory)
-        components = self.anomalib_service.create_inference_components(config, package_directory)
+        components = (
+            self.anomalib_service.create_inference_components(config, package_directory, preprocessing_plan)
+            if preprocessing_plan is not None
+            else self.anomalib_service.create_inference_components(config, package_directory)
+        )
         exported: list[ExportResult] = []
         failures: dict[str, str] = {}
 
@@ -126,6 +147,7 @@ class ExportService:
                         decision_threshold,
                         self.score_tolerances[result.export_format],
                         inspection_processor,
+                        preprocessing_pipeline,
                     )
                     if not self._has_custom_deployment_validator
                     else self._deployment_validator(
@@ -164,6 +186,19 @@ class ExportService:
                 "source_size": [inspection_region.source_width, inspection_region.source_height],
                 "rectified_size": list(inspection_region.rectified_size()),
             },
+            preprocessing_contract=(
+                {
+                    "preprocessing_contract_version": preprocessing_plan.preprocessing_contract_version,
+                    "metadata_file": "preprocessing_plan.json",
+                    "metadata_sha256": resolved_preprocessing_hash(preprocessing_plan),
+                    "model_id": preprocessing_plan.model_id,
+                    "model_input_size": list(preprocessing_plan.model_input_size),
+                    "score_aggregation": preprocessing_plan.score_aggregation.value,
+                    "tiled": preprocessing_plan.tiled,
+                }
+                if preprocessing_plan is not None
+                else {"legacy": True}
+            ),
         )
         return ModelExportReport(exported=exported, failures=failures, package_directory=package_directory)
 
@@ -184,7 +219,7 @@ class ExportService:
             "predictions.csv",
             "inspection_region.json",
         )
-        optional_names = ("calibration_manifest.json", "final_test_manifest.json")
+        optional_names = ("calibration_manifest.json", "final_test_manifest.json", "preprocessing_plan.json")
         copied: dict[str, str] = {}
         for name in (*required_names, *optional_names):
             source_path = run_directory / name
@@ -210,6 +245,7 @@ class ExportService:
         threshold_metadata: dict[str, object],
         score_tolerances: Mapping[str, float],
         inspection_preprocessing: Mapping[str, object],
+        preprocessing_contract: Mapping[str, object],
     ) -> Path:
         """Record deployment package provenance and every verified file digest."""
         payload = {
@@ -224,6 +260,7 @@ class ExportService:
             "final_test_prediction_count": len(final_test_predictions),
             "threshold_metadata": threshold_metadata,
             "inspection_preprocessing": dict(inspection_preprocessing),
+            "preprocessing_contract": dict(preprocessing_contract),
             "format_score_tolerances": dict(score_tolerances),
             "included_run_artifacts": included_artifacts,
             "exports": [
@@ -289,6 +326,7 @@ class ExportService:
         threshold: float,
         score_tolerance: float = DEFAULT_SCORE_TOLERANCE,
         inspection_processor: InspectionRegionProcessor | None = None,
+        preprocessing_pipeline: PreprocessingPipeline | None = None,
     ) -> dict[str, object]:
         """Reload an export and require numerical and threshold-decision final-test parity."""
         if export_format == ModelExportFormat.TORCH.value:
@@ -305,10 +343,18 @@ class ExportService:
         score_mismatches: list[str] = []
         score_deltas: list[float] = []
         for expected in expected_predictions:
-            deployment_input: str | Any = expected.source_path
-            if inspection_processor is not None:
-                deployment_input = inspection_processor.apply_path(Path(expected.source_path))
-            score = ExportService._deployment_score(inferencer.predict(deployment_input))
+            if preprocessing_pipeline is not None:
+                deployed_maps = [
+                    ExportService._deployment_anomaly_map(inferencer.predict(prepared.image_rgb))
+                    for prepared in preprocessing_pipeline.prepare_path(Path(expected.source_path))
+                ]
+                reconstructed = preprocessing_pipeline.reconstruct_anomaly_maps(deployed_maps)
+                score = preprocessing_pipeline.score_from_reconstructed_map(reconstructed)
+            else:
+                deployment_input: str | Any = expected.source_path
+                if inspection_processor is not None:
+                    deployment_input = inspection_processor.apply_path(Path(expected.source_path))
+                score = ExportService._deployment_score(inferencer.predict(deployment_input))
             expected_score = float(expected.anomaly_score)
             if not isfinite(expected_score):
                 raise ValueError(f"Persisted checkpoint score must be finite: {expected.source_path}")
@@ -338,6 +384,14 @@ class ExportService:
             "maximum_score_delta": max(score_deltas, default=0.0),
             "mean_score_delta": sum(score_deltas) / len(score_deltas) if score_deltas else 0.0,
         }
+
+    @staticmethod
+    def _deployment_anomaly_map(prediction: Any) -> Any:
+        """Extract the required anomaly map used by preprocessing-v2 external score aggregation."""
+        value = prediction.get("anomaly_map") if isinstance(prediction, dict) else getattr(prediction, "anomaly_map", None)
+        if value is None:
+            raise ValueError("Deployment prediction did not contain an anomaly map required by preprocessing v2.")
+        return value
 
     @staticmethod
     def _deployment_score(prediction: Any) -> float:

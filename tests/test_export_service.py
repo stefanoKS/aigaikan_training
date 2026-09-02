@@ -7,15 +7,18 @@ from pathlib import Path
 import sys
 from types import ModuleType
 
+import numpy as np
 import pytest
 
 from app.core.dataset_manifest import sha256_file
 from app.core.inspection_region import InspectionRegionProcessor, inspection_region_hash, write_inspection_region
+from app.core.preprocessing_pipeline import PreprocessingPipeline
 from app.models.inspection_region import InspectionRegionConfig
 from app.core.run_artifacts import CanonicalCheckpoint, write_run_manifest
 from app.core.result_parser import ResultParser
 from app.models.prediction_result import PredictionResult
 from app.models.training_config import TrainingConfig
+from app.models.preprocessing_config import PreprocessingConfig
 from app.models.training_run import TrainingRun
 from app.services.export_service import DEPLOYMENT_CONTRACT_VERSION, FORMAT_SCORE_TOLERANCES, ExportService, ModelExportFormat
 
@@ -276,3 +279,57 @@ def test_deployment_validation_rejects_excessive_score_difference(monkeypatch) -
             threshold=0.5,
             score_tolerance=0.01,
         )
+
+
+def test_deployment_validation_uses_the_same_preprocessing_v2_valid_geometry(tmp_path: Path, monkeypatch) -> None:
+    received_images: list[object] = []
+
+    class FakeTorchInferencer:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def predict(self, image: object) -> dict[str, object]:
+            received_images.append(image)
+            anomaly_map = np.zeros((192, 640), dtype=np.float32)
+            anomaly_map[176, 638] = 0.7
+            anomaly_map[191, 639] = 1.0
+            return {"pred_score": 1.0, "anomaly_map": anomaly_map}
+
+    anomalib_deploy = ModuleType("anomalib.deploy")
+    anomalib_deploy.TorchInferencer = FakeTorchInferencer
+    monkeypatch.setitem(sys.modules, "anomalib.deploy", anomalib_deploy)
+    source_path = tmp_path / "final_test_ok.png"
+    from PIL import Image
+
+    Image.new("RGB", (639, 177), (20, 30, 40)).save(source_path)
+    pipeline = PreprocessingPipeline(
+        InspectionRegionConfig(),
+        PreprocessingConfig().resolve("patchcore", (639, 177)),
+    )
+    expected = PredictionResult(
+        source_path=str(source_path),
+        predicted_label="NG",
+        ground_truth_label="OK",
+        anomaly_score=0.7,
+        threshold=0.6,
+        dataset_role="final_test_ok",
+    )
+
+    report = ExportService._validate_deployment(
+        Path("model.pt"),
+        "torch",
+        [expected],
+        threshold=0.6,
+        preprocessing_pipeline=pipeline,
+    )
+
+    assert report["status"] == "PASS"
+    assert len(received_images) == 1
+    assert getattr(received_images[0], "shape") == (192, 640, 3)
+
+
+def test_export_rejects_models_without_a_validated_deployment_format(tmp_path: Path) -> None:
+    (tmp_path / "config.json").write_text(json.dumps(TrainingConfig(model_name="anomaly_dino").to_dict()), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="export is unavailable"):
+        ExportService().export_model(tmp_path, tmp_path / "exports", [ModelExportFormat.TORCH])

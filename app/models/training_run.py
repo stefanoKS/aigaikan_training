@@ -33,6 +33,10 @@ class TrainingRun:
     calibration_manifest_sha256: str = ""
     final_test_manifest_sha256: str = ""
     inspection_region_hash: str = ""
+    preprocessing_hash: str = ""
+    preprocessing_contract_version: int = 0
+    preprocessing_model_input: str = ""
+    score_aggregation: str = ""
     roi_contract_version: int = 0
     rectified_roi_width: int = 0
     rectified_roi_height: int = 0

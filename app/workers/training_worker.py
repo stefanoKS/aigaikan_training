@@ -16,13 +16,16 @@ from app.core.dataset_manifest import build_dataset_manifest, build_effective_sp
 from app.core.dataset_validator import DatasetValidator
 from app.core.inspection_region import inspection_region_hash, validate_inspection_region_sources, write_inspection_region
 from app.core.model_registry import ModelExecutionMode
-from app.core.prediction_adapter import iter_anomalib_predictions
+from app.core.prediction_adapter import iter_anomalib_predictions, iter_preprocessed_predictions
+from app.core.preprocessing_contract import preprocessing_hash, resolved_preprocessing_hash, write_resolved_preprocessing_plan
+from app.core.preprocessing_pipeline import PreprocessingPipeline, resolve_preprocessing_plan
 from app.core.project_manager import ProjectManager
 from app.core.quality_metrics import FinalTestAcceptancePolicy, calculate_quality_metrics
 from app.core.result_parser import ResultParser
 from app.core.run_artifacts import resolve_canonical_checkpoint, write_evaluation_revision, write_run_manifest
 from app.core.threshold_calibrator import CalibrationSample, ThresholdCalibrationConfig, ThresholdCalibrator
 from app.models.prediction_result import PredictionResult
+from app.models.preprocessing_config import PreprocessingTile
 from app.models.project_config import ProjectConfig
 from app.models.training_run import TrainingRun
 from app.services.anomalib_service import AnomalibService
@@ -140,9 +143,29 @@ def emit(message: dict[str, object]) -> None:
 def calibration_samples_from_predictions(
     output: Any,
     source_path_by_staged_path: dict[Path, Path],
+    preprocessing_pipeline: PreprocessingPipeline | None = None,
+    preprocessing_tile_by_staged_path: dict[Path, PreprocessingTile] | None = None,
 ) -> list[CalibrationSample]:
     """Convert only held-out calibration predictions into evidence for threshold selection."""
     samples: list[CalibrationSample] = []
+    if preprocessing_pipeline is not None:
+        if preprocessing_tile_by_staged_path is None:
+            raise ValueError("Preprocessing-v2 calibration requires staged tile provenance.")
+        for prediction in iter_preprocessed_predictions(
+            output,
+            source_path_by_staged_path,
+            preprocessing_tile_by_staged_path,
+            preprocessing_pipeline,
+        ):
+            role = prediction.staged_paths[0].parent.name
+            if role == "validation_ok":
+                label = "OK"
+            elif role == "validation_ng":
+                label = "NG"
+            else:
+                raise ValueError(f"Calibration prediction path has an unexpected staged role: {prediction.staged_paths[0]}")
+            samples.append(CalibrationSample(score=prediction.score, label=label))
+        return samples
     for prediction in iter_anomalib_predictions(output):
         if prediction.image_path not in source_path_by_staged_path:
             raise ValueError(f"Calibration prediction path is not part of the staged dataset: {prediction.image_path}")
@@ -161,9 +184,39 @@ def _final_test_predictions(
     output: Any,
     source_path_by_staged_path: dict[Path, Path],
     threshold: float,
+    preprocessing_pipeline: PreprocessingPipeline | None = None,
+    preprocessing_tile_by_staged_path: dict[Path, PreprocessingTile] | None = None,
 ) -> list[PredictionResult]:
     """Build final-test rows using the application-calibrated deployment threshold."""
     predictions: list[PredictionResult] = []
+    if preprocessing_pipeline is not None:
+        if preprocessing_tile_by_staged_path is None:
+            raise ValueError("Preprocessing-v2 final testing requires staged tile provenance.")
+        for prediction in iter_preprocessed_predictions(
+            output,
+            source_path_by_staged_path,
+            preprocessing_tile_by_staged_path,
+            preprocessing_pipeline,
+        ):
+            role = prediction.staged_paths[0].parent.name
+            if role == "final_test_ok":
+                ground_truth = "OK"
+            elif role == "final_test_ng":
+                ground_truth = "NG"
+            else:
+                raise ValueError(f"Final-test prediction path has an unexpected staged role: {prediction.staged_paths[0]}")
+            predictions.append(
+                PredictionResult(
+                    source_path=str(prediction.source_path),
+                    predicted_label="NG" if prediction.score >= threshold else "OK",
+                    ground_truth_label=ground_truth,
+                    anomaly_score=prediction.score,
+                    threshold=threshold,
+                    original_image=str(prediction.source_path),
+                    dataset_role=role,
+                )
+            )
+        return predictions
     for anomalib_prediction in iter_anomalib_predictions(output):
         staged_path = anomalib_prediction.image_path
         source_path = source_path_by_staged_path.get(staged_path)
@@ -190,7 +243,12 @@ def _final_test_predictions(
     return predictions
 
 
-def _model_provenance(definition: Any, config: Any, model: Any) -> dict[str, object]:
+def _model_provenance(
+    definition: Any,
+    config: Any,
+    model: Any,
+    preprocessing_plan: Any | None = None,
+) -> dict[str, object]:
     """Describe model identity and encoder provenance without conflating DINO families."""
     payload: dict[str, object] = {
         "algorithm": definition.algorithm or definition.anomalib_class_name or definition.display_name,
@@ -203,6 +261,8 @@ def _model_provenance(definition: Any, config: Any, model: Any) -> dict[str, obj
         payload["encoder"] = {"family": "DINOv2", "name": config.dinomaly_encoder_name}
     elif definition.key == "dinomaly_dinov3":
         payload["encoder"] = {"family": "DINOv3", "name": config.dinomaly_encoder_name}
+    if preprocessing_plan is not None:
+        payload["preprocessing_v2"] = preprocessing_plan.to_dict()
     return payload
 
 
@@ -268,6 +328,16 @@ def run(project_file: Path) -> int:
             project.inspection_region,
             (path for paths in effective_split.roles().values() for path in paths),
         )
+        preprocessing_plan = resolve_preprocessing_plan(
+            project.preprocessing,
+            project.inspection_region,
+            project.training.model_name,
+            (path for paths in effective_split.roles().values() for path in paths),
+        )
+        preprocessing_pipeline = PreprocessingPipeline(project.inspection_region, preprocessing_plan)
+        preprocessing_plan_hash = resolved_preprocessing_hash(preprocessing_plan)
+        project_preprocessing_hash = preprocessing_hash(project.preprocessing)
+        write_resolved_preprocessing_plan(run_dir / "preprocessing_plan.json", preprocessing_plan)
         roi_hash = inspection_region_hash(project.inspection_region)
         rectified_width, rectified_height = project.inspection_region.rectified_size()
         write_inspection_region(run_dir / "inspection_region.json", project.inspection_region)
@@ -290,7 +360,12 @@ def run(project_file: Path) -> int:
             Path(project.project_path),
         )
         write_dataset_manifest(run_dir / "final_test_manifest.json", final_test_manifest)
-        staged_dataset = stage_effective_split(effective_split, project.dataset, run_dir / "dataset_snapshot")
+        staged_dataset = stage_effective_split(
+            effective_split,
+            project.dataset,
+            run_dir / "dataset_snapshot",
+            preprocessing_pipeline,
+        )
         environment = collect_environment_info(Path(project.project_path), project.training.random_seed)
         (run_dir / "environment.json").write_text(json.dumps(environment, indent=2), encoding="utf-8")
         (run_dir / "config.json").write_text(json.dumps(project.training.to_dict(), indent=2), encoding="utf-8")
@@ -311,6 +386,7 @@ def run(project_file: Path) -> int:
             callbacks=[progress_callback],
             calibration_mode=True,
             inspection_region=project.inspection_region,
+            preprocessing_plan=preprocessing_plan,
         )
         device_note = str(components["device_note"])
         if device_note:
@@ -350,6 +426,8 @@ def run(project_file: Path) -> int:
         calibration_samples = calibration_samples_from_predictions(
             calibration_predictions_output,
             staged_dataset.source_path_by_staged_path,
+            preprocessing_pipeline,
+            staged_dataset.preprocessing_tile_by_staged_path,
         )
         expected_calibration_count = sum(effective_split.counts()["validation"].values())
         if len(calibration_samples) != expected_calibration_count:
@@ -387,6 +465,7 @@ def run(project_file: Path) -> int:
             project.training,
             calibration_mode=False,
             inspection_region=project.inspection_region,
+            preprocessing_plan=preprocessing_plan,
         )
         _reset_gpu_peak_memory(str(components["device"]))
         emit({"type": "stage", "name": STAGES[6]})
@@ -401,6 +480,8 @@ def run(project_file: Path) -> int:
             final_predictions_output,
             staged_dataset.source_path_by_staged_path,
             decision_threshold,
+            preprocessing_pipeline,
+            staged_dataset.preprocessing_tile_by_staged_path,
         )
         expected_prediction_count = sum(effective_split.counts()["final_test"].values())
         if len(predictions) != expected_prediction_count:
@@ -458,6 +539,10 @@ def run(project_file: Path) -> int:
         run_metrics["Threshold Revision"] = revision_path.stem
         run_metrics["Inspection Region SHA-256"] = roi_hash
         run_metrics["Inspection ROI Rectified Size"] = f"{rectified_width}x{rectified_height}"
+        run_metrics["Preprocessing SHA-256"] = preprocessing_plan_hash
+        run_metrics["Preprocessing Model Input"] = f"{preprocessing_plan.model_input_size[0]}x{preprocessing_plan.model_input_size[1]}"
+        run_metrics["Preprocessing Tile Count"] = len(preprocessing_plan.tiles)
+        run_metrics["Score Aggregation"] = preprocessing_plan.score_aggregation.value
         result_parser.write_training_run(
             run_dir / "results.json",
             TrainingRun(
@@ -474,6 +559,12 @@ def run(project_file: Path) -> int:
                 calibration_manifest_sha256=str(calibration_manifest["manifest_sha256"]),
                 final_test_manifest_sha256=str(final_test_manifest["manifest_sha256"]),
                 inspection_region_hash=roi_hash,
+                preprocessing_hash=preprocessing_plan_hash,
+                preprocessing_contract_version=preprocessing_plan.preprocessing_contract_version,
+                preprocessing_model_input=(
+                    f"{preprocessing_plan.model_input_size[0]}x{preprocessing_plan.model_input_size[1]}"
+                ),
+                score_aggregation=preprocessing_plan.score_aggregation.value,
                 roi_contract_version=project.inspection_region.roi_contract_version,
                 rectified_roi_width=rectified_width,
                 rectified_roi_height=rectified_height,
@@ -496,7 +587,12 @@ def run(project_file: Path) -> int:
             threshold=decision_threshold,
             threshold_metadata=threshold_metadata,
             extra={
-                "model": _model_provenance(definition, project.training, components["model"]),
+                "model": _model_provenance(
+                    definition,
+                    project.training,
+                    components["model"],
+                    preprocessing_plan,
+                ),
                 "config_path": str(run_dir / "config.json"),
                 "environment_path": str(run_dir / "environment.json"),
                 "calibration_manifest_path": str(run_dir / "calibration_manifest.json"),
@@ -514,6 +610,16 @@ def run(project_file: Path) -> int:
                     "metadata_sha256": roi_hash,
                     "source_size": [project.inspection_region.source_width, project.inspection_region.source_height],
                     "rectified_size": [rectified_width, rectified_height],
+                },
+                "preprocessing_contract": {
+                    "preprocessing_contract_version": preprocessing_plan.preprocessing_contract_version,
+                    "metadata_file": "preprocessing_plan.json",
+                    "metadata_sha256": preprocessing_plan_hash,
+                    "project_policy_sha256": project_preprocessing_hash,
+                    "model_id": preprocessing_plan.model_id,
+                    "model_input_size": list(preprocessing_plan.model_input_size),
+                    "score_aggregation": preprocessing_plan.score_aggregation.value,
+                    "tiled": preprocessing_plan.tiled,
                 },
                 "quality_status": quality_report.status,
                 "evaluation_method": effective_split.evaluation_method,

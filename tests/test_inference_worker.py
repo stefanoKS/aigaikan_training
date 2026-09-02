@@ -5,13 +5,18 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import sys
+from types import ModuleType
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
+from app.core.preprocessing_contract import resolved_preprocessing_hash, write_resolved_preprocessing_plan
 from app.core.run_artifacts import CanonicalCheckpoint, write_run_manifest
 from app.core.inspection_region import inspection_region_hash, write_inspection_region
 from app.models.inspection_region import InspectionRegionConfig
+from app.models.preprocessing_config import PreprocessingConfig
 from app.models.training_config import TrainingConfig
 from app.workers import inference_worker
 
@@ -169,3 +174,76 @@ def test_enabled_roi_inference_uses_predict_dataset_with_the_saved_processor(tmp
     assert "data_path" not in captured
     assert captured["ckpt_path"] == checkpoint
     assert captured["dataset"].transform.config == roi
+
+
+def test_preprocessing_v2_inference_uses_prepared_geometry_and_reconstructed_source_map(tmp_path: Path, monkeypatch) -> None:
+    run_directory = tmp_path / "run"
+    _write_run(run_directory)
+    plan = PreprocessingConfig().resolve("patchcore", (639, 177))
+    write_resolved_preprocessing_plan(run_directory / "preprocessing_plan.json", plan)
+    manifest_path = run_directory / "run_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["preprocessing_contract"] = {
+        "preprocessing_contract_version": 2,
+        "metadata_file": "preprocessing_plan.json",
+        "metadata_sha256": resolved_preprocessing_hash(plan),
+        "project_policy_sha256": "a" * 64,
+        "model_id": "patchcore",
+        "model_input_size": [640, 192],
+        "score_aggregation": "max",
+        "tiled": False,
+    }
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    source_path = tmp_path / "source.png"
+    from PIL import Image
+
+    Image.new("RGB", (639, 177), (10, 20, 30)).save(source_path)
+    captured: dict[str, object] = {}
+    visualized: list[tuple[object, object]] = []
+
+    class FakePredictDataset:
+        def __init__(self, path: Path) -> None:
+            self.path = Path(path)
+
+    class FakeEngine:
+        def predict(self, **kwargs: object) -> list[dict[str, object]]:
+            captured.update(kwargs)
+            prepared_path = next(captured["dataset"].path.rglob("*.png"))
+            captured["prepared_size"] = Image.open(prepared_path).size
+            anomaly_map = np.zeros((192, 640), dtype=np.float32)
+            anomaly_map[176, 638] = 0.7
+            anomaly_map[191, 639] = 1.0
+            return [{"image_path": [str(prepared_path)], "pred_score": [1.0], "anomaly_map": [anomaly_map]}]
+
+    class FakeService:
+        def create_inference_components(self, _config: object, _output_directory: Path, received_plan: object) -> dict[str, object]:
+            assert received_plan == plan
+            return {
+                "model": object(),
+                "engine": FakeEngine(),
+                "definition": SimpleNamespace(display_name="PatchCore"),
+                "device": "cpu",
+                "device_note": "",
+            }
+
+    anomalib_data = ModuleType("anomalib.data")
+    anomalib_data.PredictDataset = FakePredictDataset
+    monkeypatch.setitem(sys.modules, "anomalib.data", anomalib_data)
+    monkeypatch.setattr(inference_worker, "AnomalibService", FakeService)
+    monkeypatch.setattr(inference_worker, "_discover_images", lambda _path: (source_path.resolve(),))
+    monkeypatch.setattr(
+        inference_worker,
+        "_save_visualizations",
+        lambda _source, anomaly_map, _directory, _index, rectified: visualized.append((anomaly_map, rectified)) or ("", ""),
+    )
+    messages: list[dict[str, object]] = []
+    monkeypatch.setattr(inference_worker, "emit", messages.append)
+
+    assert inference_worker.run(run_directory, source_path) == 0
+
+    assert captured["prepared_size"] == (640, 192)
+    assert visualized[0][0].shape == (177, 639)
+    assert visualized[0][1].shape == (177, 639, 3)
+    prediction = next(message for message in messages if message["type"] == "prediction")
+    assert prediction["anomaly_score"] == pytest.approx(0.7)
+    assert prediction["predicted_label"] == "NG"

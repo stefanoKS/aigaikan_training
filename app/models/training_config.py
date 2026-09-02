@@ -8,6 +8,7 @@ from math import ceil
 from pathlib import Path
 from typing import Any
 
+from app.core.dinomaly_encoder_registry import DinomalyEncoderRegistry
 from app.core.threshold_calibrator import ThresholdCalibrationConfig, ThresholdMethod
 
 
@@ -19,7 +20,18 @@ class DeviceMode(StrEnum):
     CPU = "cpu"
 
 
-_SUPPORTED_MODEL_NAMES = frozenset({"patchcore", "padim", "dinomalydinov2", "dinomalydinov3"})
+_SUPPORTED_MODEL_NAMES = frozenset(
+    {
+        "patchcore",
+        "padim",
+        "dinomalydinov2",
+        "dinomalydinov3",
+        "anomalydino",
+        "superadd",
+        "efficientad",
+        "supersimplenet",
+    }
+)
 
 
 @dataclass(slots=True)
@@ -38,6 +50,7 @@ class TrainingConfig:
     split_seed: int = 42
     num_workers: int = 0
     output_dir: str = ""
+    dinomaly_encoder_id: str = ""
     dinomaly_decoder_depth: int = 8
     dinomaly_bottleneck_dropout: float = 0.2
     dinomaly_context_recentering: bool = False
@@ -95,6 +108,11 @@ class TrainingConfig:
             or self.dinomaly_context_recentering
         ):
             raise ValueError("Dinomaly settings must use the supported stock profile")
+        if self.is_dinomaly:
+            DinomalyEncoderRegistry().validate_for_family(
+                self.dinomaly_encoder_name,
+                "DINOv3" if self.is_dinomaly_dinov3 else "DINOv2",
+            )
         ThresholdCalibrationConfig(
             method=self.threshold_method,
             target_normal_false_reject_rate=self.target_normal_false_reject_rate,
@@ -134,6 +152,8 @@ class TrainingConfig:
     @property
     def dinomaly_encoder_name(self) -> str:
         """Return the explicit stock timm encoder selected by the Dinomaly variant."""
+        if self.dinomaly_encoder_id:
+            return self.dinomaly_encoder_id
         if self.is_dinomaly_dinov3:
             return "vit_base_patch16_dinov3.lvd1689m"
         return "vit_base_patch14_reg4_dinov2"
@@ -155,6 +175,32 @@ class TrainingConfig:
                 "backbone": "resnet18",
                 "layers": ["layer1", "layer2", "layer3"],
                 "max_epochs": 1,
+                "preprocessing": "anomalib-native",
+            }
+        if self._normalized_model_name == "anomalydino":
+            return {
+                "encoder_name": "vit_small_patch14_dinov2",
+                "num_neighbours": 1,
+                "sampling_ratio": 0.1,
+                "preprocessing": "anomalib-native",
+            }
+        if self._normalized_model_name == "superadd":
+            return {
+                "backbone": "vit_huge_plus_patch16_dinov3",
+                "patch_size": 448,
+                "patch_overlap": 16,
+                "preprocessing": "anomalib-native",
+            }
+        if self._normalized_model_name == "efficientad":
+            return {
+                "model_size": "small",
+                "teacher_out_channels": 384,
+                "preprocessing": "anomalib-native",
+            }
+        if self._normalized_model_name == "supersimplenet":
+            return {
+                "backbone": "wide_resnet50_2.tv_in1k",
+                "layers": ["layer2", "layer3"],
                 "preprocessing": "anomalib-native",
             }
         profile: dict[str, object] = {
@@ -256,6 +302,9 @@ class TrainingConfig:
             split_seed=int(payload.get("split_seed", payload.get("random_seed", 42))),
             num_workers=int(payload.get("num_workers", 0)),
             output_dir=payload.get("output_dir", ""),
+            dinomaly_encoder_id=_curated_dinomaly_encoder_id(
+                payload.get("dinomaly_encoder_id", payload.get("dinomaly_encoder", ""))
+            ),
             dinomaly_decoder_depth=8,
             dinomaly_bottleneck_dropout=0.2,
             dinomaly_context_recentering=False,
@@ -270,3 +319,13 @@ class TrainingConfig:
             minimum_final_test_ok_images=int(payload.get("minimum_final_test_ok_images", 10)),
             minimum_final_test_ng_images=int(payload.get("minimum_final_test_ng_images", 10)),
         )
+
+
+def _curated_dinomaly_encoder_id(value: object) -> str:
+    """Retain only persisted identifiers that remain in the curated encoder catalog."""
+    identifier = str(value)
+    try:
+        DinomalyEncoderRegistry().get(identifier)
+    except ValueError:
+        return ""
+    return identifier

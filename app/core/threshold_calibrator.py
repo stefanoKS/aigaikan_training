@@ -139,20 +139,23 @@ class ThresholdCalibrator:
         candidates = [self._labeled_metrics(normal_scores, abnormal_scores, threshold) for threshold in sorted(set(
             [*normal_scores, *abnormal_scores]
         ))]
-        selected = max(
-            candidates,
+        eligible_candidates = (
+            [candidate for candidate in candidates if candidate["recall"] >= minimum_required_ng_recall]
+            if minimum_required_ng_recall is not None
+            else candidates
+        )
+        if not eligible_candidates:
+            raise ValueError(
+                f"No threshold reaches the required NG recall of {minimum_required_ng_recall:.6g}."
+            )
+        selected = min(
+            eligible_candidates,
             key=lambda candidate: (
-                candidate["recall"],
-                candidate["precision"],
-                -candidate["false_reject_count"],
-                candidate["threshold"],
+                candidate["false_reject_count"],
+                -float(candidate["precision"]),
+                -float(candidate["threshold"]),
             ),
         )
-        if minimum_required_ng_recall is not None and selected["recall"] < minimum_required_ng_recall:
-            raise ValueError(
-                f"The selected threshold reaches NG recall {selected['recall']:.6g}, below the required "
-                f"{minimum_required_ng_recall:.6g}."
-            )
         return self._labeled_result(ThresholdMethod.LABELED_RECALL_PRIORITY, normal_scores, abnormal_scores, selected)
 
     @staticmethod

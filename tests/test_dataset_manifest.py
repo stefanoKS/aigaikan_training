@@ -13,7 +13,10 @@ from app.core.dataset_manifest import (
     stage_effective_split,
     validate_effective_split,
 )
+from app.core.preprocessing_pipeline import PreprocessingPipeline
 from app.models.dataset_config import DatasetConfig, DatasetRole
+from app.models.inspection_region import InspectionRegionConfig
+from app.models.preprocessing_config import PreprocessingConfig, TilingConfig
 
 
 def _save_image(path: Path, color: tuple[int, int, int]) -> None:
@@ -131,3 +134,40 @@ def test_normal_only_split_rejects_too_few_images_for_three_disjoint_roles(tmp_p
 
     with pytest.raises(ValueError, match="At least four OK training images"):
         build_effective_split(config, seed=42)
+
+def test_preprocessed_staging_uses_one_tile_geometry_for_every_split(tmp_path: Path) -> None:
+    config = _dataset_config(tmp_path)
+    for index in range(6):
+        _save_image(tmp_path / "ok_train" / f"ok_{index}.png", (index + 10, 0, 0))
+    for index in range(2):
+        _save_image(tmp_path / "ng_test" / f"ng_{index}.png", (0, index + 30, 0))
+    split = build_effective_split(config, seed=42)
+    pipeline = PreprocessingPipeline(
+        InspectionRegionConfig(),
+        PreprocessingConfig().resolve("patchcore", (640, 480)),
+    )
+
+    staged = stage_effective_split(split, config, tmp_path / "run" / "dataset_snapshot", pipeline)
+
+    assert staged.preprocessing_tile_by_staged_path
+    assert all(tile.index == 0 for tile in staged.preprocessing_tile_by_staged_path.values())
+    assert all(Image.open(path).size == (640, 480) for path in staged.source_path_by_staged_path)
+
+
+def test_tiled_staging_retains_every_source_tile_provenance(tmp_path: Path) -> None:
+    config = _dataset_config(tmp_path)
+    for index in range(4):
+        path = tmp_path / "ok_train" / f"ok_{index}.png"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (639, 177), (index + 10, 0, 0)).save(path)
+    roi = InspectionRegionConfig()
+    pipeline = PreprocessingPipeline(
+        roi,
+        PreprocessingConfig(tiling=TilingConfig(enabled=True)).resolve("dinomaly_dinov3", (639, 177)),
+    )
+
+    staged = stage_effective_split(build_effective_split(config, seed=42), config, tmp_path / "run" / "dataset_snapshot", pipeline)
+
+    assert set(tile.index for tile in staged.preprocessing_tile_by_staged_path.values()) == {0, 1, 2}
+    assert len(staged.preprocessing_tile_by_staged_path) == len(staged.source_path_by_staged_path)
+    assert all(Image.open(path).size == (448, 256) for path in staged.source_path_by_staged_path)

@@ -52,7 +52,7 @@ class ModelDefinition:
 
 
 class ModelRegistry:
-    """Registry for the four image-folder configurations supported by this app."""
+    """Registry for image-folder model configurations supported by this app."""
 
     _MODEL_DEFINITIONS = (
         ModelDefinition(
@@ -89,6 +89,48 @@ class ModelRegistry:
             encoder_family="DINOv3",
             requirement="Stock Anomalib 2.6.0 Dinomaly with a DINOv3 timm encoder.",
             support_level=ModelSupportLevel.PRODUCTION_VALIDATED,
+        ),
+        ModelDefinition(
+            "anomaly_dino",
+            "AnomalyDINO",
+            "AnomalyDINO",
+            algorithm="AnomalyDINO",
+            model_variant="anomaly_dino",
+            encoder_family="DINOv2",
+            requirement="Export formats remain unavailable until deployment parity validation is completed.",
+            supports_export=False,
+            support_level=ModelSupportLevel.SUPPORTED,
+        ),
+        ModelDefinition(
+            "super_add",
+            "SuperADD",
+            "SuperADD",
+            algorithm="SuperADD",
+            model_variant="super_add",
+            encoder_family="DINOv3",
+            requirement="Export formats remain unavailable until deployment parity validation is completed.",
+            supports_export=False,
+            support_level=ModelSupportLevel.SUPPORTED,
+        ),
+        ModelDefinition(
+            "efficient_ad",
+            "EfficientAD",
+            "EfficientAd",
+            algorithm="EfficientAD",
+            model_variant="efficient_ad",
+            requirement="Requires Anomalib's ImageNette reference data. Export formats remain unavailable pending parity validation.",
+            supports_export=False,
+            support_level=ModelSupportLevel.SUPPORTED,
+        ),
+        ModelDefinition(
+            "supersimplenet",
+            "SuperSimpleNet",
+            "Supersimplenet",
+            algorithm="SuperSimpleNet",
+            model_variant="supersimplenet",
+            requirement="Export formats remain unavailable until deployment parity validation is completed.",
+            supports_export=False,
+            support_level=ModelSupportLevel.SUPPORTED,
         ),
     )
 

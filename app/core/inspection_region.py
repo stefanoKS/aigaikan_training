@@ -38,6 +38,14 @@ class InspectionRegionProcessor(Transform):
             return self._apply_tensor(image, cv2.INTER_NEAREST if isinstance(image, Mask) else cv2.INTER_LINEAR)
         raise TypeError(f"Inspection ROI cannot process image type {type(image)!r}.")
 
+    def apply_mask(self, mask: np.ndarray) -> np.ndarray:
+        """Apply the configured transform to a NumPy mask without interpolating its labels."""
+        if mask.ndim != 2:
+            raise ValueError("Inspection ROI mask input must have HW dimensions.")
+        if not self.config.enabled:
+            return mask
+        return self._warp_array(mask, cv2.INTER_NEAREST)
+
     def transform(self, inpt: Any, params: dict[str, Any]) -> Any:
         """Apply the ROI through Anomalib's Torchvision transform pipeline."""
         return self.apply(inpt)

@@ -11,6 +11,7 @@ from tempfile import NamedTemporaryFile, TemporaryDirectory
 from typing import Any
 
 from app.core.inspection_region import read_inspection_region, write_inspection_region
+from app.core.preprocessing_contract import read_preprocessing_config, write_preprocessing_config
 from app.models.project_config import ProjectConfig
 
 LOGGER = logging.getLogger(__name__)
@@ -22,6 +23,7 @@ class ProjectManager:
     PROJECTS_ROOT_NAME = "AnomalibProjects"
     PROJECT_FILE_NAME = "project.json"
     INSPECTION_REGION_FILE_NAME = "inspection_region.json"
+    PREPROCESSING_FILE_NAME = "preprocessing.json"
     REQUIRED_DIRECTORIES = (
         "dataset/ok_train",
         "dataset/ok_validation",
@@ -62,6 +64,9 @@ class ProjectManager:
         inspection_region_path = project.root_path / self.INSPECTION_REGION_FILE_NAME
         if inspection_region_path.is_file():
             project.inspection_region = read_inspection_region(inspection_region_path)
+        preprocessing_path = project.root_path / self.PREPROCESSING_FILE_NAME
+        if preprocessing_path.is_file():
+            project.preprocessing = read_preprocessing_config(preprocessing_path)
         project.mark_opened()
         self.save_project(project)
         LOGGER.info("Loaded project '%s' from %s", project.name, project_file)
@@ -73,6 +78,7 @@ class ProjectManager:
         project_root.mkdir(parents=True, exist_ok=True)
         project_file = project_root / self.PROJECT_FILE_NAME
         write_inspection_region(project_root / self.INSPECTION_REGION_FILE_NAME, project.inspection_region)
+        write_preprocessing_config(project_root / self.PREPROCESSING_FILE_NAME, project.preprocessing)
         payload = project.to_dict()
         self._atomic_write_json(project_file, payload)
         return project_file

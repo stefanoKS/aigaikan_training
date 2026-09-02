@@ -7,12 +7,14 @@ import json
 import random
 import shutil
 from collections.abc import Iterable, Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from PIL import Image
 
+from app.core.preprocessing_pipeline import PreprocessingPipeline
 from app.models.dataset_config import DatasetConfig, DatasetRole, SUPPORTED_IMAGE_EXTENSIONS
+from app.models.preprocessing_config import PreprocessingTile
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +68,16 @@ class StagedDataset:
     training_config: DatasetConfig
     final_test_config: DatasetConfig
     source_path_by_staged_path: dict[Path, Path]
+    preprocessing_tile_by_staged_path: dict[Path, PreprocessingTile] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class _StagedImage:
+    """One staged model input and the original image it represents."""
+
+    source_path: Path
+    staged_path: Path
+    preprocessing_tile: PreprocessingTile | None = None
 
 
 def collect_configured_images(config: DatasetConfig) -> dict[DatasetRole, list[Path]]:
@@ -200,9 +212,16 @@ def write_dataset_manifest(path: Path, manifest: Mapping[str, object]) -> Path:
     return path
 
 
-def stage_effective_split(split: EffectiveSplit, config: DatasetConfig, destination: Path) -> StagedDataset:
-    """Copy a disjoint split into a run-local snapshot for Anomalib's folder API."""
+def stage_effective_split(
+    split: EffectiveSplit,
+    config: DatasetConfig,
+    destination: Path,
+    preprocessing_pipeline: PreprocessingPipeline | None = None,
+) -> StagedDataset:
+    """Stage a disjoint split into model-ready folders without altering source data."""
     destination.mkdir(parents=True, exist_ok=False)
+    if preprocessing_pipeline is not None:
+        return _stage_preprocessed_split(split, config, destination, preprocessing_pipeline)
     mappings: dict[str, dict[Path, Path]] = {}
     for role, paths in split.roles().items():
         mappings[role] = _stage_images(paths, destination / role)
@@ -236,6 +255,64 @@ def stage_effective_split(split: EffectiveSplit, config: DatasetConfig, destinat
         for source_path, staged_path in role_mapping.items()
     }
     return StagedDataset(training_config, final_test_config, source_path_by_staged_path)
+
+
+def _stage_preprocessed_split(
+    split: EffectiveSplit,
+    config: DatasetConfig,
+    destination: Path,
+    preprocessing_pipeline: PreprocessingPipeline,
+) -> StagedDataset:
+    staged_roles = {
+        role: _stage_preprocessed_images(paths, destination / role, preprocessing_pipeline)
+        for role, paths in split.roles().items()
+    }
+    mask_directory = config.folders[DatasetRole.MASKS].resolved_path()
+    calibration_masks = _stage_preprocessed_masks(
+        staged_roles["validation_ng"],
+        mask_directory,
+        destination / "validation_masks",
+        preprocessing_pipeline,
+    )
+    final_masks = _stage_preprocessed_masks(
+        staged_roles["final_test_ng"],
+        mask_directory,
+        destination / "final_test_masks",
+        preprocessing_pipeline,
+    )
+    folder_mappings = {
+        role: {image.source_path: image.staged_path for image in images}
+        for role, images in staged_roles.items()
+    }
+    training_config = _staged_config(
+        training_ok=folder_mappings["training_ok"],
+        evaluation_ok=folder_mappings["validation_ok"],
+        evaluation_ng=folder_mappings["validation_ng"],
+        masks=calibration_masks,
+    )
+    final_test_config = _staged_config(
+        training_ok=folder_mappings["training_ok"],
+        evaluation_ok=folder_mappings["final_test_ok"],
+        evaluation_ng=folder_mappings["final_test_ng"],
+        masks=final_masks,
+    )
+    source_path_by_staged_path = {
+        image.staged_path: image.source_path
+        for images in staged_roles.values()
+        for image in images
+    }
+    preprocessing_tile_by_staged_path = {
+        image.staged_path: image.preprocessing_tile
+        for images in staged_roles.values()
+        for image in images
+        if image.preprocessing_tile is not None
+    }
+    return StagedDataset(
+        training_config,
+        final_test_config,
+        source_path_by_staged_path,
+        preprocessing_tile_by_staged_path,
+    )
 
 
 def sha256_file(path: Path) -> str:
@@ -299,6 +376,55 @@ def _stage_images(paths: Iterable[Path], destination: Path) -> dict[Path, Path]:
         staged_path = destination / f"{index:06d}_{source_path.name}"
         shutil.copy2(source_path, staged_path)
         mapping[source_path] = staged_path
+    return mapping
+
+
+def _stage_preprocessed_images(
+    paths: Iterable[Path],
+    destination: Path,
+    preprocessing_pipeline: PreprocessingPipeline,
+) -> tuple[_StagedImage, ...]:
+    destination.mkdir(parents=True, exist_ok=True)
+    staged: list[_StagedImage] = []
+    for source_index, source_path in enumerate(paths):
+        source_path = source_path.resolve()
+        for prepared in preprocessing_pipeline.prepare_path(source_path):
+            staged_path = (destination / f"{source_index:06d}_tile{prepared.tile.index:02d}_{source_path.stem}.png").resolve()
+            Image.fromarray(prepared.image_rgb, "RGB").save(staged_path)
+            staged.append(_StagedImage(source_path, staged_path, prepared.tile))
+    return tuple(staged)
+
+
+def _stage_preprocessed_masks(
+    staged_ng_images: Iterable[_StagedImage],
+    mask_directory: Path | None,
+    destination: Path,
+    preprocessing_pipeline: PreprocessingPipeline,
+) -> dict[Path, Path]:
+    if mask_directory is None or not mask_directory.is_dir():
+        return {}
+    source_masks = [
+        path.resolve()
+        for path in mask_directory.rglob("*")
+        if path.is_file() and path.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS
+    ]
+    grouped: dict[Path, list[_StagedImage]] = {}
+    for staged_image in staged_ng_images:
+        grouped.setdefault(staged_image.source_path, []).append(staged_image)
+    mapping: dict[Path, Path] = {}
+    for source_path, images in grouped.items():
+        matches = [mask_path for mask_path in source_masks if source_path.stem in mask_path.stem]
+        if len(matches) != 1:
+            continue
+        prepared_masks = preprocessing_pipeline.prepare_mask_path(matches[0])
+        destination.mkdir(parents=True, exist_ok=True)
+        for staged_image in images:
+            tile = staged_image.preprocessing_tile
+            if tile is None:
+                raise ValueError("Preprocessed mask staging requires tile provenance.")
+            staged_mask_path = (destination / staged_image.staged_path.name).resolve()
+            Image.fromarray(prepared_masks[tile.index]).save(staged_mask_path)
+            mapping[matches[0]] = staged_mask_path
     return mapping
 
 

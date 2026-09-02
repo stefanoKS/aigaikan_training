@@ -5,7 +5,7 @@ import pytest
 from app.core.model_registry import ModelRegistry, ModelSupportLevel
 
 
-def test_registry_contains_only_the_supported_production_configurations() -> None:
+def test_registry_preserves_production_models_and_registers_supported_adapters() -> None:
     registry = ModelRegistry()
 
     assert [definition.key for definition in registry.all()] == [
@@ -13,11 +13,19 @@ def test_registry_contains_only_the_supported_production_configurations() -> Non
         "padim",
         "dinomaly_dinov2",
         "dinomaly_dinov3",
+        "anomaly_dino",
+        "super_add",
+        "efficient_ad",
+        "supersimplenet",
     ]
     assert {definition.anomalib_class_name for definition in registry.official_anomalib_models()} == {
         "Patchcore",
         "Padim",
         "Dinomaly",
+        "AnomalyDINO",
+        "SuperADD",
+        "EfficientAd",
+        "Supersimplenet",
     }
     assert [definition.key for definition in registry.production_models()] == [
         "patchcore",
@@ -25,6 +33,7 @@ def test_registry_contains_only_the_supported_production_configurations() -> Non
         "dinomaly_dinov2",
         "dinomaly_dinov3",
     ]
+    assert all(not registry.get(key).supports_export for key in ("anomaly_dino", "super_add", "efficient_ad", "supersimplenet"))
 
 
 def test_dinomaly_variants_have_distinct_encoder_identities_and_share_stock_implementation() -> None:

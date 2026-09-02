@@ -73,6 +73,18 @@ def test_dinomaly_step_override_remains_available() -> None:
     assert config.resolved_dinomaly_training_steps(training_image_count=80) == 7500
 
 
+def test_dinomaly_persists_a_curated_encoder_selection() -> None:
+    config = TrainingConfig(
+        model_name="dinomaly_dinov2",
+        dinomaly_encoder_id="vit_large_patch14_reg4_dinov2",
+    )
+
+    restored = TrainingConfig.from_dict(config.to_dict())
+
+    assert restored.dinomaly_encoder_name == "vit_large_patch14_reg4_dinov2"
+    restored.validate()
+
+
 def test_dinomaly_preprocessing_defaults_match_the_selected_encoder_patch_size() -> None:
     assert TrainingConfig(model_name="dinomaly_dinov2").model_profile()["preprocessing"] == "anomalib-native"
     assert TrainingConfig(model_name="dinomaly_dinov3").model_profile()["preprocessing"] == {

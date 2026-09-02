@@ -40,6 +40,17 @@ def test_recall_priority_preserves_ng_recall_before_false_rejects() -> None:
     assert result.observed_calibration_false_reject_rate == 0.5
 
 
+def test_recall_priority_minimizes_false_rejects_after_meeting_the_ng_recall_target() -> None:
+    result = ThresholdCalibrator().calibrate(
+        _samples((0.15, "OK"), (0.1, "NG"), (0.9, "NG")),
+        ThresholdCalibrationConfig(ThresholdMethod.LABELED_RECALL_PRIORITY, minimum_required_ng_recall=0.5),
+    )
+
+    assert result.threshold_value == 0.9
+    assert result.ng_recall == 0.5
+    assert result.observed_calibration_false_reject_rate == 0.0
+
+
 def test_normal_only_conformal_uses_deterministic_finite_sample_order_statistic() -> None:
     samples = _samples((0.8, "OK"), (0.1, "OK"), (0.5, "OK"), (0.3, "OK"))
     config = ThresholdCalibrationConfig(ThresholdMethod.NORMAL_ONLY_CONFORMAL, target_normal_false_reject_rate=0.5)
