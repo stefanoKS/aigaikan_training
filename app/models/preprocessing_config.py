@@ -6,14 +6,24 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
-PREPROCESSING_CONTRACT_VERSION = 2
-REFERENCE_RECTIFIED_SIZE = (639, 177)
+PREPROCESSING_CONTRACT_VERSION = 3
+LEGACY_PREPROCESSING_CONTRACT_VERSION = 2
+SUPPORTED_PREPROCESSING_CONTRACT_VERSIONS = frozenset(
+    {LEGACY_PREPROCESSING_CONTRACT_VERSION, PREPROCESSING_CONTRACT_VERSION}
+)
 
 
 class PaddingMode(StrEnum):
     """Supported deterministic padding policies."""
 
     CONSTANT = "constant"
+
+
+class PaddingPolicy(StrEnum):
+    """How right/bottom canvas padding is resolved for a new run."""
+
+    AUTOMATIC = "automatic"
+    CUSTOM = "custom"
 
 
 class ScoreAggregation(StrEnum):
@@ -29,14 +39,16 @@ class TilingConfig:
 
     enabled: bool = False
     tile_width: int = 320
-    tile_height: int = 177
+    tile_height: int = 0
     overlap_x: int = 160
     final_tile_alignment: str = "end"
 
     def validate(self) -> None:
         """Reject ambiguous or unsupported tile layouts."""
-        if self.tile_width < 2 or self.tile_height < 2:
-            raise ValueError("Tile dimensions must both be at least two pixels.")
+        if self.tile_width < 2:
+            raise ValueError("Tile width must be at least two pixels.")
+        if self.tile_height != 0 and self.tile_height < 2:
+            raise ValueError("Tile height must be automatic or at least two pixels.")
         if not 0 <= self.overlap_x < self.tile_width:
             raise ValueError("Tile horizontal overlap must be non-negative and smaller than tile width.")
         if self.final_tile_alignment != "end":
@@ -62,7 +74,7 @@ class TilingConfig:
         result = cls(
             enabled=bool(payload.get("enabled", False)),
             tile_width=int(payload.get("tile_width", 320)),
-            tile_height=int(payload.get("tile_height", 177)),
+            tile_height=int(payload.get("tile_height", 0)),
             overlap_x=int(payload.get("overlap_x", 160)),
             final_tile_alignment=str(payload.get("final_tile_alignment", "end")),
         )
@@ -76,7 +88,10 @@ class PreprocessingConfig:
 
     preprocessing_contract_version: int = PREPROCESSING_CONTRACT_VERSION
     padding_mode: PaddingMode = PaddingMode.CONSTANT
+    padding_policy: PaddingPolicy = PaddingPolicy.AUTOMATIC
     padding_value_rgb: tuple[int, int, int] = (0, 0, 0)
+    custom_padding_right: int = 0
+    custom_padding_bottom: int = 0
     tiling: TilingConfig = field(default_factory=TilingConfig)
     score_aggregation: ScoreAggregation = ScoreAggregation.MAX
     top_k_fraction: float = 0.01
@@ -84,12 +99,19 @@ class PreprocessingConfig:
 
     def validate(self) -> None:
         """Validate the project-owned behavior before it becomes a run contract."""
-        if self.preprocessing_contract_version != PREPROCESSING_CONTRACT_VERSION:
+        if self.preprocessing_contract_version not in SUPPORTED_PREPROCESSING_CONTRACT_VERSIONS:
             raise ValueError(f"Unsupported preprocessing contract version: {self.preprocessing_contract_version}")
         if self.padding_mode is not PaddingMode.CONSTANT:
             raise ValueError(f"Unsupported padding mode: {self.padding_mode}")
         if len(self.padding_value_rgb) != 3 or any(not 0 <= value <= 255 for value in self.padding_value_rgb):
             raise ValueError("Padding RGB values must be integers between zero and 255.")
+        if self.custom_padding_right < 0 or self.custom_padding_bottom < 0:
+            raise ValueError("Custom right and bottom padding cannot be negative.")
+        if (
+            self.preprocessing_contract_version == LEGACY_PREPROCESSING_CONTRACT_VERSION
+            and self.padding_policy is not PaddingPolicy.AUTOMATIC
+        ):
+            raise ValueError("Legacy preprocessing-v2 supports only its saved automatic padding behavior.")
         self.tiling.validate()
         if not 0 < self.top_k_fraction <= 1:
             raise ValueError("Top-k score fraction must be greater than zero and at most one.")
@@ -99,7 +121,7 @@ class PreprocessingConfig:
     def to_dict(self) -> dict[str, object]:
         """Serialize the stable project-level v2 preprocessing policy."""
         self.validate()
-        return {
+        payload: dict[str, object] = {
             "preprocessing_contract_version": self.preprocessing_contract_version,
             "padding_mode": self.padding_mode.value,
             "padding_value_rgb": list(self.padding_value_rgb),
@@ -108,6 +130,15 @@ class PreprocessingConfig:
             "top_k_fraction": self.top_k_fraction,
             "aspect_ratio_tolerance": self.aspect_ratio_tolerance,
         }
+        if self.preprocessing_contract_version >= PREPROCESSING_CONTRACT_VERSION:
+            payload.update(
+                {
+                    "padding_policy": self.padding_policy.value,
+                    "custom_padding_right": self.custom_padding_right,
+                    "custom_padding_bottom": self.custom_padding_bottom,
+                }
+            )
+        return payload
 
     @classmethod
     def from_dict(cls, payload: object) -> "PreprocessingConfig":
@@ -117,12 +148,18 @@ class PreprocessingConfig:
         raw_padding = payload.get("padding_value_rgb", (0, 0, 0))
         if not isinstance(raw_padding, (list, tuple)) or len(raw_padding) != 3:
             raise ValueError("Padding RGB value must contain exactly three components.")
+        contract_version = int(payload.get("preprocessing_contract_version", LEGACY_PREPROCESSING_CONTRACT_VERSION))
         result = cls(
-            preprocessing_contract_version=int(
-                payload.get("preprocessing_contract_version", PREPROCESSING_CONTRACT_VERSION)
-            ),
+            preprocessing_contract_version=contract_version,
             padding_mode=PaddingMode(payload.get("padding_mode", PaddingMode.CONSTANT.value)),
+            padding_policy=PaddingPolicy(
+                payload.get("padding_policy", PaddingPolicy.AUTOMATIC.value)
+                if contract_version >= PREPROCESSING_CONTRACT_VERSION
+                else PaddingPolicy.AUTOMATIC.value
+            ),
             padding_value_rgb=tuple(int(value) for value in raw_padding),
+            custom_padding_right=int(payload.get("custom_padding_right", 0)),
+            custom_padding_bottom=int(payload.get("custom_padding_bottom", 0)),
             tiling=TilingConfig.from_dict(payload.get("tiling")),
             score_aggregation=ScoreAggregation(payload.get("score_aggregation", ScoreAggregation.MAX.value)),
             top_k_fraction=float(payload.get("top_k_fraction", 0.01)),
@@ -138,6 +175,10 @@ class PreprocessingConfig:
         if width < 2 or height < 2:
             raise ValueError("Rectified ROI dimensions must both be at least two pixels.")
         profile = _model_profile(model_id)
+        if self.preprocessing_contract_version == LEGACY_PREPROCESSING_CONTRACT_VERSION:
+            if self.tiling.enabled:
+                return _resolve_legacy_tiled_plan(self, profile, width, height)
+            return _resolve_legacy_full_roi_plan(self, profile, width, height)
         if self.tiling.enabled:
             return _resolve_tiled_plan(self, profile, width, height)
         return _resolve_full_roi_plan(self, profile, width, height)
@@ -199,6 +240,10 @@ class ResolvedPreprocessingPlan:
     rectified_size: tuple[int, int]
     padding_mode: PaddingMode
     padding_value_rgb: tuple[int, int, int]
+    padding_policy: PaddingPolicy
+    resolved_padding: tuple[int, int, int, int]
+    model_alignment: tuple[int, int]
+    minimum_model_input_size: tuple[int, int]
     score_aggregation: ScoreAggregation
     top_k_fraction: float
     aspect_ratio_tolerance: float
@@ -219,7 +264,7 @@ class ResolvedPreprocessingPlan:
 
     def validate(self) -> None:
         """Validate reconstructed run metadata before it controls image geometry."""
-        if self.preprocessing_contract_version != PREPROCESSING_CONTRACT_VERSION:
+        if self.preprocessing_contract_version not in SUPPORTED_PREPROCESSING_CONTRACT_VERSIONS:
             raise ValueError(f"Unsupported preprocessing contract version: {self.preprocessing_contract_version}")
         if self.patch_size < 1:
             raise ValueError("Patch size must be positive.")
@@ -234,6 +279,12 @@ class ResolvedPreprocessingPlan:
         input_size = self.model_input_size
         if input_size[0] % self.patch_size or input_size[1] % self.patch_size:
             raise ValueError("Model input dimensions must be divisible by the selected patch size.")
+        if len(self.model_alignment) != 2 or any(value < 1 for value in self.model_alignment):
+            raise ValueError("Preprocessing model alignment must contain two positive dimensions.")
+        if len(self.minimum_model_input_size) != 2 or any(value < 0 for value in self.minimum_model_input_size):
+            raise ValueError("Preprocessing minimum model input size is invalid.")
+        if len(self.resolved_padding) != 4 or any(value < 0 for value in self.resolved_padding):
+            raise ValueError("Preprocessing resolved padding is invalid.")
         for tile in self.tiles:
             x, y, tile_width, tile_height = tile.rectified_box
             valid_x, valid_y, valid_width, valid_height = tile.valid_box
@@ -249,7 +300,7 @@ class ResolvedPreprocessingPlan:
     def to_dict(self) -> dict[str, object]:
         """Serialize the complete model-ready processing plan."""
         self.validate()
-        return {
+        payload: dict[str, object] = {
             "preprocessing_contract_version": self.preprocessing_contract_version,
             "model_id": self.model_id,
             "patch_size": self.patch_size,
@@ -261,6 +312,18 @@ class ResolvedPreprocessingPlan:
             "aspect_ratio_tolerance": self.aspect_ratio_tolerance,
             "tiles": [tile.to_dict() for tile in self.tiles],
         }
+        if self.preprocessing_contract_version >= PREPROCESSING_CONTRACT_VERSION:
+            payload.update(
+                {
+                    "padding_policy": self.padding_policy.value,
+                    "resolved_padding": list(self.resolved_padding),
+                    "prepared_canvas_size": list(self.model_input_size),
+                    "model_alignment": list(self.model_alignment),
+                    "minimum_model_input_size": list(self.minimum_model_input_size),
+                    "valid_content_rect": [0, 0, *self.rectified_size],
+                }
+            )
+        return payload
 
     @classmethod
     def from_dict(cls, payload: object) -> "ResolvedPreprocessingPlan":
@@ -271,17 +334,42 @@ class ResolvedPreprocessingPlan:
         raw_tiles = payload.get("tiles")
         if not isinstance(raw_padding, (list, tuple)) or not isinstance(raw_tiles, list):
             raise ValueError("Resolved preprocessing plan has invalid padding or tile data.")
+        contract_version = int(payload.get("preprocessing_contract_version", -1))
+        rectified_size = _int_tuple(payload.get("rectified_size"), 2, "rectified_size")
+        tiles = tuple(PreprocessingTile.from_dict(tile) for tile in raw_tiles)
+        if contract_version == LEGACY_PREPROCESSING_CONTRACT_VERSION:
+            model_input_size = tiles[0].model_input_size if len(tiles) == 1 else (0, 0)
+            resolved_padding = (
+                0,
+                0,
+                max(model_input_size[0] - rectified_size[0], 0),
+                max(model_input_size[1] - rectified_size[1], 0),
+            )
+            padding_policy = PaddingPolicy.AUTOMATIC
+            model_alignment = (int(payload.get("patch_size", 0)),) * 2
+            minimum_model_input_size = (0, 0)
+        else:
+            padding_policy = PaddingPolicy(payload.get("padding_policy", PaddingPolicy.AUTOMATIC.value))
+            resolved_padding = _int_tuple(payload.get("resolved_padding"), 4, "resolved_padding")
+            model_alignment = _int_tuple(payload.get("model_alignment"), 2, "model_alignment")
+            minimum_model_input_size = _int_tuple(
+                payload.get("minimum_model_input_size"), 2, "minimum_model_input_size"
+            )
         result = cls(
-            preprocessing_contract_version=int(payload.get("preprocessing_contract_version", -1)),
+            preprocessing_contract_version=contract_version,
             model_id=str(payload.get("model_id", "")),
             patch_size=int(payload.get("patch_size", 0)),
-            rectified_size=_int_tuple(payload.get("rectified_size"), 2, "rectified_size"),
+            rectified_size=rectified_size,
             padding_mode=PaddingMode(payload.get("padding_mode", PaddingMode.CONSTANT.value)),
             padding_value_rgb=_int_tuple(raw_padding, 3, "padding_value_rgb"),
+            padding_policy=padding_policy,
+            resolved_padding=resolved_padding,
+            model_alignment=model_alignment,
+            minimum_model_input_size=minimum_model_input_size,
             score_aggregation=ScoreAggregation(payload.get("score_aggregation", ScoreAggregation.MAX.value)),
             top_k_fraction=float(payload.get("top_k_fraction", 0.01)),
             aspect_ratio_tolerance=float(payload.get("aspect_ratio_tolerance", 0.005)),
-            tiles=tuple(PreprocessingTile.from_dict(tile) for tile in raw_tiles),
+            tiles=tiles,
         )
         result.validate()
         return result
@@ -291,24 +379,25 @@ class ResolvedPreprocessingPlan:
 class _ModelPreprocessingProfile:
     model_id: str
     patch_size: int
-    minimum_full_size: tuple[int, int]
-    tiled_model_input_size: tuple[int, int] | None
+    minimum_model_input_size: tuple[int, int]
+    legacy_minimum_full_size: tuple[int, int]
+    legacy_tiled_model_input_size: tuple[int, int] | None
 
 
 def _model_profile(model_id: str) -> _ModelPreprocessingProfile:
     normalized = "".join(character for character in model_id.casefold() if character.isalnum())
     if normalized == "dinomalydinov3":
-        return _ModelPreprocessingProfile("dinomaly_dinov3", 16, (640, 192), (448, 256))
+        return _ModelPreprocessingProfile("dinomaly_dinov3", 16, (0, 0), (640, 192), (448, 256))
     if normalized in {"dinomalydinov2", "anomalydino"}:
         canonical = "anomaly_dino" if normalized == "anomalydino" else "dinomaly_dinov2"
-        return _ModelPreprocessingProfile(canonical, 14, (644, 182), (448, 252))
+        return _ModelPreprocessingProfile(canonical, 14, (0, 0), (644, 182), (448, 252))
     if normalized == "superadd":
-        return _ModelPreprocessingProfile("super_add", 16, (640, 448), None)
+        return _ModelPreprocessingProfile("super_add", 16, (448, 448), (640, 448), None)
     if normalized in {"efficientad", "supersimplenet"}:
         canonical = "efficient_ad" if normalized == "efficientad" else "supersimplenet"
-        return _ModelPreprocessingProfile(canonical, 1, (640, 192), None)
+        return _ModelPreprocessingProfile(canonical, 1, (0, 0), (640, 192), None)
     if normalized in {"patchcore", "padim"}:
-        return _ModelPreprocessingProfile(normalized, 1, (640, 192), None)
+        return _ModelPreprocessingProfile(normalized, 1, (0, 0), (640, 192), None)
     raise ValueError(f"No preprocessing v2 profile is registered for model: {model_id}")
 
 
@@ -318,7 +407,7 @@ def _resolve_full_roi_plan(
     width: int,
     height: int,
 ) -> ResolvedPreprocessingPlan:
-    padded_size = _padded_size(width, height, profile.minimum_full_size, profile.patch_size)
+    padded_size = _resolve_padded_size(config, profile, width, height)
     tile = PreprocessingTile(
         index=0,
         rectified_box=(0, 0, width, height),
@@ -336,27 +425,23 @@ def _resolve_tiled_plan(
     height: int,
 ) -> ResolvedPreprocessingPlan:
     tiling = config.tiling
-    if height != tiling.tile_height:
+    tile_height = tiling.tile_height or height
+    if height != tile_height:
         raise ValueError(
             "Tiled preprocessing requires the configured rectified tile height "
-            f"of {tiling.tile_height}, received {height}."
+            f"of {tile_height}, received {height}."
         )
     if width < tiling.tile_width:
         raise ValueError(f"Tiled preprocessing requires a rectified width of at least {tiling.tile_width} pixels.")
-    if profile.tiled_model_input_size is None:
-        raise ValueError(f"Tiled preprocessing is not registered for {profile.model_id}.")
-    padded_size = _padded_size(tiling.tile_width, tiling.tile_height, (0, 0), profile.patch_size)
-    output_size = profile.tiled_model_input_size
-    valid_width = _resized_valid_extent(tiling.tile_width, padded_size[0], output_size[0])
-    valid_height = _resized_valid_extent(tiling.tile_height, padded_size[1], output_size[1])
+    padded_size = _resolve_padded_size(config, profile, tiling.tile_width, tile_height)
     starts = _tile_starts(width, tiling.tile_width, tiling.overlap_x)
     tiles = tuple(
         PreprocessingTile(
             index=index,
-            rectified_box=(start, 0, tiling.tile_width, tiling.tile_height),
+            rectified_box=(start, 0, tiling.tile_width, tile_height),
             padded_size=padded_size,
-            model_input_size=output_size,
-            valid_box=(0, 0, valid_width, valid_height),
+            model_input_size=padded_size,
+            valid_box=(0, 0, tiling.tile_width, tile_height),
         )
         for index, start in enumerate(starts)
     )
@@ -376,6 +461,15 @@ def _plan(
         rectified_size=rectified_size,
         padding_mode=config.padding_mode,
         padding_value_rgb=config.padding_value_rgb,
+        padding_policy=config.padding_policy,
+        resolved_padding=(
+            0,
+            0,
+            max(tiles[0].padded_size[0] - tiles[0].rectified_box[2], 0),
+            max(tiles[0].padded_size[1] - tiles[0].rectified_box[3], 0),
+        ),
+        model_alignment=(profile.patch_size, profile.patch_size),
+        minimum_model_input_size=profile.minimum_model_input_size,
         score_aggregation=config.score_aggregation,
         top_k_fraction=config.top_k_fraction,
         aspect_ratio_tolerance=config.aspect_ratio_tolerance,
@@ -385,9 +479,92 @@ def _plan(
     return result
 
 
+def _resolve_legacy_full_roi_plan(
+    config: PreprocessingConfig,
+    profile: _ModelPreprocessingProfile,
+    width: int,
+    height: int,
+) -> ResolvedPreprocessingPlan:
+    padded_size = _padded_size(width, height, profile.legacy_minimum_full_size, profile.patch_size)
+    tile = PreprocessingTile(
+        index=0,
+        rectified_box=(0, 0, width, height),
+        padded_size=padded_size,
+        model_input_size=padded_size,
+        valid_box=(0, 0, width, height),
+    )
+    return _plan(config, profile, (width, height), (tile,))
+
+
+def _resolve_legacy_tiled_plan(
+    config: PreprocessingConfig,
+    profile: _ModelPreprocessingProfile,
+    width: int,
+    height: int,
+) -> ResolvedPreprocessingPlan:
+    tiling = config.tiling
+    tile_height = tiling.tile_height or 177
+    if height != tile_height:
+        raise ValueError(
+            "Legacy tiled preprocessing requires the configured rectified tile height "
+            f"of {tile_height}, received {height}."
+        )
+    if width < tiling.tile_width:
+        raise ValueError(f"Legacy tiled preprocessing requires a rectified width of at least {tiling.tile_width} pixels.")
+    if profile.legacy_tiled_model_input_size is None:
+        raise ValueError(f"Legacy tiled preprocessing is not registered for {profile.model_id}.")
+    padded_size = _padded_size(tiling.tile_width, tile_height, (0, 0), profile.patch_size)
+    output_size = profile.legacy_tiled_model_input_size
+    valid_width = _resized_valid_extent(tiling.tile_width, padded_size[0], output_size[0])
+    valid_height = _resized_valid_extent(tile_height, padded_size[1], output_size[1])
+    starts = _tile_starts(width, tiling.tile_width, tiling.overlap_x)
+    tiles = tuple(
+        PreprocessingTile(
+            index=index,
+            rectified_box=(start, 0, tiling.tile_width, tile_height),
+            padded_size=padded_size,
+            model_input_size=output_size,
+            valid_box=(0, 0, valid_width, valid_height),
+        )
+        for index, start in enumerate(starts)
+    )
+    return _plan(config, profile, (width, height), tiles)
+
+
 def _padded_size(width: int, height: int, minimum_size: tuple[int, int], patch_size: int) -> tuple[int, int]:
     minimum_width, minimum_height = minimum_size
     return _round_up(max(width, minimum_width), patch_size), _round_up(max(height, minimum_height), patch_size)
+
+
+def _resolve_padded_size(
+    config: PreprocessingConfig,
+    profile: _ModelPreprocessingProfile,
+    width: int,
+    height: int,
+) -> tuple[int, int]:
+    """Resolve automatic or explicit right/bottom padding without changing valid content."""
+    minimum_width, minimum_height = profile.minimum_model_input_size
+    alignment = profile.patch_size
+    automatic_size = (
+        _round_up(max(width, minimum_width), alignment),
+        _round_up(max(height, minimum_height), alignment),
+    )
+    if config.padding_policy is PaddingPolicy.AUTOMATIC:
+        return automatic_size
+    prepared_size = (width + config.custom_padding_right, height + config.custom_padding_bottom)
+    if (
+        prepared_size[0] < minimum_width
+        or prepared_size[1] < minimum_height
+        or prepared_size[0] % alignment
+        or prepared_size[1] % alignment
+    ):
+        raise ValueError(
+            "Custom padding produces an invalid prepared canvas "
+            f"of {prepared_size[0]}x{prepared_size[1]}. "
+            f"Use the nearest valid size {automatic_size[0]}x{automatic_size[1]} "
+            f"for the {profile.model_id} alignment of {alignment}."
+        )
+    return prepared_size
 
 
 def _round_up(value: int, divisor: int) -> int:

@@ -121,6 +121,7 @@ class ResultsPage(QWidget):
             "Defect Detection Evidence",
             "Threshold Method",
             "Threshold Revision",
+            "Pixel Mask Threshold",
             "Calibration Images",
             "Calibration False Reject Target",
             "Calibration False Reject Observed",
@@ -138,9 +139,21 @@ class ResultsPage(QWidget):
         right_layout = QVBoxLayout(right_column)
         self.metrics_table = QTableWidget(0, 2)
         self.metrics_table.setHorizontalHeaderLabels(["Metric", "Value"])
-        self.gallery_table = QTableWidget(0, 7)
+        self.gallery_table = QTableWidget(0, 11)
         self.gallery_table.setHorizontalHeaderLabels(
-            ["Original", "Anomaly Map", "Overlay", "Predicted", "Ground Truth", "Score", "Source Path"]
+            [
+                "Original",
+                "Anomaly Map",
+                "Overlay",
+                "Continuous Map",
+                "Pixel Mask",
+                "Contour Overlay",
+                "Pixel Threshold",
+                "Predicted",
+                "Ground Truth",
+                "Score",
+                "Source Path",
+            ]
         )
         right_layout.addWidget(self.metrics_table, stretch=1)
         right_layout.addWidget(self.gallery_table, stretch=2)
@@ -203,6 +216,7 @@ class ResultsPage(QWidget):
             "Threshold Revision": str(
                 run.threshold_metadata.get("threshold_revision", run.metrics.get("Threshold Revision", "Not available"))
             ),
+            "Pixel Mask Threshold": self._pixel_mask_threshold_text(run.threshold_metadata),
             "Calibration Images": self._format_value(run.metrics.get("Calibration Image Count")),
             "Calibration False Reject Target": self._format_value(
                 run.metrics.get("Calibration Target False Reject Rate")
@@ -254,6 +268,10 @@ class ResultsPage(QWidget):
                 prediction.original_image or prediction.source_path,
                 prediction.anomaly_map,
                 prediction.overlay_image,
+                prediction.continuous_anomaly_map,
+                prediction.binary_mask,
+                prediction.contour_overlay_image,
+                self._format_pixel_threshold(prediction),
                 prediction.predicted_label,
                 prediction.ground_truth_label,
                 f"{prediction.anomaly_score:.6g}",
@@ -291,4 +309,23 @@ class ResultsPage(QWidget):
         hours, remainder = divmod(total_seconds, 3600)
         minutes, remaining_seconds = divmod(remainder, 60)
         return f"{hours:02}:{minutes:02}:{remaining_seconds:02}"
+
+    @staticmethod
+    def _pixel_mask_threshold_text(threshold_metadata: dict[str, object]) -> str:
+        operating_point = threshold_metadata.get("pixel_operating_point")
+        if not isinstance(operating_point, dict):
+            return "Disabled"
+        if not operating_point.get("enabled"):
+            return "Disabled"
+        threshold = operating_point.get("threshold")
+        try:
+            return f"{float(threshold):.6g} (map >= threshold)"
+        except (TypeError, ValueError):
+            return "Invalid"
+
+    @staticmethod
+    def _format_pixel_threshold(prediction: PredictionResult) -> str:
+        if prediction.pixel_threshold is None:
+            return "Not produced"
+        return f"{prediction.pixel_threshold:.6g} (map >= threshold)"
 

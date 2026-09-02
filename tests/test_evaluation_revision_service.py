@@ -13,8 +13,9 @@ from app.core.dataset_manifest import sha256_file
 from app.core.inspection_region import inspection_region_hash, write_inspection_region
 from app.core.preprocessing_contract import resolved_preprocessing_hash, write_resolved_preprocessing_plan
 from app.core.result_parser import ResultParser
+from app.core.threshold_contract import PixelThresholdOperatingPoint
 from app.models.inspection_region import InspectionRegionConfig
-from app.models.preprocessing_config import PreprocessingConfig
+from app.models.preprocessing_config import LEGACY_PREPROCESSING_CONTRACT_VERSION, PreprocessingConfig
 from app.core.run_artifacts import CanonicalCheckpoint, write_run_manifest
 from app.core.threshold_calibrator import ThresholdCalibrationConfig, ThresholdMethod
 from app.models.dataset_config import DatasetConfig, DatasetRole
@@ -40,7 +41,9 @@ class _FakeEngine:
         return {
             "image_path": [str(path.resolve()) for path in paths],
             "pred_score": [0.1 if "ok" in path.name else 0.9 for path in paths],
-            "anomaly_map": [None for path in paths],
+            "anomaly_map": [
+                np.full((4, 6), 0.1 if "ok" in path.name else 0.9, dtype=np.float32) for path in paths
+            ],
         }
 
 
@@ -100,6 +103,7 @@ def test_reevaluation_revises_threshold_without_retraining_the_canonical_model(t
             final_test_ng=tmp_path / "final_ng",
         ),
         ThresholdCalibrationConfig(ThresholdMethod.NORMAL_ONLY_MAX),
+        PixelThresholdOperatingPoint(enabled=True, threshold=0.5),
     )
 
     revision = json.loads(result.revision_path.read_text(encoding="utf-8"))
@@ -108,6 +112,16 @@ def test_reevaluation_revises_threshold_without_retraining_the_canonical_model(t
     assert revision["canonical_checkpoint"]["sha256"] == canonical.sha256
     assert result.quality_report.status == "WARNING"
     assert result.predictions_path.is_file()
+    assert revision["pixel_operating_point"] == PixelThresholdOperatingPoint(enabled=True, threshold=0.5).to_dict()
+    persisted_predictions = ResultParser().read_predictions_csv(result.predictions_path)
+    assert all(prediction.continuous_anomaly_map for prediction in persisted_predictions)
+    assert all(Path(prediction.anomaly_map).is_file() for prediction in persisted_predictions)
+    assert all(prediction.score_semantic for prediction in persisted_predictions)
+    assert all(prediction.pixel_threshold == 0.5 for prediction in persisted_predictions)
+    assert all(Path(prediction.binary_mask).is_file() for prediction in persisted_predictions)
+    assert all(prediction.pixel_threshold_semantic == "continuous_anomaly_map_gte_v1" for prediction in persisted_predictions)
+    assert all(prediction.region_metadata["coordinate_space"] == "source_image" for prediction in persisted_predictions)
+    assert np.load(persisted_predictions[0].continuous_anomaly_map)["anomaly_map"].shape == (4, 6)
 
 
 def test_reevaluation_replays_preprocessing_v2_and_excludes_padding_scores(tmp_path: Path, monkeypatch) -> None:
@@ -117,7 +131,9 @@ def test_reevaluation_replays_preprocessing_v2_and_excludes_padding_scores(tmp_p
     (tmp_path / "config.json").write_text(json.dumps(TrainingConfig().to_dict()), encoding="utf-8")
     inspection_region = InspectionRegionConfig()
     write_inspection_region(tmp_path / "inspection_region.json", inspection_region)
-    plan = PreprocessingConfig().resolve("patchcore", (639, 177))
+    plan = PreprocessingConfig(
+        preprocessing_contract_version=LEGACY_PREPROCESSING_CONTRACT_VERSION
+    ).resolve("patchcore", (639, 177))
     write_resolved_preprocessing_plan(tmp_path / "preprocessing_plan.json", plan)
     write_run_manifest(
         tmp_path / "run_manifest.json",
@@ -206,4 +222,9 @@ def test_reevaluation_replays_preprocessing_v2_and_excludes_padding_scores(tmp_p
     assert sorted(prediction.anomaly_score for prediction in ResultParser().read_predictions_csv(result.predictions_path)) == pytest.approx(
         [0.1, 0.9]
     )
+    persisted_predictions = ResultParser().read_predictions_csv(result.predictions_path)
+    assert all(prediction.continuous_anomaly_map for prediction in persisted_predictions)
+    assert all(prediction.anomaly_map for prediction in persisted_predictions)
+    assert all(prediction.region_metadata["coordinate_space"] == "source_image" for prediction in persisted_predictions)
+    assert np.load(persisted_predictions[0].continuous_anomaly_map)["anomaly_map"].shape == (177, 639)
     assert (tmp_path / "final_ng" / "ng.png").read_bytes() == source_bytes

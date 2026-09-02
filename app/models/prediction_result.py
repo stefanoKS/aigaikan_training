@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 
@@ -19,6 +19,17 @@ class PredictionResult:
     anomaly_map: str = ""
     overlay_image: str = ""
     dataset_role: str = ""
+    native_image_score: float | None = None
+    native_tile_scores: list[float] = field(default_factory=list)
+    score_semantic: str = ""
+    continuous_anomaly_map: str = ""
+    binary_mask: str = ""
+    contour_overlay_image: str = ""
+    pixel_threshold: float | None = None
+    pixel_threshold_comparator: str = ""
+    pixel_threshold_semantic: str = ""
+    map_display_normalization: dict[str, Any] = field(default_factory=dict)
+    region_metadata: dict[str, Any] = field(default_factory=dict)
 
     def classification_bucket(self) -> str:
         """Return the result bucket."""

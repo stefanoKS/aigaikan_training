@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
 from app.core.model_registry import ModelExecutionMode, ModelRegistry
 from app.core.threshold_calibrator import ThresholdMethod
 from app.core.dinomaly_encoder_registry import DinomalyEncoderRegistry
-from app.models.preprocessing_config import ScoreAggregation
+from app.models.preprocessing_config import PaddingPolicy, ScoreAggregation
 
 
 class ConfigPage(QWidget):
@@ -111,6 +111,27 @@ class ConfigPage(QWidget):
 
         self.preprocessing_group = QGroupBox("Preprocessing Policy")
         preprocessing_form = QFormLayout(self.preprocessing_group)
+        self.rectified_roi_size_label = QLabel("Select an inspection ROI or dataset image")
+        self.padding_policy_combo = QComboBox()
+        self.padding_policy_combo.addItem("Automatic", PaddingPolicy.AUTOMATIC.value)
+        self.padding_policy_combo.addItem("Custom", PaddingPolicy.CUSTOM.value)
+        self.padding_policy_combo.setToolTip("ROI or padding changes require retraining.")
+        self.automatic_right_padding_label = QLabel("-")
+        self.automatic_bottom_padding_label = QLabel("-")
+        self.custom_right_padding_spin = QSpinBox()
+        self.custom_right_padding_spin.setRange(0, 100000)
+        self.custom_right_padding_spin.setSuffix(" px")
+        self.custom_bottom_padding_spin = QSpinBox()
+        self.custom_bottom_padding_spin.setRange(0, 100000)
+        self.custom_bottom_padding_spin.setSuffix(" px")
+        self.prepared_image_size_label = QLabel("-")
+        self.model_alignment_label = QLabel("-")
+        self.padding_validation_label = QLabel()
+        self.padding_validation_label.setObjectName("ModelSupport")
+        self.padding_validation_label.setWordWrap(True)
+        self.use_nearest_valid_size_button = QPushButton("Use Nearest Valid Size")
+        self.use_nearest_valid_size_button.setEnabled(False)
+        self.reset_padding_button = QPushButton("Reset to Automatic")
         self.tiling_check = QCheckBox("Enable horizontal tile processing")
         self.score_aggregation_combo = QComboBox()
         self.score_aggregation_combo.addItem("Maximum valid-pixel score", ScoreAggregation.MAX.value)
@@ -121,6 +142,16 @@ class ConfigPage(QWidget):
         self.top_k_fraction_spin.setSingleStep(0.1)
         self.top_k_fraction_spin.setSuffix("%")
         self.top_k_fraction_spin.setValue(1.0)
+        preprocessing_form.addRow("Rectified ROI Size", self.rectified_roi_size_label)
+        preprocessing_form.addRow("Padding Policy", self.padding_policy_combo)
+        preprocessing_form.addRow("Automatic Right Padding", self.automatic_right_padding_label)
+        preprocessing_form.addRow("Automatic Bottom Padding", self.automatic_bottom_padding_label)
+        preprocessing_form.addRow("Custom Right Padding", self.custom_right_padding_spin)
+        preprocessing_form.addRow("Custom Bottom Padding", self.custom_bottom_padding_spin)
+        preprocessing_form.addRow("Prepared Image Size", self.prepared_image_size_label)
+        preprocessing_form.addRow("Model Alignment Requirement", self.model_alignment_label)
+        preprocessing_form.addRow(self.padding_validation_label)
+        preprocessing_form.addRow(self.use_nearest_valid_size_button, self.reset_padding_button)
         preprocessing_form.addRow("Tiling", self.tiling_check)
         preprocessing_form.addRow("Score Aggregation", self.score_aggregation_combo)
         preprocessing_form.addRow("Top-k Fraction", self.top_k_fraction_spin)
@@ -155,12 +186,23 @@ class ConfigPage(QWidget):
             "Normal-only calibration selects a false-reject operating point. Defect-detection performance remains unverified without genuine NG data."
         )
         self.normal_only_calibration_note.setWordWrap(True)
+        self.pixel_threshold_check = QCheckBox("Enable pixel mask threshold")
+        self.pixel_threshold_check.setToolTip(
+            "Creates mask and contour artifacts from continuous anomaly-map values without changing image decisions."
+        )
+        self.pixel_threshold_spin = QDoubleSpinBox()
+        self.pixel_threshold_spin.setRange(-1_000_000_000.0, 1_000_000_000.0)
+        self.pixel_threshold_spin.setDecimals(6)
+        self.pixel_threshold_spin.setSingleStep(0.01)
+        self.pixel_threshold_spin.setValue(0.5)
         threshold_form.addRow("Calibration Method", self.threshold_method_combo)
         threshold_form.addRow("Normal False Reject Target", self.threshold_fpr_combo)
         threshold_form.addRow("Custom Normal False Reject Target", self.threshold_fpr_spin)
         threshold_form.addRow("NG Recall Target", self.minimum_ng_recall_check)
         threshold_form.addRow("Required NG Recall", self.minimum_ng_recall_spin)
         threshold_form.addRow(self.normal_only_calibration_note)
+        threshold_form.addRow("Pixel Mask", self.pixel_threshold_check)
+        threshold_form.addRow("Pixel Map Threshold", self.pixel_threshold_spin)
         root.addWidget(self.threshold_group)
 
         self.acceptance_group = QGroupBox("Final-Test Acceptance Policy")
@@ -195,7 +237,11 @@ class ConfigPage(QWidget):
         self.model_combo.currentIndexChanged.connect(self._update_model_support)
         self.threshold_fpr_combo.currentIndexChanged.connect(self._update_threshold_controls)
         self.minimum_ng_recall_check.toggled.connect(self._update_threshold_controls)
+        self.pixel_threshold_check.toggled.connect(self._update_threshold_controls)
         self.score_aggregation_combo.currentIndexChanged.connect(self._update_preprocessing_controls)
+        self.padding_policy_combo.currentIndexChanged.connect(self._update_preprocessing_controls)
+        self.use_nearest_valid_size_button.clicked.connect(self._use_nearest_valid_size)
+        self.reset_padding_button.clicked.connect(self._reset_padding_to_automatic)
         self._update_model_support()
         self._update_threshold_controls()
         self._update_preprocessing_controls()
@@ -203,6 +249,75 @@ class ConfigPage(QWidget):
     def set_estimated_training_steps(self, steps: int, epochs: int) -> None:
         """Show the model-adjusted optimizer work without changing layout width."""
         self.estimated_steps_label.setText(f"{steps:,} steps ({epochs:,} epochs)")
+
+    def set_padding_policy(self, policy: PaddingPolicy, right_padding: int, bottom_padding: int, editable: bool) -> None:
+        """Load persisted padding settings without upgrading legacy projects implicitly."""
+        policy_index = self.padding_policy_combo.findData(policy.value)
+        self.padding_policy_combo.blockSignals(True)
+        self.padding_policy_combo.setCurrentIndex(max(policy_index, 0))
+        self.padding_policy_combo.blockSignals(False)
+        self.custom_right_padding_spin.setValue(right_padding)
+        self.custom_bottom_padding_spin.setValue(bottom_padding)
+        self.padding_policy_combo.setEnabled(editable)
+        self.reset_padding_button.setEnabled(editable)
+        self.padding_policy_combo.setToolTip(
+            "ROI or padding changes require retraining."
+            if editable
+            else "Legacy preprocessing-v2 is retained unchanged for compatibility with existing runs."
+        )
+        self._update_preprocessing_controls()
+
+    def set_preprocessing_geometry(
+        self,
+        *,
+        rectified_size: tuple[int, int] | None,
+        automatic_padding: tuple[int, int] | None,
+        prepared_size: tuple[int, int] | None,
+        alignment: tuple[int, int] | None,
+        validation_message: str = "",
+        allow_nearest_size: bool = True,
+    ) -> None:
+        """Display model-ready geometry calculated from the current ROI and controls."""
+        self.rectified_roi_size_label.setText(
+            f"{rectified_size[0]} x {rectified_size[1]} px" if rectified_size is not None else "Select an inspection ROI or dataset image"
+        )
+        self.automatic_right_padding_label.setText(
+            f"{automatic_padding[0]} px" if automatic_padding is not None else "-"
+        )
+        self.automatic_bottom_padding_label.setText(
+            f"{automatic_padding[1]} px" if automatic_padding is not None else "-"
+        )
+        self.prepared_image_size_label.setText(
+            f"{prepared_size[0]} x {prepared_size[1]} px" if prepared_size is not None else "-"
+        )
+        self.model_alignment_label.setText(
+            f"{alignment[0]} x {alignment[1]} px" if alignment is not None else "-"
+        )
+        self.padding_validation_label.setText(validation_message)
+        self.use_nearest_valid_size_button.setEnabled(automatic_padding is not None and allow_nearest_size)
+
+    def padding_policy(self) -> PaddingPolicy:
+        """Return the operator-selected v3 padding policy."""
+        return PaddingPolicy(str(self.padding_policy_combo.currentData()))
+
+    def _use_nearest_valid_size(self) -> None:
+        """Copy the shown automatic right/bottom values into Custom mode explicitly."""
+        right_padding = self._padding_label_value(self.automatic_right_padding_label)
+        bottom_padding = self._padding_label_value(self.automatic_bottom_padding_label)
+        if right_padding is None or bottom_padding is None:
+            return
+        self.custom_right_padding_spin.setValue(right_padding)
+        self.custom_bottom_padding_spin.setValue(bottom_padding)
+        self.padding_policy_combo.setCurrentIndex(self.padding_policy_combo.findData(PaddingPolicy.CUSTOM.value))
+
+    def _reset_padding_to_automatic(self) -> None:
+        """Return to dynamic model-aligned right/bottom padding."""
+        self.padding_policy_combo.setCurrentIndex(self.padding_policy_combo.findData(PaddingPolicy.AUTOMATIC.value))
+
+    @staticmethod
+    def _padding_label_value(label: QLabel) -> int | None:
+        value = label.text().removesuffix(" px")
+        return int(value) if value.isdigit() else None
 
     def _populate_models(self) -> None:
         """Populate the fixed set of supported model configurations."""
@@ -249,16 +364,27 @@ class ConfigPage(QWidget):
         is_training_model = self._model_definitions[model_key].execution_mode is ModelExecutionMode.TRAIN
         self.trainer_group.setEnabled(is_training_model)
         self.trainer_group.setTitle("Trainer Settings" if is_training_model else "Trainer Settings (Not used for zero-shot evaluation)")
-        uses_fixed_one_pass = model_key in {"patchcore", "padim"}
+        uses_fixed_one_pass = model_key in {"patchcore", "padim", "anomaly_dino", "super_add"}
         self.max_epochs_spin.setValue(1 if uses_fixed_one_pass else self.max_epochs_spin.value())
         self.max_epochs_spin.setEnabled(not uses_fixed_one_pass and not is_dinomaly and is_training_model)
         self.max_epochs_spin.setToolTip(
             "Dinomaly uses its Anomalib trainer defaults and the configured step budget."
             if is_dinomaly
-            else ""
+            else (
+                "This model uses one memory-bank collection pass."
+                if uses_fixed_one_pass
+                else ""
+            )
         )
-        self.batch_size_spin.setValue(8 if model_key == "patchcore" else self.batch_size_spin.value())
-        self.batch_size_spin.setEnabled(is_training_model)
+        fixed_batch_size = {"patchcore": 8, "efficient_ad": 1}.get(model_key)
+        if fixed_batch_size is not None:
+            self.batch_size_spin.setValue(fixed_batch_size)
+        self.batch_size_spin.setEnabled(is_training_model and fixed_batch_size is None)
+        self.batch_size_spin.setToolTip(
+            "EfficientAD requires one-image training batches."
+            if model_key == "efficient_ad"
+            else ("PatchCore uses batches of eight images." if model_key == "patchcore" else "")
+        )
         supports_tiling = is_dinomaly
         self.tiling_check.setEnabled(supports_tiling)
         self.tiling_check.setToolTip("Tiling is currently supported only by Dinomaly models." if not supports_tiling else "")
@@ -321,10 +447,14 @@ class ConfigPage(QWidget):
         """Enable only the optional calibration inputs selected by the user."""
         self.threshold_fpr_spin.setEnabled(self.threshold_fpr_combo.currentData() is None)
         self.minimum_ng_recall_spin.setEnabled(self.minimum_ng_recall_check.isChecked())
+        self.pixel_threshold_spin.setEnabled(self.pixel_threshold_check.isChecked())
 
     def _update_preprocessing_controls(self) -> None:
         """Expose top-k tuning only when its aggregation strategy is active."""
         self.top_k_fraction_spin.setEnabled(
             self.score_aggregation_combo.currentData() == ScoreAggregation.TOP_K_MEAN.value
         )
+        custom_padding = self.padding_policy() is PaddingPolicy.CUSTOM and self.padding_policy_combo.isEnabled()
+        self.custom_right_padding_spin.setEnabled(custom_padding)
+        self.custom_bottom_padding_spin.setEnabled(custom_padding)
 

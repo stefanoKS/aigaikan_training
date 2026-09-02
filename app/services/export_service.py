@@ -25,6 +25,7 @@ from app.core.run_artifacts import (
     read_verified_preprocessing_plan,
 )
 from app.models.prediction_result import PredictionResult
+from app.models.preprocessing_config import LEGACY_PREPROCESSING_CONTRACT_VERSION
 from app.models.training_config import TrainingConfig
 from app.services.anomalib_service import AnomalibService, REQUIRED_ANOMALIB_VERSION
 
@@ -344,12 +345,29 @@ class ExportService:
         score_deltas: list[float] = []
         for expected in expected_predictions:
             if preprocessing_pipeline is not None:
-                deployed_maps = [
-                    ExportService._deployment_anomaly_map(inferencer.predict(prepared.image_rgb))
+                deployed_predictions = [
+                    inferencer.predict(prepared.image_rgb)
                     for prepared in preprocessing_pipeline.prepare_path(Path(expected.source_path))
                 ]
-                reconstructed = preprocessing_pipeline.reconstruct_anomaly_maps(deployed_maps)
-                score = preprocessing_pipeline.score_from_reconstructed_map(reconstructed)
+                if (
+                    preprocessing_pipeline.plan.preprocessing_contract_version
+                    == LEGACY_PREPROCESSING_CONTRACT_VERSION
+                ):
+                    deployed_maps = [
+                        ExportService._deployment_anomaly_map(prediction)
+                        for prediction in deployed_predictions
+                    ]
+                    reconstructed = preprocessing_pipeline.reconstruct_anomaly_maps(deployed_maps)
+                    score = preprocessing_pipeline.score_from_reconstructed_map(reconstructed)
+                else:
+                    native_tile_scores = [
+                        ExportService._deployment_score(prediction) for prediction in deployed_predictions
+                    ]
+                    score = (
+                        native_tile_scores[0]
+                        if len(native_tile_scores) == 1
+                        else preprocessing_pipeline.aggregate_tile_scores(native_tile_scores)
+                    )
             else:
                 deployment_input: str | Any = expected.source_path
                 if inspection_processor is not None:

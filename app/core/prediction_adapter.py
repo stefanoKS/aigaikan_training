@@ -9,7 +9,11 @@ from pathlib import Path
 from typing import Any
 
 from app.core.preprocessing_pipeline import PreprocessingPipeline
-from app.models.preprocessing_config import PreprocessingTile
+from app.models.preprocessing_config import LEGACY_PREPROCESSING_CONTRACT_VERSION, PreprocessingTile
+
+ANOMALIB_POSTPROCESSED_SCORE_SEMANTIC = "anomalib_postprocessed_pred_score_v1"
+LEGACY_VALID_MAP_SCORE_SEMANTIC = "legacy_v2_valid_map_aggregation_v1"
+NATIVE_TILE_SCORE_SEMANTIC_PREFIX = "native_tile_score_aggregation"
 
 @dataclass(frozen=True, slots=True)
 class AnomalibPrediction:
@@ -18,6 +22,7 @@ class AnomalibPrediction:
     image_path: Path
     score: float
     anomaly_map: Any
+    score_semantic: str = ANOMALIB_POSTPROCESSED_SCORE_SEMANTIC
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,6 +33,9 @@ class PreprocessedAnomalibPrediction:
     score: float
     anomaly_map: Any
     staged_paths: tuple[Path, ...]
+    native_image_score: float | None
+    native_tile_scores: tuple[float, ...]
+    score_semantic: str
 
 
 def iter_anomalib_predictions(output: Any) -> Iterator[AnomalibPrediction]:
@@ -75,11 +83,27 @@ def iter_preprocessed_predictions(
         reconstructed = preprocessing_pipeline.reconstruct_anomaly_maps(
             tile_predictions[index].anomaly_map for index in expected_indexes
         )
+        native_tile_scores = tuple(tile_predictions[index].score for index in expected_indexes)
+        if preprocessing_pipeline.plan.preprocessing_contract_version == LEGACY_PREPROCESSING_CONTRACT_VERSION:
+            score = preprocessing_pipeline.score_from_reconstructed_map(reconstructed)
+            native_image_score = None
+            score_semantic = LEGACY_VALID_MAP_SCORE_SEMANTIC
+        elif len(native_tile_scores) == 1:
+            score = native_tile_scores[0]
+            native_image_score = score
+            score_semantic = ANOMALIB_POSTPROCESSED_SCORE_SEMANTIC
+        else:
+            score = preprocessing_pipeline.aggregate_tile_scores(native_tile_scores)
+            native_image_score = None
+            score_semantic = f"{NATIVE_TILE_SCORE_SEMANTIC_PREFIX}_{preprocessing_pipeline.plan.score_aggregation.value}_v1"
         yield PreprocessedAnomalibPrediction(
             source_path=source_path,
-            score=preprocessing_pipeline.score_from_reconstructed_map(reconstructed),
+            score=score,
             anomaly_map=reconstructed.anomaly_map,
             staged_paths=tuple(staged_paths_by_source[source_path][index] for index in expected_indexes),
+            native_image_score=native_image_score,
+            native_tile_scores=native_tile_scores,
+            score_semantic=score_semantic,
         )
 
 

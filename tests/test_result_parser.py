@@ -35,12 +35,18 @@ def test_export_and_read_predictions_csv(tmp_path: Path) -> None:
             ground_truth_label="OK",
             anomaly_score=0.12,
             threshold=0.5,
+            pixel_threshold=3.5,
+            pixel_threshold_comparator="greater_than_or_equal",
+            pixel_threshold_semantic="continuous_anomaly_map_gte_v1",
         )
     ]
     parser.export_predictions_csv(path, predictions)
     restored = parser.read_predictions_csv(path)
     assert restored[0].source_path.endswith("image.png")
     assert restored[0].classification_bucket() == "Correct OK"
+    assert restored[0].pixel_threshold == 3.5
+    assert restored[0].pixel_threshold_comparator == "greater_than_or_equal"
+    assert restored[0].pixel_threshold_semantic == "continuous_anomaly_map_gte_v1"
 
 
 def test_write_and_read_training_run(tmp_path: Path) -> None:

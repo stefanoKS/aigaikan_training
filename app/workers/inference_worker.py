@@ -14,11 +14,13 @@ from typing import Any
 import numpy as np
 
 from app.core.inspection_region import InspectionRegionProcessor
+from app.core.prediction_artifacts import inspection_region_metadata, save_prediction_artifacts
 from app.core.prediction_adapter import iter_anomalib_predictions, iter_preprocessed_predictions
 from app.core.preprocessing_pipeline import PreprocessingPipeline
 from app.core.result_parser import ResultParser
 from app.core.run_artifacts import (
     read_canonical_checkpoint,
+    read_persisted_pixel_operating_point,
     read_persisted_threshold,
     read_verified_inspection_region,
     read_verified_preprocessing_plan,
@@ -52,45 +54,6 @@ def _discover_images(input_path: Path) -> tuple[Path, ...]:
 def _count_images(input_path: Path) -> int:
     """Return the count Anomalib itself will attempt to predict."""
     return len(_discover_images(input_path))
-
-
-def _save_visualizations(
-    source_path: Path,
-    anomaly_map: Any,
-    output_directory: Path,
-    index: int,
-    rectified_image: Any | None = None,
-) -> tuple[str, str]:
-    if anomaly_map is None:
-        return "", ""
-    import numpy as np
-    from PIL import Image
-
-    values = anomaly_map.detach().float().cpu().numpy() if hasattr(anomaly_map, "detach") else np.asarray(anomaly_map)
-    while values.ndim > 2:
-        values = values[0]
-    if values.ndim != 2 or values.size == 0:
-        return "", ""
-    values = np.nan_to_num(values.astype(np.float32), nan=0.0, posinf=1.0, neginf=0.0)
-    normalized = np.clip(values, 0.0, 1.0)
-    heatmap = np.stack(
-        (
-            np.clip(1.8 * normalized, 0.0, 1.0),
-            np.clip(1.8 * (1.0 - np.abs(normalized - 0.5) * 2.0), 0.0, 1.0),
-            np.clip(1.8 * (1.0 - normalized), 0.0, 1.0),
-        ),
-        axis=-1,
-    )
-    original = Image.fromarray(rectified_image, "RGB") if rectified_image is not None else Image.open(source_path).convert("RGB")
-    heatmap_image = Image.fromarray((heatmap * 255).astype(np.uint8), "RGB").resize(
-        original.size,
-        Image.Resampling.BILINEAR,
-    )
-    heatmap_path = output_directory / f"{index:04d}_heatmap.png"
-    overlay_path = output_directory / f"{index:04d}_overlay.png"
-    heatmap_image.save(heatmap_path)
-    Image.blend(original, heatmap_image, 0.45).save(overlay_path)
-    return str(heatmap_path), str(overlay_path)
 
 
 def _expected_source_path(predicted_path: Path, expected_paths: set[Path]) -> Path | None:
@@ -151,6 +114,8 @@ def run(run_directory: Path, input_path: Path) -> int:
         raise ValueError("Select an image file or a folder containing supported image files.")
     checkpoint_path = read_canonical_checkpoint(run_directory).path
     threshold = read_persisted_threshold(run_directory)
+    pixel_operating_point = read_persisted_pixel_operating_point(run_directory)
+    pixel_threshold = pixel_operating_point.active_threshold
     inspection_region = read_verified_inspection_region(run_directory)
     preprocessing_plan = read_verified_preprocessing_plan(run_directory)
     preprocessing_pipeline = (
@@ -189,6 +154,7 @@ def run(run_directory: Path, input_path: Path) -> int:
     )
     emit({"type": "progress", "current": 0, "total": total_images})
     predictions: list[PredictionResult] = []
+    region_metadata = inspection_region_metadata(inspection_region)
     expected_paths = set(source_paths)
     predicted_paths: set[Path] = set()
     if preprocessing_pipeline is None:
@@ -207,12 +173,13 @@ def run(run_directory: Path, input_path: Path) -> int:
             if source_path in predicted_paths:
                 raise ValueError(f"Anomalib returned more than one prediction for: {source_path}")
             predicted_paths.add(source_path)
-            heatmap_path, overlay_path = _save_visualizations(
+            artifacts = save_prediction_artifacts(
                 source_path,
                 anomalib_prediction.anomaly_map,
                 visualizations_directory,
                 len(predictions),
-                rectified_images.get(source_path),
+                rectified_image=rectified_images.get(source_path),
+                pixel_threshold=pixel_threshold,
             )
             prediction = PredictionResult(
                 source_path=str(source_path),
@@ -221,8 +188,19 @@ def run(run_directory: Path, input_path: Path) -> int:
                 anomaly_score=anomalib_prediction.score,
                 threshold=threshold,
                 original_image=str(source_path),
-                anomaly_map=heatmap_path,
-                overlay_image=overlay_path,
+                anomaly_map=artifacts.heatmap_image,
+                overlay_image=artifacts.overlay_image,
+                native_image_score=anomalib_prediction.score,
+                native_tile_scores=[anomalib_prediction.score],
+                score_semantic=anomalib_prediction.score_semantic,
+                continuous_anomaly_map=artifacts.continuous_anomaly_map,
+                binary_mask=artifacts.binary_mask,
+                contour_overlay_image=artifacts.contour_overlay_image,
+                pixel_threshold=artifacts.pixel_threshold,
+                pixel_threshold_comparator=artifacts.pixel_threshold_comparator,
+                pixel_threshold_semantic=artifacts.pixel_threshold_semantic,
+                map_display_normalization=artifacts.display_normalization or {},
+                region_metadata=region_metadata,
             )
             predictions.append(prediction)
             emit({"type": "prediction", **prediction.to_dict()})
@@ -256,12 +234,13 @@ def run(run_directory: Path, input_path: Path) -> int:
                 predicted_paths.add(source_path)
                 with Image.open(preview_path_by_source[source_path]) as preview:
                     rectified_image = np.asarray(preview.convert("RGB"))
-                heatmap_path, overlay_path = _save_visualizations(
+                artifacts = save_prediction_artifacts(
                     source_path,
                     anomalib_prediction.anomaly_map,
                     visualizations_directory,
                     len(predictions),
-                    rectified_image,
+                    rectified_image=rectified_image,
+                    pixel_threshold=pixel_threshold,
                 )
                 prediction = PredictionResult(
                     source_path=str(source_path),
@@ -270,8 +249,19 @@ def run(run_directory: Path, input_path: Path) -> int:
                     anomaly_score=anomalib_prediction.score,
                     threshold=threshold,
                     original_image=str(source_path),
-                    anomaly_map=heatmap_path,
-                    overlay_image=overlay_path,
+                    anomaly_map=artifacts.heatmap_image,
+                    overlay_image=artifacts.overlay_image,
+                    native_image_score=anomalib_prediction.native_image_score,
+                    native_tile_scores=list(anomalib_prediction.native_tile_scores),
+                    score_semantic=anomalib_prediction.score_semantic,
+                    continuous_anomaly_map=artifacts.continuous_anomaly_map,
+                    binary_mask=artifacts.binary_mask,
+                    contour_overlay_image=artifacts.contour_overlay_image,
+                    pixel_threshold=artifacts.pixel_threshold,
+                    pixel_threshold_comparator=artifacts.pixel_threshold_comparator,
+                    pixel_threshold_semantic=artifacts.pixel_threshold_semantic,
+                    map_display_normalization=artifacts.display_normalization or {},
+                    region_metadata=region_metadata,
                 )
                 predictions.append(prediction)
                 emit({"type": "prediction", **prediction.to_dict()})

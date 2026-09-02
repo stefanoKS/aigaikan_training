@@ -94,6 +94,17 @@ class ResultParser:
                     anomaly_map=row.get("anomaly_map", ""),
                     overlay_image=row.get("overlay_image", ""),
                     dataset_role=row.get("dataset_role", ""),
+                    native_image_score=_optional_float(row.get("native_image_score")),
+                    native_tile_scores=_json_float_list(row.get("native_tile_scores")),
+                    score_semantic=row.get("score_semantic", ""),
+                    continuous_anomaly_map=row.get("continuous_anomaly_map", ""),
+                    binary_mask=row.get("binary_mask", ""),
+                    contour_overlay_image=row.get("contour_overlay_image", ""),
+                    pixel_threshold=_optional_float(row.get("pixel_threshold")),
+                    pixel_threshold_comparator=row.get("pixel_threshold_comparator", ""),
+                    pixel_threshold_semantic=row.get("pixel_threshold_semantic", ""),
+                    map_display_normalization=_json_mapping(row.get("map_display_normalization")),
+                    region_metadata=_json_mapping(row.get("region_metadata")),
                 )
                 for row in reader
             ]
@@ -117,6 +128,17 @@ class ResultParser:
                 anomaly_map=str(item.get("anomaly_map", "")),
                 overlay_image=str(item.get("overlay_image", "")),
                 dataset_role=str(item.get("dataset_role", "")),
+                native_image_score=_optional_float(item.get("native_image_score")),
+                native_tile_scores=_float_list(item.get("native_tile_scores")),
+                score_semantic=str(item.get("score_semantic", "")),
+                continuous_anomaly_map=str(item.get("continuous_anomaly_map", "")),
+                binary_mask=str(item.get("binary_mask", "")),
+                contour_overlay_image=str(item.get("contour_overlay_image", "")),
+                pixel_threshold=_optional_float(item.get("pixel_threshold")),
+                pixel_threshold_comparator=str(item.get("pixel_threshold_comparator", "")),
+                pixel_threshold_semantic=str(item.get("pixel_threshold_semantic", "")),
+                map_display_normalization=_mapping(item.get("map_display_normalization")),
+                region_metadata=_mapping(item.get("region_metadata")),
             )
             for item in payload.get("predictions", [])
             if isinstance(item, dict)
@@ -177,6 +199,17 @@ class ResultParser:
             "original_image",
             "anomaly_map",
             "overlay_image",
+            "continuous_anomaly_map",
+            "binary_mask",
+            "contour_overlay_image",
+            "pixel_threshold",
+            "pixel_threshold_comparator",
+            "pixel_threshold_semantic",
+            "map_display_normalization",
+            "region_metadata",
+            "native_image_score",
+            "native_tile_scores",
+            "score_semantic",
             "classification_bucket",
         ]
         with path.open("w", encoding="utf-8", newline="") as handle:
@@ -196,6 +229,17 @@ class ResultParser:
                         "original_image": payload["original_image"],
                         "anomaly_map": payload["anomaly_map"],
                         "overlay_image": payload["overlay_image"],
+                        "continuous_anomaly_map": payload["continuous_anomaly_map"],
+                        "binary_mask": payload["binary_mask"],
+                        "contour_overlay_image": payload["contour_overlay_image"],
+                        "pixel_threshold": "" if payload["pixel_threshold"] is None else payload["pixel_threshold"],
+                        "pixel_threshold_comparator": payload["pixel_threshold_comparator"],
+                        "pixel_threshold_semantic": payload["pixel_threshold_semantic"],
+                        "map_display_normalization": json.dumps(payload["map_display_normalization"], sort_keys=True),
+                        "region_metadata": json.dumps(payload["region_metadata"], sort_keys=True),
+                        "native_image_score": "" if payload["native_image_score"] is None else payload["native_image_score"],
+                        "native_tile_scores": json.dumps(payload["native_tile_scores"]),
+                        "score_semantic": payload["score_semantic"],
                         "classification_bucket": payload["classification_bucket"],
                     }
                 )
@@ -204,7 +248,39 @@ class ResultParser:
 
 def _optional_float(value: Any) -> float | None:
     """Deserialize an optional measured numeric value without inventing a default."""
-    if value is None:
+    if value in (None, ""):
         return None
     return float(value)
+
+
+def _json_mapping(value: object) -> dict[str, Any]:
+    if value in (None, ""):
+        return {}
+    try:
+        decoded = json.loads(str(value))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Prediction metadata must be JSON object text.") from exc
+    return _mapping(decoded)
+
+
+def _mapping(value: object) -> dict[str, Any]:
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _json_float_list(value: object) -> list[float]:
+    if value in (None, ""):
+        return []
+    try:
+        decoded = json.loads(str(value))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Native tile scores must be JSON array text.") from exc
+    return _float_list(decoded)
+
+
+def _float_list(value: object) -> list[float]:
+    if value is None:
+        return []
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("Native tile scores must be a list.")
+    return [float(item) for item in value]
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
@@ -46,7 +47,13 @@ from app.core.settings_manager import SettingsManager
 from app.core.training_controller import TrainingController
 from app.models.dataset_config import DatasetRole, FolderImportMode, SUPPORTED_IMAGE_EXTENSIONS
 from app.models.inspection_region import InspectionRegionConfig
-from app.models.preprocessing_config import PreprocessingConfig, ScoreAggregation, TilingConfig
+from app.models.preprocessing_config import (
+    LEGACY_PREPROCESSING_CONTRACT_VERSION,
+    PaddingPolicy,
+    PreprocessingConfig,
+    ScoreAggregation,
+    TilingConfig,
+)
 from app.models.project_config import ProjectConfig
 from app.models.training_config import DeviceMode, TrainingConfig
 from app.models.training_run import TrainingRun
@@ -242,6 +249,11 @@ class MainWindow(QMainWindow):
         self.config_page.max_epochs_spin.valueChanged.connect(self._update_estimated_training_steps)
         self.config_page.target_training_steps_spin.valueChanged.connect(self._update_estimated_training_steps)
         self.config_page.seed_spin.valueChanged.connect(self._sync_split_seed_on_initial_edit)
+        self.config_page.model_combo.currentIndexChanged.connect(self._refresh_preprocessing_geometry)
+        self.config_page.padding_policy_combo.currentIndexChanged.connect(self._refresh_preprocessing_geometry)
+        self.config_page.custom_right_padding_spin.valueChanged.connect(self._refresh_preprocessing_geometry)
+        self.config_page.custom_bottom_padding_spin.valueChanged.connect(self._refresh_preprocessing_geometry)
+        self.config_page.tiling_check.toggled.connect(self._refresh_preprocessing_geometry)
 
         self.results_page.browse_export_directory_button.clicked.connect(self._choose_model_export_directory)
         self.results_page.export_model_button.clicked.connect(self._export_model)
@@ -711,28 +723,20 @@ class MainWindow(QMainWindow):
             if self.config_page.minimum_ng_recall_check.isChecked()
             else None
         )
+        config.pixel_threshold_enabled = self.config_page.pixel_threshold_check.isChecked()
+        config.pixel_threshold = self.config_page.pixel_threshold_spin.value()
         config.maximum_final_test_false_reject_rate = self.config_page.maximum_final_test_false_reject_spin.value() / 100
         config.minimum_final_test_ok_images = self.config_page.minimum_final_test_ok_images_spin.value()
         config.minimum_final_test_ng_images = self.config_page.minimum_final_test_ng_images_spin.value()
         preprocessing = project.preprocessing
-        updated_preprocessing = PreprocessingConfig(
-            padding_mode=preprocessing.padding_mode,
-            padding_value_rgb=preprocessing.padding_value_rgb,
-            tiling=TilingConfig(
-                enabled=self.config_page.tiling_check.isChecked(),
-                tile_width=preprocessing.tiling.tile_width,
-                tile_height=preprocessing.tiling.tile_height,
-                overlap_x=preprocessing.tiling.overlap_x,
-                final_tile_alignment=preprocessing.tiling.final_tile_alignment,
-            ),
-            score_aggregation=ScoreAggregation(str(self.config_page.score_aggregation_combo.currentData())),
-            top_k_fraction=self.config_page.top_k_fraction_spin.value() / 100,
-            aspect_ratio_tolerance=preprocessing.aspect_ratio_tolerance,
-        )
+        updated_preprocessing = self._preprocessing_from_page(preprocessing)
         config.apply_model_defaults(self._training_image_count())
         try:
             config.validate()
             updated_preprocessing.validate()
+            rectified_size = self._effective_preprocessing_size()
+            if rectified_size is not None:
+                updated_preprocessing.resolve(config.model_name, rectified_size)
         except ValueError as exc:
             if show_dialog:
                 QMessageBox.warning(self, "Invalid Training Settings", str(exc))
@@ -774,6 +778,8 @@ class MainWindow(QMainWindow):
         self.config_page.minimum_ng_recall_check.setChecked(config.minimum_required_ng_recall is not None)
         if config.minimum_required_ng_recall is not None:
             self.config_page.minimum_ng_recall_spin.setValue(config.minimum_required_ng_recall * 100)
+        self.config_page.pixel_threshold_check.setChecked(config.pixel_threshold_enabled)
+        self.config_page.pixel_threshold_spin.setValue(config.pixel_threshold)
         self.config_page.maximum_final_test_false_reject_spin.setValue(config.maximum_final_test_false_reject_rate * 100)
         self.config_page.minimum_final_test_ok_images_spin.setValue(config.minimum_final_test_ok_images)
         self.config_page.minimum_final_test_ng_images_spin.setValue(config.minimum_final_test_ng_images)
@@ -784,6 +790,16 @@ class MainWindow(QMainWindow):
         self.config_page._update_threshold_controls()
         self.config_page._update_preprocessing_controls()
         self.config_page._update_model_support()
+        if preprocessing.preprocessing_contract_version == LEGACY_PREPROCESSING_CONTRACT_VERSION:
+            self.config_page.set_padding_policy(PaddingPolicy.AUTOMATIC, 0, 0, editable=False)
+        else:
+            self.config_page.set_padding_policy(
+                preprocessing.padding_policy,
+                preprocessing.custom_padding_right,
+                preprocessing.custom_padding_bottom,
+                editable=True,
+            )
+        self._refresh_preprocessing_geometry()
         self.training_page.active_model_label.setText(definition.display_name)
         self.training_page.active_device_label.setText(config.device.value)
         self._update_model_action()
@@ -838,6 +854,119 @@ class MainWindow(QMainWindow):
         if preprocessing_hash(self.current_project.preprocessing) != previous_preprocessing_hash:
             self._mark_retraining_required()
         self._refresh_config_page()
+
+    def _preprocessing_from_page(self, existing: PreprocessingConfig) -> PreprocessingConfig:
+        """Read v3 operator settings while retaining legacy policy semantics byte-for-byte."""
+        if existing.preprocessing_contract_version == LEGACY_PREPROCESSING_CONTRACT_VERSION:
+            return existing
+        return PreprocessingConfig(
+            preprocessing_contract_version=existing.preprocessing_contract_version,
+            padding_mode=existing.padding_mode,
+            padding_policy=self.config_page.padding_policy(),
+            padding_value_rgb=existing.padding_value_rgb,
+            custom_padding_right=self.config_page.custom_right_padding_spin.value(),
+            custom_padding_bottom=self.config_page.custom_bottom_padding_spin.value(),
+            tiling=TilingConfig(
+                enabled=self.config_page.tiling_check.isChecked(),
+                tile_width=existing.tiling.tile_width,
+                tile_height=existing.tiling.tile_height,
+                overlap_x=existing.tiling.overlap_x,
+                final_tile_alignment=existing.tiling.final_tile_alignment,
+            ),
+            score_aggregation=ScoreAggregation(str(self.config_page.score_aggregation_combo.currentData())),
+            top_k_fraction=self.config_page.top_k_fraction_spin.value() / 100,
+            aspect_ratio_tolerance=existing.aspect_ratio_tolerance,
+        )
+
+    def _effective_preprocessing_size(self) -> tuple[int, int] | None:
+        """Return the current ROI size, or the single validated source resolution with no ROI."""
+        project = self.current_project
+        if project is None:
+            return None
+        if project.inspection_region.enabled:
+            return project.inspection_region.rectified_size() if project.inspection_region.is_configured else None
+        sizes: set[tuple[int, int]] = set()
+        for role, folder in project.dataset.folders.items():
+            if role is DatasetRole.MASKS:
+                continue
+            directory = folder.resolved_path()
+            if directory is None or not directory.is_dir():
+                continue
+            for source_path in directory.rglob("*"):
+                if not source_path.is_file() or source_path.suffix.lower() not in SUPPORTED_IMAGE_EXTENSIONS:
+                    continue
+                try:
+                    from PIL import Image
+
+                    with Image.open(source_path) as image:
+                        sizes.add(image.size)
+                except OSError:
+                    continue
+        return next(iter(sizes)) if len(sizes) == 1 else None
+
+    def _refresh_preprocessing_geometry(self, *_args: object) -> None:
+        """Show only geometry that the active preprocessing policy can actually resolve."""
+        project = self.current_project
+        if project is None:
+            self.config_page.set_preprocessing_geometry(
+                rectified_size=None,
+                automatic_padding=None,
+                prepared_size=None,
+                alignment=None,
+                allow_nearest_size=False,
+            )
+            return
+        rectified_size = self._effective_preprocessing_size()
+        preprocessing = project.preprocessing
+        if preprocessing.preprocessing_contract_version == LEGACY_PREPROCESSING_CONTRACT_VERSION:
+            self.config_page.set_preprocessing_geometry(
+                rectified_size=rectified_size,
+                automatic_padding=None,
+                prepared_size=None,
+                alignment=None,
+                validation_message="Legacy preprocessing-v2 remains unchanged. Reset configuration to opt into dynamic padding.",
+                allow_nearest_size=False,
+            )
+            return
+        if rectified_size is None:
+            self.config_page.set_preprocessing_geometry(
+                rectified_size=None,
+                automatic_padding=None,
+                prepared_size=None,
+                alignment=None,
+                validation_message="Select a complete ROI or dataset images with one shared resolution.",
+                allow_nearest_size=False,
+            )
+            return
+        model_id = str(self.config_page.model_combo.currentData())
+        page_policy = self._preprocessing_from_page(preprocessing)
+        automatic_policy = replace(page_policy, padding_policy=PaddingPolicy.AUTOMATIC)
+        try:
+            automatic_plan = automatic_policy.resolve(model_id, rectified_size)
+            plan = page_policy.resolve(model_id, rectified_size)
+        except ValueError as exc:
+            try:
+                automatic_plan = automatic_policy.resolve(model_id, rectified_size)
+                automatic_padding = automatic_plan.resolved_padding[2:]
+                alignment = automatic_plan.model_alignment
+            except ValueError:
+                automatic_padding = None
+                alignment = None
+            self.config_page.set_preprocessing_geometry(
+                rectified_size=rectified_size,
+                automatic_padding=automatic_padding,
+                prepared_size=None,
+                alignment=alignment,
+                validation_message=str(exc),
+            )
+            return
+        self.config_page.set_preprocessing_geometry(
+            rectified_size=rectified_size,
+            automatic_padding=automatic_plan.resolved_padding[2:],
+            prepared_size=plan.model_input_size,
+            alignment=plan.model_alignment,
+            validation_message="",
+        )
 
     def _mark_retraining_required(self) -> None:
         """Clear current-only views after a project policy affecting model inputs changes."""

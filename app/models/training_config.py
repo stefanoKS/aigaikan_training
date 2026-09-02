@@ -10,6 +10,7 @@ from typing import Any
 
 from app.core.dinomaly_encoder_registry import DinomalyEncoderRegistry
 from app.core.threshold_calibrator import ThresholdCalibrationConfig, ThresholdMethod
+from app.core.threshold_contract import PixelThresholdOperatingPoint
 
 
 class DeviceMode(StrEnum):
@@ -57,6 +58,8 @@ class TrainingConfig:
     threshold_method: ThresholdMethod = ThresholdMethod.AUTO
     target_normal_false_reject_rate: float = 0.005
     minimum_required_ng_recall: float | None = None
+    pixel_threshold_enabled: bool = False
+    pixel_threshold: float = 0.5
     maximum_final_test_false_reject_rate: float = 0.005
     minimum_final_test_ok_images: int = 10
     minimum_final_test_ng_images: int = 10
@@ -67,8 +70,10 @@ class TrainingConfig:
             if self.batch_size > 0:
                 self.batch_size = 8
             self.max_epochs = 1
-        elif self.is_padim:
+        elif self.is_padim or self.is_anomaly_dino or self.is_super_add:
             self.max_epochs = 1
+        elif self.is_efficient_ad:
+            self.batch_size = 1
 
     def validate(self) -> None:
         """Validate configuration values."""
@@ -99,9 +104,11 @@ class TrainingConfig:
         if self.minimum_final_test_ok_images <= 0 or self.minimum_final_test_ng_images <= 0:
             raise ValueError("Minimum final-test evidence counts must be positive")
         if self.uses_fixed_one_pass and self.max_epochs != 1:
-            raise ValueError("PatchCore and PaDiM use exactly one epoch with their Anomalib trainer arguments")
+            raise ValueError("PatchCore, PaDiM, AnomalyDINO, and SuperADD use exactly one epoch with their Anomalib trainer arguments")
         if self.is_patchcore and self.batch_size != 8:
             raise ValueError("PatchCore uses a batch size of 8")
+        if self.is_efficient_ad and self.batch_size != 1:
+            raise ValueError("EfficientAD requires a batch size of 1")
         if self.is_dinomaly and (
             self.dinomaly_decoder_depth != 8
             or self.dinomaly_bottleneck_dropout != 0.2
@@ -118,6 +125,7 @@ class TrainingConfig:
             target_normal_false_reject_rate=self.target_normal_false_reject_rate,
             minimum_required_ng_recall=self.minimum_required_ng_recall,
         ).validate()
+        self.pixel_operating_point.validate()
 
     @property
     def is_patchcore(self) -> bool:
@@ -145,9 +153,32 @@ class TrainingConfig:
         return self._normalized_model_name == "dinomalydinov3"
 
     @property
+    def is_anomaly_dino(self) -> bool:
+        """Return whether the selected model only builds an embedding memory bank."""
+        return self._normalized_model_name == "anomalydino"
+
+    @property
+    def is_efficient_ad(self) -> bool:
+        """Return whether the selected model requires one-image train batches."""
+        return self._normalized_model_name == "efficientad"
+
+    @property
+    def is_super_add(self) -> bool:
+        """Return whether the selected model only builds a memory bank in one training pass."""
+        return self._normalized_model_name == "superadd"
+
+    @property
     def uses_fixed_one_pass(self) -> bool:
         """Return whether the selected model builds a memory bank in one pass."""
-        return self.is_patchcore or self.is_padim
+        return self.is_patchcore or self.is_padim or self.is_anomaly_dino or self.is_super_add
+
+    @property
+    def pixel_operating_point(self) -> PixelThresholdOperatingPoint:
+        """Return the separately configured map-mask operating point."""
+        return PixelThresholdOperatingPoint(
+            enabled=self.pixel_threshold_enabled,
+            threshold=self.pixel_threshold,
+        )
 
     @property
     def dinomaly_encoder_name(self) -> str:
@@ -181,7 +212,9 @@ class TrainingConfig:
             return {
                 "encoder_name": "vit_small_patch14_dinov2",
                 "num_neighbours": 1,
+                "coreset_subsampling": True,
                 "sampling_ratio": 0.1,
+                "max_epochs": 1,
                 "preprocessing": "anomalib-native",
             }
         if self._normalized_model_name == "superadd":
@@ -189,12 +222,14 @@ class TrainingConfig:
                 "backbone": "vit_huge_plus_patch16_dinov3",
                 "patch_size": 448,
                 "patch_overlap": 16,
+                "max_epochs": 1,
                 "preprocessing": "anomalib-native",
             }
         if self._normalized_model_name == "efficientad":
             return {
                 "model_size": "small",
                 "teacher_out_channels": 384,
+                "batch_size": 1,
                 "preprocessing": "anomalib-native",
             }
         if self._normalized_model_name == "supersimplenet":
@@ -252,8 +287,10 @@ class TrainingConfig:
         if self.is_patchcore:
             self.batch_size = 8
             self.max_epochs = 1
-        elif self.is_padim:
+        elif self.is_padim or self.is_anomaly_dino or self.is_super_add:
             self.max_epochs = 1
+        elif self.is_efficient_ad:
+            self.batch_size = 1
         elif self.is_dinomaly:
             self.dinomaly_decoder_depth = 8
             self.dinomaly_bottleneck_dropout = 0.2
@@ -315,6 +352,8 @@ class TrainingConfig:
                 if payload.get("minimum_required_ng_recall") is not None
                 else None
             ),
+            pixel_threshold_enabled=bool(payload.get("pixel_threshold_enabled", False)),
+            pixel_threshold=float(payload.get("pixel_threshold", 0.5)),
             maximum_final_test_false_reject_rate=float(payload.get("maximum_final_test_false_reject_rate", 0.005)),
             minimum_final_test_ok_images=int(payload.get("minimum_final_test_ok_images", 10)),
             minimum_final_test_ng_images=int(payload.get("minimum_final_test_ng_images", 10)),

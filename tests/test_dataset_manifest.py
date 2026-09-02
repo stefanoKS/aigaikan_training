@@ -170,4 +170,4 @@ def test_tiled_staging_retains_every_source_tile_provenance(tmp_path: Path) -> N
 
     assert set(tile.index for tile in staged.preprocessing_tile_by_staged_path.values()) == {0, 1, 2}
     assert len(staged.preprocessing_tile_by_staged_path) == len(staged.source_path_by_staged_path)
-    assert all(Image.open(path).size == (448, 256) for path in staged.source_path_by_staged_path)
+    assert all(Image.open(path).size == pipeline.plan.model_input_size for path in staged.source_path_by_staged_path)

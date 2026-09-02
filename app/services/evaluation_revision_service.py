@@ -9,7 +9,8 @@ from tempfile import TemporaryDirectory
 from typing import Any
 
 from app.core.dataset_manifest import build_dataset_manifest, write_dataset_manifest
-from app.core.inspection_region import validate_inspection_region_sources
+from app.core.inspection_region import InspectionRegionProcessor, validate_inspection_region_sources
+from app.core.prediction_artifacts import PredictionArtifacts, inspection_region_metadata, save_prediction_artifacts
 from app.core.prediction_adapter import iter_anomalib_predictions, iter_preprocessed_predictions
 from app.core.preprocessing_pipeline import PreprocessingPipeline
 from app.core.quality_metrics import FinalTestAcceptancePolicy, QualityReport, calculate_quality_metrics
@@ -17,11 +18,14 @@ from app.core.result_parser import ResultParser
 from app.core.run_artifacts import (
     CanonicalCheckpoint,
     read_canonical_checkpoint,
+    next_evaluation_revision_id,
+    read_persisted_pixel_operating_point,
     read_verified_inspection_region,
     read_verified_preprocessing_plan,
     write_evaluation_revision,
 )
 from app.core.threshold_calibrator import CalibrationSample, ThresholdCalibrationConfig, ThresholdCalibrator
+from app.core.threshold_contract import PixelThresholdOperatingPoint
 from app.models.dataset_config import DatasetConfig, DatasetRole
 from app.models.prediction_result import PredictionResult
 from app.models.preprocessing_config import PreprocessingTile
@@ -61,10 +65,14 @@ class EvaluationRevisionService:
         run_directory: Path,
         directories: EvaluationDirectories,
         threshold_config: ThresholdCalibrationConfig,
+        pixel_operating_point: PixelThresholdOperatingPoint | None = None,
     ) -> EvaluationRevisionResult:
         """Calibrate and evaluate a verified existing checkpoint on separate new folders."""
         run_directory = run_directory.expanduser().resolve()
         canonical_checkpoint = read_canonical_checkpoint(run_directory)
+        pixel_operating_point = pixel_operating_point or read_persisted_pixel_operating_point(run_directory)
+        pixel_operating_point.validate()
+        pixel_threshold = pixel_operating_point.active_threshold
         config = self._load_training_config(run_directory)
         inspection_region = read_verified_inspection_region(run_directory)
         preprocessing_plan = read_verified_preprocessing_plan(run_directory)
@@ -83,6 +91,8 @@ class EvaluationRevisionService:
         )
         revisions_directory = run_directory / "evaluation_revisions"
         revisions_directory.mkdir(parents=True, exist_ok=True)
+        revision_id = next_evaluation_revision_id(run_directory)
+        artifact_directory = revisions_directory / f"{revision_id}_prediction_artifacts"
         components = (
             self.anomalib_service.create_inference_components(config, revisions_directory, preprocessing_plan)
             if preprocessing_plan is not None
@@ -106,13 +116,14 @@ class EvaluationRevisionService:
                 abnormal_directory=resolved.calibration_ng,
             )
         else:
-            calibration_samples = self._calibration_samples_from_scores(
-                self._preprocessed_scores(
+            calibration_predictions = self._preprocessed_predictions(
                     components,
                     canonical_checkpoint.path,
                     [*self._images(resolved.calibration_ok), *self._images(resolved.calibration_ng)],
                     preprocessing_pipeline,
-                ),
+                )
+            calibration_samples = self._calibration_samples_from_scores(
+                ((prediction.source_path, prediction.score) for prediction in calibration_predictions),
                 normal_directory=resolved.calibration_ok,
                 abnormal_directory=resolved.calibration_ng,
             )
@@ -140,18 +151,26 @@ class EvaluationRevisionService:
                 normal_directory=resolved.final_test_ok,
                 abnormal_directory=resolved.final_test_ng,
                 threshold=calibration_result.threshold_value,
+                artifact_directory=artifact_directory,
+                inspection_region=inspection_region,
+                pixel_threshold=pixel_threshold,
             )
         else:
-            final_predictions = self._final_predictions_from_scores(
-                self._preprocessed_scores(
+            final_test_predictions = self._preprocessed_predictions(
                     components,
                     canonical_checkpoint.path,
                     [*self._images(resolved.final_test_ok), *self._images(resolved.final_test_ng)],
                     preprocessing_pipeline,
-                ),
+                )
+            final_predictions = self._final_predictions_from_preprocessed(
+                final_test_predictions,
                 normal_directory=resolved.final_test_ok,
                 abnormal_directory=resolved.final_test_ng,
                 threshold=calibration_result.threshold_value,
+                artifact_directory=artifact_directory,
+                inspection_region=inspection_region,
+                preprocessing_pipeline=preprocessing_pipeline,
+                pixel_threshold=pixel_threshold,
             )
         quality_report = calculate_quality_metrics(
             final_predictions,
@@ -176,6 +195,8 @@ class EvaluationRevisionService:
             final_test_manifest_sha256=str(final_test_manifest["manifest_sha256"]),
             threshold_metadata=threshold_metadata,
             evaluation_metrics=quality_report.metrics,
+            revision_id=revision_id,
+            pixel_operating_point=pixel_operating_point.to_dict(),
         )
         threshold_metadata["threshold_revision"] = revision_path.stem
         revision_directory = revision_path.parent
@@ -276,16 +297,156 @@ class EvaluationRevisionService:
         normal_directory: Path,
         abnormal_directory: Path | None,
         threshold: float,
+        artifact_directory: Path | None = None,
+        inspection_region=None,
+        pixel_threshold: float | None = None,
     ) -> list[PredictionResult]:
-        return EvaluationRevisionService._final_predictions_from_scores(
-            ((prediction.image_path, prediction.score) for prediction in iter_anomalib_predictions(output)),
+        labels = {path: ("OK", "final_test_ok") for path in EvaluationRevisionService._images(normal_directory)}
+        labels.update({path: ("NG", "final_test_ng") for path in EvaluationRevisionService._images(abnormal_directory)})
+        region_metadata = inspection_region_metadata(inspection_region) if inspection_region is not None else {}
+        results: list[PredictionResult] = []
+        for prediction in iter_anomalib_predictions(output):
+            try:
+                ground_truth, role = labels[prediction.image_path]
+            except KeyError as exc:
+                raise ValueError(f"Final-test prediction path is outside the selected revision folders: {prediction.image_path}") from exc
+            artifacts = EvaluationRevisionService._prediction_artifacts(
+                prediction.image_path,
+                prediction.anomaly_map,
+                artifact_directory,
+                len(results),
+                inspection_region=inspection_region,
+                pixel_threshold=pixel_threshold,
+            )
+            results.append(
+                PredictionResult(
+                    source_path=str(prediction.image_path),
+                    original_image=str(prediction.image_path),
+                    predicted_label="NG" if prediction.score >= threshold else "OK",
+                    ground_truth_label=ground_truth,
+                    anomaly_score=prediction.score,
+                    threshold=threshold,
+                    dataset_role=role,
+                    native_image_score=prediction.score,
+                    native_tile_scores=[prediction.score],
+                    score_semantic=prediction.score_semantic,
+                    continuous_anomaly_map=artifacts.continuous_anomaly_map,
+                    anomaly_map=artifacts.heatmap_image,
+                    overlay_image=artifacts.overlay_image,
+                    binary_mask=artifacts.binary_mask,
+                    contour_overlay_image=artifacts.contour_overlay_image,
+                    pixel_threshold=artifacts.pixel_threshold,
+                    pixel_threshold_comparator=artifacts.pixel_threshold_comparator,
+                    pixel_threshold_semantic=artifacts.pixel_threshold_semantic,
+                    map_display_normalization=artifacts.display_normalization or {},
+                    region_metadata=region_metadata,
+                )
+            )
+        if len(results) != len(labels):
+            raise RuntimeError(f"Final-test prediction count mismatch: expected {len(labels)}, received {len(results)}.")
+        return results
+
+    @staticmethod
+    def _final_predictions_from_preprocessed(
+        predictions: list[Any],
+        *,
+        normal_directory: Path,
+        abnormal_directory: Path | None,
+        threshold: float,
+        artifact_directory: Path | None,
+        inspection_region,
+        preprocessing_pipeline: PreprocessingPipeline,
+        pixel_threshold: float | None,
+    ) -> list[PredictionResult]:
+        labels = {path: ("OK", "final_test_ok") for path in EvaluationRevisionService._images(normal_directory)}
+        labels.update({path: ("NG", "final_test_ng") for path in EvaluationRevisionService._images(abnormal_directory)})
+        region_metadata = inspection_region_metadata(inspection_region)
+        results: list[PredictionResult] = []
+        for prediction in predictions:
+            try:
+                ground_truth, role = labels[prediction.source_path]
+            except KeyError as exc:
+                raise ValueError(f"Final-test prediction path is outside the selected revision folders: {prediction.source_path}") from exc
+            artifacts = EvaluationRevisionService._prediction_artifacts(
+                prediction.source_path,
+                prediction.anomaly_map,
+                artifact_directory,
+                len(results),
+                preprocessing_pipeline=preprocessing_pipeline,
+                pixel_threshold=pixel_threshold,
+            )
+            results.append(
+                PredictionResult(
+                    source_path=str(prediction.source_path),
+                    original_image=str(prediction.source_path),
+                    predicted_label="NG" if prediction.score >= threshold else "OK",
+                    ground_truth_label=ground_truth,
+                    anomaly_score=prediction.score,
+                    threshold=threshold,
+                    dataset_role=role,
+                    native_image_score=prediction.native_image_score,
+                    native_tile_scores=list(prediction.native_tile_scores),
+                    score_semantic=prediction.score_semantic,
+                    continuous_anomaly_map=artifacts.continuous_anomaly_map,
+                    anomaly_map=artifacts.heatmap_image,
+                    overlay_image=artifacts.overlay_image,
+                    binary_mask=artifacts.binary_mask,
+                    contour_overlay_image=artifacts.contour_overlay_image,
+                    pixel_threshold=artifacts.pixel_threshold,
+                    pixel_threshold_comparator=artifacts.pixel_threshold_comparator,
+                    pixel_threshold_semantic=artifacts.pixel_threshold_semantic,
+                    map_display_normalization=artifacts.display_normalization or {},
+                    region_metadata=region_metadata,
+                )
+            )
+        if len(results) != len(labels):
+            raise RuntimeError(f"Final-test prediction count mismatch: expected {len(labels)}, received {len(results)}.")
+        return results
+
+    @staticmethod
+    def _prediction_artifacts(
+        source_path: Path,
+        anomaly_map: Any,
+        artifact_directory: Path | None,
+        index: int,
+        *,
+        inspection_region=None,
+        preprocessing_pipeline: PreprocessingPipeline | None = None,
+        pixel_threshold: float | None = None,
+    ) -> PredictionArtifacts:
+        if artifact_directory is None:
+            return PredictionArtifacts()
+        rectified_image = None
+        if preprocessing_pipeline is not None:
+            _prepared, rectified_image = preprocessing_pipeline.prepare_path_with_rectified(source_path)
+        elif inspection_region is not None and inspection_region.enabled:
+            rectified_image = InspectionRegionProcessor(inspection_region).apply_path(source_path)
+        return save_prediction_artifacts(
+            source_path,
+            anomaly_map,
+            artifact_directory,
+            index,
+            rectified_image=rectified_image,
+            pixel_threshold=pixel_threshold,
+        )
+
+    @staticmethod
+    def _final_predictions_from_scores(
+        predictions: Any,
+        *,
+        normal_directory: Path,
+        abnormal_directory: Path | None,
+        threshold: float,
+    ) -> list[PredictionResult]:
+        return EvaluationRevisionService._final_predictions_from_scores_legacy(
+            predictions,
             normal_directory=normal_directory,
             abnormal_directory=abnormal_directory,
             threshold=threshold,
         )
 
     @staticmethod
-    def _final_predictions_from_scores(
+    def _final_predictions_from_scores_legacy(
         predictions: Any,
         *,
         normal_directory: Path,
@@ -316,13 +477,13 @@ class EvaluationRevisionService:
         return results
 
     @staticmethod
-    def _preprocessed_scores(
+    def _preprocessed_predictions(
         components: dict[str, Any],
         checkpoint_path: Path,
         source_paths: list[Path],
         preprocessing_pipeline: PreprocessingPipeline,
-    ) -> list[tuple[Path, float]]:
-        """Run a saved preprocessing-v2 plan and return one externally-scored result per source."""
+    ) -> list[Any]:
+        """Run a saved preprocessing plan and retain source scores, maps, and provenance."""
         from PIL import Image
         from anomalib.data import PredictDataset
 
@@ -345,12 +506,11 @@ class EvaluationRevisionService:
                 return_predictions=True,
                 ckpt_path=str(checkpoint_path),
             )
-            return [
-                (prediction.source_path, prediction.score)
-                for prediction in iter_preprocessed_predictions(
+            return list(
+                iter_preprocessed_predictions(
                     output,
                     source_path_by_staged_path,
                     preprocessing_tile_by_staged_path,
                     preprocessing_pipeline,
                 )
-            ]
+            )

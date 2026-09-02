@@ -206,6 +206,8 @@ class AnomalibService:
             engine_kwargs["max_epochs"] = 1
         if config.is_dinomaly:
             engine_kwargs["max_steps"] = config.resolved_dinomaly_training_steps(training_image_count)
+        elif not config.uses_fixed_one_pass:
+            engine_kwargs["max_epochs"] = config.max_epochs
         if callbacks:
             engine_kwargs["callbacks"] = callbacks
         engine = Engine(
@@ -424,7 +426,12 @@ class AnomalibService:
             model_class,
             definition,
             preprocessing_plan,
-            {"num_neighbours": 1, "encoder_name": "vit_small_patch14_dinov2", "sampling_ratio": 0.1},
+            {
+                "num_neighbours": 1,
+                "encoder_name": "vit_small_patch14_dinov2",
+                "coreset_subsampling": True,
+                "sampling_ratio": 0.1,
+            },
         )
 
     def _create_super_add_model(

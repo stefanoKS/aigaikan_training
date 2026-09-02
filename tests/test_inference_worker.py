@@ -12,16 +12,18 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from app.core.prediction_artifacts import PredictionArtifacts
 from app.core.preprocessing_contract import resolved_preprocessing_hash, write_resolved_preprocessing_plan
 from app.core.run_artifacts import CanonicalCheckpoint, write_run_manifest
+from app.core.threshold_contract import PixelThresholdOperatingPoint
 from app.core.inspection_region import inspection_region_hash, write_inspection_region
 from app.models.inspection_region import InspectionRegionConfig
-from app.models.preprocessing_config import PreprocessingConfig
+from app.models.preprocessing_config import LEGACY_PREPROCESSING_CONTRACT_VERSION, PreprocessingConfig
 from app.models.training_config import TrainingConfig
 from app.workers import inference_worker
 
 
-def _write_run(run_directory: Path) -> Path:
+def _write_run(run_directory: Path, pixel_operating_point: PixelThresholdOperatingPoint | None = None) -> Path:
     checkpoint = run_directory / "weights" / "model.ckpt"
     checkpoint.parent.mkdir(parents=True)
     checkpoint.write_text("checkpoint", encoding="utf-8")
@@ -43,7 +45,7 @@ def _write_run(run_directory: Path) -> Path:
                 "source_size": [0, 0],
                 "rectified_size": [0, 0],
             }
-        },
+        } | ({"pixel_operating_point": pixel_operating_point.to_dict()} if pixel_operating_point is not None else {}),
     )
     return checkpoint
 
@@ -79,7 +81,7 @@ def test_folder_inference_uses_anomalib_discovery_and_logs_selected_patchcore_ru
     second_image.touch()
     messages: list[dict[str, object]] = []
     monkeypatch.setattr(inference_worker, "AnomalibService", _fake_service([first_image, second_image]))
-    monkeypatch.setattr(inference_worker, "_save_visualizations", lambda *_args: ("", ""))
+    monkeypatch.setattr(inference_worker, "save_prediction_artifacts", lambda *_args, **_kwargs: PredictionArtifacts())
     monkeypatch.setattr(inference_worker, "emit", messages.append)
 
     assert inference_worker.run(run_directory, input_directory) == 0
@@ -99,7 +101,7 @@ def test_folder_inference_fails_when_anomalib_skips_a_discovered_image(tmp_path:
     first_image.touch()
     second_image.touch()
     monkeypatch.setattr(inference_worker, "AnomalibService", _fake_service([first_image]))
-    monkeypatch.setattr(inference_worker, "_save_visualizations", lambda *_args: ("", ""))
+    monkeypatch.setattr(inference_worker, "save_prediction_artifacts", lambda *_args, **_kwargs: PredictionArtifacts())
     monkeypatch.setattr(inference_worker, "emit", lambda _message: None)
 
     with pytest.raises(ValueError, match="produced 1 predictions for 2 input images"):
@@ -165,7 +167,7 @@ def test_enabled_roi_inference_uses_predict_dataset_with_the_saved_processor(tmp
             }
 
     monkeypatch.setattr(inference_worker, "AnomalibService", FakeService)
-    monkeypatch.setattr(inference_worker, "_save_visualizations", lambda *_args: ("", ""))
+    monkeypatch.setattr(inference_worker, "save_prediction_artifacts", lambda *_args, **_kwargs: PredictionArtifacts())
     monkeypatch.setattr(inference_worker, "emit", lambda _message: None)
 
     assert inference_worker.run(run_directory, image_path) == 0
@@ -178,8 +180,10 @@ def test_enabled_roi_inference_uses_predict_dataset_with_the_saved_processor(tmp
 
 def test_preprocessing_v2_inference_uses_prepared_geometry_and_reconstructed_source_map(tmp_path: Path, monkeypatch) -> None:
     run_directory = tmp_path / "run"
-    _write_run(run_directory)
-    plan = PreprocessingConfig().resolve("patchcore", (639, 177))
+    _write_run(run_directory, PixelThresholdOperatingPoint(enabled=True, threshold=0.6))
+    plan = PreprocessingConfig(
+        preprocessing_contract_version=LEGACY_PREPROCESSING_CONTRACT_VERSION
+    ).resolve("patchcore", (639, 177))
     write_resolved_preprocessing_plan(run_directory / "preprocessing_plan.json", plan)
     manifest_path = run_directory / "run_manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -199,7 +203,6 @@ def test_preprocessing_v2_inference_uses_prepared_geometry_and_reconstructed_sou
 
     Image.new("RGB", (639, 177), (10, 20, 30)).save(source_path)
     captured: dict[str, object] = {}
-    visualized: list[tuple[object, object]] = []
 
     class FakePredictDataset:
         def __init__(self, path: Path) -> None:
@@ -231,19 +234,18 @@ def test_preprocessing_v2_inference_uses_prepared_geometry_and_reconstructed_sou
     monkeypatch.setitem(sys.modules, "anomalib.data", anomalib_data)
     monkeypatch.setattr(inference_worker, "AnomalibService", FakeService)
     monkeypatch.setattr(inference_worker, "_discover_images", lambda _path: (source_path.resolve(),))
-    monkeypatch.setattr(
-        inference_worker,
-        "_save_visualizations",
-        lambda _source, anomaly_map, _directory, _index, rectified: visualized.append((anomaly_map, rectified)) or ("", ""),
-    )
     messages: list[dict[str, object]] = []
     monkeypatch.setattr(inference_worker, "emit", messages.append)
 
     assert inference_worker.run(run_directory, source_path) == 0
 
     assert captured["prepared_size"] == (640, 192)
-    assert visualized[0][0].shape == (177, 639)
-    assert visualized[0][1].shape == (177, 639, 3)
     prediction = next(message for message in messages if message["type"] == "prediction")
     assert prediction["anomaly_score"] == pytest.approx(0.7)
     assert prediction["predicted_label"] == "NG"
+    assert np.load(prediction["continuous_anomaly_map"])["anomaly_map"].shape == (177, 639)
+    assert prediction["map_display_normalization"]["minimum"] == 0.0
+    assert prediction["region_metadata"]["coordinate_space"] == "source_image"
+    assert prediction["pixel_threshold"] == 0.6
+    assert prediction["pixel_threshold_comparator"] == "greater_than_or_equal"
+    assert np.asarray(Image.open(prediction["binary_mask"])).max() == 255

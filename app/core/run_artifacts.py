@@ -11,6 +11,7 @@ from typing import Any, Mapping
 from app.core.dataset_manifest import sha256_file
 from app.core.inspection_region import inspection_region_hash, read_inspection_region
 from app.core.preprocessing_contract import read_resolved_preprocessing_plan, resolved_preprocessing_hash
+from app.core.threshold_contract import PixelThresholdOperatingPoint
 from app.models.inspection_region import InspectionRegionConfig
 from app.models.preprocessing_config import ResolvedPreprocessingPlan
 
@@ -61,6 +62,11 @@ def write_run_manifest(
         payload["threshold_metadata"] = metadata
     if extra:
         payload.update(extra)
+    pixel_operating_point = payload.get("pixel_operating_point")
+    if pixel_operating_point is not None:
+        if not isinstance(pixel_operating_point, Mapping):
+            raise ValueError("Pixel operating point must be an object.")
+        payload["pixel_operating_point"] = PixelThresholdOperatingPoint.from_dict(pixel_operating_point).to_dict()
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
     return path
 
@@ -73,6 +79,8 @@ def write_evaluation_revision(
     final_test_manifest_sha256: str,
     threshold_metadata: Mapping[str, object],
     evaluation_metrics: Mapping[str, object] | None = None,
+    revision_id: str | None = None,
+    pixel_operating_point: Mapping[str, object] | None = None,
 ) -> Path:
     """Write an immutable recalibration/evaluation record without altering the model checkpoint."""
     metadata = _validated_threshold_metadata(
@@ -81,8 +89,9 @@ def write_evaluation_revision(
     )
     revisions_directory = run_directory / "evaluation_revisions"
     revisions_directory.mkdir(parents=True, exist_ok=True)
-    existing = sorted(revisions_directory.glob("revision-*.json"))
-    revision_id = f"revision-{len(existing) + 1:03d}"
+    revision_id = revision_id or next_evaluation_revision_id(run_directory)
+    if not revision_id.startswith("revision-") or not revision_id[9:].isdigit():
+        raise ValueError("Evaluation revision ID must use the form revision-NNN.")
     metadata["threshold_revision"] = revision_id
     path = revisions_directory / f"{revision_id}.json"
     payload: dict[str, object] = {
@@ -97,24 +106,32 @@ def write_evaluation_revision(
     }
     if evaluation_metrics:
         payload["evaluation_metrics"] = dict(evaluation_metrics)
+    if pixel_operating_point is not None:
+        payload["pixel_operating_point"] = PixelThresholdOperatingPoint.from_dict(pixel_operating_point).to_dict()
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
     return path
+
+
+def next_evaluation_revision_id(run_directory: Path) -> str:
+    """Return the next deterministic revision identifier without writing a record."""
+    revisions_directory = run_directory / "evaluation_revisions"
+    existing = sorted(revisions_directory.glob("revision-*.json"))
+    return f"revision-{len(existing) + 1:03d}"
 
 
 def extract_decision_threshold(model: Any) -> float:
     """Read Anomalib's calibrated image decision boundary without inventing a fallback."""
     post_processor = getattr(model, "post_processor", None)
-    for name in ("image_threshold", "pixel_threshold"):
-        threshold = getattr(post_processor, name, None)
-        value = getattr(threshold, "value", threshold)
-        if hasattr(value, "item"):
-            value = value.item()
-        try:
-            result = float(value)
-        except (TypeError, ValueError):
-            continue
-        if isfinite(result):
-            return result
+    threshold = getattr(post_processor, "image_threshold", None)
+    value = getattr(threshold, "value", threshold)
+    if hasattr(value, "item"):
+        value = value.item()
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        result = float("nan")
+    if isfinite(result):
+        return result
     raise RuntimeError("Anomalib did not provide a finite calibrated decision threshold.")
 
 
@@ -156,6 +173,16 @@ def read_persisted_threshold_metadata(run_directory: Path) -> dict[str, object]:
         },
         float(threshold),
     )
+
+
+def read_persisted_pixel_operating_point(run_directory: Path) -> PixelThresholdOperatingPoint:
+    """Read the explicit mask operating point, leaving legacy runs mask-free."""
+    payload = read_run_manifest(run_directory).get("pixel_operating_point")
+    if payload is None:
+        return PixelThresholdOperatingPoint()
+    if not isinstance(payload, Mapping):
+        raise ValueError("Run manifest pixel operating point must be an object.")
+    return PixelThresholdOperatingPoint.from_dict(payload)
 
 
 def read_canonical_checkpoint(run_directory: Path) -> CanonicalCheckpoint:

@@ -14,8 +14,9 @@ from typing import Any, Callable
 from app.core.environment_info import collect_environment_info
 from app.core.dataset_manifest import build_dataset_manifest, build_effective_split, stage_effective_split, write_dataset_manifest
 from app.core.dataset_validator import DatasetValidator
-from app.core.inspection_region import inspection_region_hash, validate_inspection_region_sources, write_inspection_region
+from app.core.inspection_region import InspectionRegionProcessor, inspection_region_hash, validate_inspection_region_sources, write_inspection_region
 from app.core.model_registry import ModelExecutionMode
+from app.core.prediction_artifacts import PredictionArtifacts, inspection_region_metadata, save_prediction_artifacts
 from app.core.prediction_adapter import iter_anomalib_predictions, iter_preprocessed_predictions
 from app.core.preprocessing_contract import preprocessing_hash, resolved_preprocessing_hash, write_resolved_preprocessing_plan
 from app.core.preprocessing_pipeline import PreprocessingPipeline, resolve_preprocessing_plan
@@ -186,9 +187,13 @@ def _final_test_predictions(
     threshold: float,
     preprocessing_pipeline: PreprocessingPipeline | None = None,
     preprocessing_tile_by_staged_path: dict[Path, PreprocessingTile] | None = None,
+    artifact_directory: Path | None = None,
+    inspection_region: InspectionRegionConfig | None = None,
+    pixel_threshold: float | None = None,
 ) -> list[PredictionResult]:
     """Build final-test rows using the application-calibrated deployment threshold."""
     predictions: list[PredictionResult] = []
+    region_metadata = inspection_region_metadata(inspection_region) if inspection_region is not None else {}
     if preprocessing_pipeline is not None:
         if preprocessing_tile_by_staged_path is None:
             raise ValueError("Preprocessing-v2 final testing requires staged tile provenance.")
@@ -205,6 +210,14 @@ def _final_test_predictions(
                 ground_truth = "NG"
             else:
                 raise ValueError(f"Final-test prediction path has an unexpected staged role: {prediction.staged_paths[0]}")
+            artifacts = _prediction_artifacts(
+                prediction.source_path,
+                prediction.anomaly_map,
+                artifact_directory,
+                len(predictions),
+                preprocessing_pipeline=preprocessing_pipeline,
+                pixel_threshold=pixel_threshold,
+            )
             predictions.append(
                 PredictionResult(
                     source_path=str(prediction.source_path),
@@ -214,6 +227,19 @@ def _final_test_predictions(
                     threshold=threshold,
                     original_image=str(prediction.source_path),
                     dataset_role=role,
+                    native_image_score=prediction.native_image_score,
+                    native_tile_scores=list(prediction.native_tile_scores),
+                    score_semantic=prediction.score_semantic,
+                    continuous_anomaly_map=artifacts.continuous_anomaly_map,
+                    anomaly_map=artifacts.heatmap_image,
+                    overlay_image=artifacts.overlay_image,
+                    binary_mask=artifacts.binary_mask,
+                    contour_overlay_image=artifacts.contour_overlay_image,
+                    pixel_threshold=artifacts.pixel_threshold,
+                    pixel_threshold_comparator=artifacts.pixel_threshold_comparator,
+                    pixel_threshold_semantic=artifacts.pixel_threshold_semantic,
+                    map_display_normalization=artifacts.display_normalization or {},
+                    region_metadata=region_metadata,
                 )
             )
         return predictions
@@ -229,6 +255,14 @@ def _final_test_predictions(
             ground_truth = "NG"
         else:
             raise ValueError(f"Final-test prediction path has an unexpected staged role: {staged_path}")
+        artifacts = _prediction_artifacts(
+            source_path,
+            anomalib_prediction.anomaly_map,
+            artifact_directory,
+            len(predictions),
+            inspection_region=inspection_region,
+            pixel_threshold=pixel_threshold,
+        )
         predictions.append(
             PredictionResult(
                 source_path=str(source_path),
@@ -238,9 +272,50 @@ def _final_test_predictions(
                 threshold=threshold,
                 original_image=str(source_path),
                 dataset_role=dataset_role,
+                native_image_score=anomalib_prediction.score,
+                native_tile_scores=[anomalib_prediction.score],
+                score_semantic=anomalib_prediction.score_semantic,
+                continuous_anomaly_map=artifacts.continuous_anomaly_map,
+                anomaly_map=artifacts.heatmap_image,
+                overlay_image=artifacts.overlay_image,
+                binary_mask=artifacts.binary_mask,
+                contour_overlay_image=artifacts.contour_overlay_image,
+                pixel_threshold=artifacts.pixel_threshold,
+                pixel_threshold_comparator=artifacts.pixel_threshold_comparator,
+                pixel_threshold_semantic=artifacts.pixel_threshold_semantic,
+                map_display_normalization=artifacts.display_normalization or {},
+                region_metadata=region_metadata,
             )
         )
     return predictions
+
+
+def _prediction_artifacts(
+    source_path: Path,
+    anomaly_map: Any,
+    artifact_directory: Path | None,
+    index: int,
+    *,
+    preprocessing_pipeline: PreprocessingPipeline | None = None,
+    inspection_region: InspectionRegionConfig | None = None,
+    pixel_threshold: float | None = None,
+) -> PredictionArtifacts:
+    """Persist artifacts in the map coordinate system used for the prediction."""
+    if artifact_directory is None:
+        return PredictionArtifacts()
+    rectified_image = None
+    if preprocessing_pipeline is not None:
+        _prepared, rectified_image = preprocessing_pipeline.prepare_path_with_rectified(source_path)
+    elif inspection_region is not None and inspection_region.enabled:
+        rectified_image = InspectionRegionProcessor(inspection_region).apply_path(source_path)
+    return save_prediction_artifacts(
+        source_path,
+        anomaly_map,
+        artifact_directory,
+        index,
+        rectified_image=rectified_image,
+        pixel_threshold=pixel_threshold,
+    )
 
 
 def _model_provenance(
@@ -444,9 +519,12 @@ def run(project_file: Path) -> int:
             ),
         )
         decision_threshold = calibration_result.threshold_value
+        pixel_operating_point = project.training.pixel_operating_point
+        pixel_threshold = pixel_operating_point.active_threshold
         threshold_metadata = calibration_result.to_dict()
         threshold_metadata["calibration_manifest_sha256"] = calibration_manifest["manifest_sha256"]
         threshold_metadata["calibration_manifest_path"] = str(run_dir / "calibration_manifest.json")
+        threshold_metadata["pixel_operating_point"] = pixel_operating_point.to_dict()
         emit(
             {
                 "type": "log",
@@ -482,6 +560,9 @@ def run(project_file: Path) -> int:
             decision_threshold,
             preprocessing_pipeline,
             staged_dataset.preprocessing_tile_by_staged_path,
+            artifact_directory=run_dir / "prediction_artifacts",
+            inspection_region=project.inspection_region,
+            pixel_threshold=pixel_threshold,
         )
         expected_prediction_count = sum(effective_split.counts()["final_test"].values())
         if len(predictions) != expected_prediction_count:
@@ -534,6 +615,7 @@ def run(project_file: Path) -> int:
             final_test_manifest_sha256=str(final_test_manifest["manifest_sha256"]),
             threshold_metadata=threshold_metadata,
             evaluation_metrics=quality_report.metrics,
+            pixel_operating_point=pixel_operating_point.to_dict(),
         )
         threshold_metadata["threshold_revision"] = revision_path.stem
         run_metrics["Threshold Revision"] = revision_path.stem
@@ -599,6 +681,7 @@ def run(project_file: Path) -> int:
                 "final_test_manifest_path": str(run_dir / "final_test_manifest.json"),
                 "evaluation_revision_path": str(revision_path),
                 "predictions_path": str(run_dir / "predictions.csv"),
+                "pixel_operating_point": pixel_operating_point.to_dict(),
                 "inspection_region_hash": roi_hash,
                 "roi_contract_version": project.inspection_region.roi_contract_version,
                 "rectified_roi_size": {"width": rectified_width, "height": rectified_height},

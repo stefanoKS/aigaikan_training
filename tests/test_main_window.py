@@ -11,6 +11,7 @@ from PySide6.QtWidgets import QApplication
 from PIL import Image
 
 from app.models.dataset_config import DatasetRole, FolderImportMode
+from app.models.preprocessing_config import LEGACY_PREPROCESSING_CONTRACT_VERSION, PaddingPolicy, PreprocessingConfig
 from app.core.preprocessing_contract import read_preprocessing_config
 from app.core.project_manager import ProjectManager
 from app.core.settings_manager import SettingsManager
@@ -153,4 +154,82 @@ def test_saving_preprocessing_policy_marks_existing_results_for_retraining(tmp_p
     assert project.training.dinomaly_encoder_id == "vit_base_patch16_dinov3.lvd1689m"
     assert project.last_training_status == "Retraining required"
     assert window.inference_page.status_label.text() == "Retraining required"
+    window.close()
+
+
+def test_v3_padding_geometry_and_custom_policy_persist_and_invalid_sizes_are_blocked(tmp_path: Path) -> None:
+    application = QApplication.instance() or QApplication([])
+    manager = ProjectManager(tmp_path / "projects")
+    window = MainWindow(SettingsManager(), manager)
+    project = manager.create_project("dynamic-padding")
+    window._set_current_project(project)
+    source_directory = tmp_path / "source"
+    source_directory.mkdir()
+    Image.new("RGB", (321, 77), (20, 30, 40)).save(source_directory / "first.png")
+    window.dataset_manager.assign_folder(
+        project.dataset,
+        DatasetRole.OK_TRAIN,
+        source_directory,
+        FolderImportMode.REFERENCE,
+    )
+    model_index = window.config_page.model_combo.findData("dinomaly_dinov3")
+    window.config_page.model_combo.setCurrentIndex(model_index)
+    application.processEvents()
+
+    assert window.config_page.rectified_roi_size_label.text() == "321 x 77 px"
+    assert window.config_page.automatic_right_padding_label.text() == "15 px"
+    assert window.config_page.automatic_bottom_padding_label.text() == "3 px"
+    assert window.config_page.prepared_image_size_label.text() == "336 x 80 px"
+
+    custom_index = window.config_page.padding_policy_combo.findData(PaddingPolicy.CUSTOM.value)
+    window.config_page.padding_policy_combo.setCurrentIndex(custom_index)
+    window.config_page.custom_right_padding_spin.setValue(15)
+    window.config_page.custom_bottom_padding_spin.setValue(3)
+    assert window._save_training_config(show_dialog=False)
+
+    persisted = read_preprocessing_config(project.root_path / "preprocessing.json")
+    assert persisted.padding_policy is PaddingPolicy.CUSTOM
+    assert persisted.custom_padding_right == 15
+    assert persisted.custom_padding_bottom == 3
+
+    window.config_page.custom_right_padding_spin.setValue(1)
+    assert "nearest valid size 336x80" in window.config_page.padding_validation_label.text()
+    assert not window._save_training_config(show_dialog=False)
+    window.close()
+
+
+def test_saving_training_settings_retains_a_legacy_v2_preprocessing_policy(tmp_path: Path) -> None:
+    application = QApplication.instance() or QApplication([])
+    manager = ProjectManager(tmp_path / "projects")
+    window = MainWindow(SettingsManager(), manager)
+    project = manager.create_project("legacy-padding")
+    project.preprocessing = PreprocessingConfig(preprocessing_contract_version=LEGACY_PREPROCESSING_CONTRACT_VERSION)
+    expected_policy = project.preprocessing.to_dict()
+    manager.save_project(project)
+    window._set_current_project(project)
+    window.config_page.seed_spin.setValue(99)
+    application.processEvents()
+
+    assert not window.config_page.padding_policy_combo.isEnabled()
+    assert window._save_training_config(show_dialog=False)
+
+    persisted = read_preprocessing_config(project.root_path / "preprocessing.json")
+    assert persisted.preprocessing_contract_version == LEGACY_PREPROCESSING_CONTRACT_VERSION
+    assert persisted.to_dict() == expected_policy
+    window.close()
+
+
+def test_model_controls_only_allow_verified_runtime_settings() -> None:
+    application = QApplication.instance() or QApplication([])
+    window = MainWindow(SettingsManager(), ProjectManager(SettingsManager().default_projects_directory()))
+
+    for model_name in ("anomaly_dino", "super_add"):
+        window.config_page.model_combo.setCurrentIndex(window.config_page.model_combo.findData(model_name))
+        application.processEvents()
+        assert window.config_page.max_epochs_spin.value() == 1
+        assert not window.config_page.max_epochs_spin.isEnabled()
+    window.config_page.model_combo.setCurrentIndex(window.config_page.model_combo.findData("efficient_ad"))
+    application.processEvents()
+    assert window.config_page.batch_size_spin.value() == 1
+    assert not window.config_page.batch_size_spin.isEnabled()
     window.close()

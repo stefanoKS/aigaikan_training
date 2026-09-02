@@ -429,7 +429,12 @@ def test_preprocessing_v2_uses_explicit_model_geometry_without_a_second_folder_t
         (
             "anomaly_dino",
             "AnomalyDINO",
-            {"num_neighbours": 1, "encoder_name": "vit_small_patch14_dinov2", "sampling_ratio": 0.1},
+            {
+                "num_neighbours": 1,
+                "encoder_name": "vit_small_patch14_dinov2",
+                "coreset_subsampling": True,
+                "sampling_ratio": 0.1,
+            },
         ),
         (
             "super_add",
@@ -465,6 +470,57 @@ def test_new_model_adapters_use_their_verified_stock_constructor_arguments(
 
     assert isinstance(model, FakeModel)
     assert model.kwargs == expected_kwargs
+
+
+@pytest.mark.parametrize(
+    ("model_name", "class_name", "batch_size"),
+    (
+        ("anomaly_dino", "AnomalyDINO", 8),
+        ("efficient_ad", "EfficientAd", 1),
+        ("super_add", "SuperADD", 8),
+        ("supersimplenet", "Supersimplenet", 8),
+    ),
+)
+def test_model_specific_engine_limits_are_explicit(
+    tmp_path: Path,
+    monkeypatch,
+    model_name: str,
+    class_name: str,
+    batch_size: int,
+) -> None:
+    class FakeFolder:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+
+    class FakeEngine:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+
+    class FakeModel:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+
+    anomalib_data = ModuleType("anomalib.data")
+    anomalib_engine = ModuleType("anomalib.engine")
+    anomalib_models = ModuleType("anomalib.models")
+    anomalib_data.Folder = FakeFolder
+    anomalib_engine.Engine = FakeEngine
+    setattr(anomalib_models, class_name, FakeModel)
+    monkeypatch.setitem(sys.modules, "anomalib.data", anomalib_data)
+    monkeypatch.setitem(sys.modules, "anomalib.engine", anomalib_engine)
+    monkeypatch.setitem(sys.modules, "anomalib.models", anomalib_models)
+    ok_folder = tmp_path / "ok"
+    ok_folder.mkdir()
+    dataset = DatasetConfig()
+    dataset.folders[DatasetRole.OK_TRAIN].path = str(ok_folder)
+
+    components = AnomalibService().create_components(
+        dataset,
+        TrainingConfig(model_name=model_name, batch_size=batch_size, max_epochs=7, device=DeviceMode.CPU),
+    )
+
+    assert components["engine"].kwargs["max_epochs"] == (1 if model_name in {"anomaly_dino", "super_add"} else 7)
+    assert components["datamodule"].kwargs["train_batch_size"] == batch_size
 
 
 def test_unregistered_model_ids_are_rejected_before_training() -> None:

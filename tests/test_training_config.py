@@ -34,6 +34,16 @@ def test_training_config_round_trip() -> None:
     restored.validate()
 
 
+def test_pixel_threshold_operating_point_is_independent_and_opt_in() -> None:
+    config = TrainingConfig(pixel_threshold_enabled=True, pixel_threshold=2.5)
+
+    restored = TrainingConfig.from_dict(config.to_dict())
+
+    assert restored.pixel_operating_point.active_threshold == 2.5
+    assert restored.pixel_operating_point.to_dict()["comparator"] == "greater_than_or_equal"
+    assert TrainingConfig.from_dict({}).pixel_operating_point.active_threshold is None
+
+
 def test_patchcore_defaults_to_fixed_production_profile() -> None:
     config = TrainingConfig()
 
@@ -121,6 +131,49 @@ def test_invalid_batch_size_raises() -> None:
         config.validate()
     except ValueError as exc:
         assert "Batch size" in str(exc)
+    else:
+        raise AssertionError("Expected validation failure")
+
+
+def test_anomaly_dino_uses_one_memory_bank_collection_pass() -> None:
+    config = TrainingConfig(model_name="anomaly_dino", max_epochs=12)
+
+    assert config.max_epochs == 1
+    assert config.model_profile()["coreset_subsampling"] is True
+    assert config.model_profile()["sampling_ratio"] == 0.1
+    config.max_epochs = 2
+    try:
+        config.validate()
+    except ValueError as exc:
+        assert "AnomalyDINO" in str(exc)
+    else:
+        raise AssertionError("Expected validation failure")
+
+
+def test_efficient_ad_requires_one_image_training_batches() -> None:
+    config = TrainingConfig(model_name="efficient_ad", batch_size=12)
+
+    assert config.batch_size == 1
+    assert config.model_profile()["batch_size"] == 1
+    config.batch_size = 2
+    try:
+        config.validate()
+    except ValueError as exc:
+        assert "EfficientAD" in str(exc)
+    else:
+        raise AssertionError("Expected validation failure")
+
+
+def test_super_add_uses_its_stock_single_memory_bank_pass() -> None:
+    config = TrainingConfig(model_name="super_add", max_epochs=12)
+
+    assert config.max_epochs == 1
+    assert config.model_profile()["max_epochs"] == 1
+    config.max_epochs = 2
+    try:
+        config.validate()
+    except ValueError as exc:
+        assert "SuperADD" in str(exc)
     else:
         raise AssertionError("Expected validation failure")
 

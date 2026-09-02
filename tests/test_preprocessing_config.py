@@ -15,7 +15,12 @@ from app.core.preprocessing_contract import (
 )
 from app.core.preprocessing_pipeline import PreprocessingPipeline, resolve_preprocessing_plan
 from app.models.inspection_region import InspectionRegionConfig
-from app.models.preprocessing_config import PreprocessingConfig, TilingConfig
+from app.models.preprocessing_config import (
+    LEGACY_PREPROCESSING_CONTRACT_VERSION,
+    PaddingPolicy,
+    PreprocessingConfig,
+    TilingConfig,
+)
 
 
 def test_dinov3_full_roi_plan_preserves_the_reference_extent_on_a_valid_patch_grid() -> None:
@@ -37,7 +42,52 @@ def test_dinov2_full_roi_plan_uses_the_patch14_grid_without_a_destructive_crop()
     assert plan.tiles[0].valid_box == (0, 0, 639, 177)
 
 
-def test_tiled_dinov3_plan_uses_end_aligned_half_overlap_and_serializes_valid_masks() -> None:
+def test_v3_automatic_padding_uses_arbitrary_roi_geometry_and_only_patch_alignment() -> None:
+    plan = PreprocessingConfig().resolve("dinomaly_dinov3", (321, 77))
+
+    assert plan.rectified_size == (321, 77)
+    assert plan.model_input_size == (336, 80)
+    assert plan.resolved_padding == (0, 0, 15, 3)
+    assert plan.minimum_model_input_size == (0, 0)
+    assert plan.to_dict()["prepared_canvas_size"] == [336, 80]
+
+
+def test_v3_custom_padding_requires_an_explicitly_valid_prepared_canvas() -> None:
+    valid = PreprocessingConfig(
+        padding_policy=PaddingPolicy.CUSTOM,
+        custom_padding_right=15,
+        custom_padding_bottom=3,
+    ).resolve("dinomaly_dinov3", (321, 77))
+
+    assert valid.model_input_size == (336, 80)
+    with pytest.raises(ValueError, match="nearest valid size 336x80"):
+        PreprocessingConfig(
+            padding_policy=PaddingPolicy.CUSTOM,
+            custom_padding_right=1,
+            custom_padding_bottom=3,
+        ).resolve("dinomaly_dinov3", (321, 77))
+
+
+def test_legacy_v2_resolution_preserves_the_original_fixed_geometry() -> None:
+    legacy = PreprocessingConfig(preprocessing_contract_version=LEGACY_PREPROCESSING_CONTRACT_VERSION)
+    plan = legacy.resolve("patchcore", (321, 77))
+
+    assert plan.model_input_size == (640, 192)
+    assert "padding_policy" not in plan.to_dict()
+    assert "prepared_canvas_size" not in plan.to_dict()
+
+
+def test_super_add_v3_padding_uses_the_dynamic_roi_and_its_verified_minimum_canvas() -> None:
+    plan = PreprocessingConfig().resolve("super_add", (503, 197))
+
+    assert plan.rectified_size == (503, 197)
+    assert plan.model_alignment == (16, 16)
+    assert plan.minimum_model_input_size == (448, 448)
+    assert plan.model_input_size == (512, 448)
+    assert plan.resolved_padding == (0, 0, 9, 251)
+
+
+def test_tiled_dinov3_plan_uses_dynamic_tile_height_and_serializes_valid_masks() -> None:
     config = PreprocessingConfig(tiling=TilingConfig(enabled=True))
     plan = config.resolve("dinomaly_dinov3", (639, 177))
     payload = plan.to_dict()
@@ -47,12 +97,12 @@ def test_tiled_dinov3_plan_uses_end_aligned_half_overlap_and_serializes_valid_ma
         (160, 0, 320, 177),
         (319, 0, 320, 177),
     ]
-    assert plan.model_input_size == (448, 256)
-    assert [tile.valid_box for tile in plan.tiles] == [(0, 0, 448, 236)] * 3
+    assert plan.model_input_size == (320, 192)
+    assert [tile.valid_box for tile in plan.tiles] == [(0, 0, 320, 177)] * 3
     assert payload["tiles"][2]["valid_pixel_mask"] == {
         "encoding": "rectangular_valid_region",
-        "size": [448, 256],
-        "box": [0, 0, 448, 236],
+        "size": [320, 192],
+        "box": [0, 0, 320, 177],
     }
 
 
@@ -119,7 +169,7 @@ def test_tiled_pipeline_reconstructs_every_valid_reference_pixel() -> None:
     )
 
     assert len(prepared) == 3
-    assert all(item.image_rgb.shape == (256, 448, 3) for item in prepared)
+    assert all(item.image_rgb.shape == (192, 320, 3) for item in prepared)
     assert reconstructed.anomaly_map.shape == (177, 639)
     assert reconstructed.valid_mask.all()
     assert reconstructed.anomaly_map[20, 10] == 1
@@ -136,7 +186,7 @@ def test_mask_preprocessing_uses_the_same_tile_dimensions_without_interpolation(
     prepared_masks = pipeline.prepare_mask_array(mask)
 
     assert len(prepared_masks) == 3
-    assert all(prepared_mask.shape == (256, 448) for prepared_mask in prepared_masks)
+    assert all(prepared_mask.shape == (192, 320) for prepared_mask in prepared_masks)
     assert all(set(np.unique(prepared_mask)).issubset({0, 255}) for prepared_mask in prepared_masks)
     assert sum(np.count_nonzero(prepared_mask) for prepared_mask in prepared_masks) > 0
 
