@@ -84,7 +84,10 @@ QScrollArea#PreprocessSettingsScrollArea {
     border: none;
     border-top: 1px solid #2c3d40;
 }
-QScrollArea#PreprocessSettingsScrollArea::viewport {
+QScrollArea#PreprocessSettingsScrollArea::viewport,
+QScrollArea#PreprocessSettingsScrollArea::corner,
+QWidget#PreprocessPreviewWorkspace,
+QWidget#PreprocessSettingsContent {
     background: #0d1012;
 }
 QSplitter::handle {

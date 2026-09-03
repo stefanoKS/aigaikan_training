@@ -11,7 +11,7 @@ from PIL import Image
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QScrollArea
 
 from app.models.image_preprocessing import ColorMode, ImagePreprocessingConfig, MorphologyOperation
 from app.models.inspection_region import InspectionRegionConfig
@@ -193,6 +193,19 @@ def test_preview_workspace_stays_fixed_while_settings_scroll(tmp_path: Path) -> 
     assert page.settings_scroll_area.verticalScrollBar().maximum() > 0
 
     scroll_area.close()
+
+
+def test_preprocess_surfaces_are_explicitly_styled_without_a_native_scroll_frame(tmp_path: Path) -> None:
+    page = _page((_image(tmp_path / "good.png", (20, 30, 40)),))
+    settings_content = page.settings_scroll_area.widget()
+
+    assert settings_content is not None
+    assert page.preview_workspace.objectName() == "PreprocessPreviewWorkspace"
+    assert page.preview_workspace.testAttribute(Qt.WidgetAttribute.WA_StyledBackground)
+    assert settings_content.objectName() == "PreprocessSettingsContent"
+    assert settings_content.testAttribute(Qt.WidgetAttribute.WA_StyledBackground)
+    assert page.settings_scroll_area.frameShape() is QScrollArea.Shape.NoFrame
+    page.close()
 
 
 def test_inactive_numeric_controls_are_disabled_until_their_operation_is_selected(tmp_path: Path) -> None:
