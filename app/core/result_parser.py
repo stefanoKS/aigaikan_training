@@ -173,6 +173,8 @@ class ResultParser:
             final_test_manifest_sha256=str(payload.get("final_test_manifest_sha256", "")),
             inspection_region_hash=str(payload.get("inspection_region_hash", "")),
             preprocessing_hash=str(payload.get("preprocessing_hash", "")),
+            image_preprocessing_hash=str(payload.get("image_preprocessing_hash", "")),
+            image_preprocessing=_mapping(payload.get("image_preprocessing")),
             preprocessing_contract_version=int(payload.get("preprocessing_contract_version", 0)),
             preprocessing_model_input=str(payload.get("preprocessing_model_input", "")),
             score_aggregation=str(payload.get("score_aggregation", "")),

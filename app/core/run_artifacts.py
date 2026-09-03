@@ -11,7 +11,9 @@ from typing import Any, Mapping
 from app.core.dataset_manifest import sha256_file
 from app.core.inspection_region import inspection_region_hash, read_inspection_region
 from app.core.preprocessing_contract import read_resolved_preprocessing_plan, resolved_preprocessing_hash
+from app.core.preprocessing_contract import image_preprocessing_hash, read_image_preprocessing_config
 from app.core.threshold_contract import PixelThresholdOperatingPoint
+from app.models.image_preprocessing import ImagePreprocessingConfig
 from app.models.inspection_region import InspectionRegionConfig
 from app.models.preprocessing_config import ResolvedPreprocessingPlan
 
@@ -247,6 +249,19 @@ def read_verified_preprocessing_plan(run_directory: Path) -> ResolvedPreprocessi
         raise ValueError("Preprocessing score aggregation does not match run_manifest.json.")
     if bool(metadata.get("tiled")) != plan.tiled:
         raise ValueError("Preprocessing tiling flag does not match run_manifest.json.")
+    embedded_profile = metadata.get("image_preprocessing")
+    if embedded_profile is not None and ImagePreprocessingConfig.from_dict(embedded_profile) != plan.image_preprocessing:
+        raise ValueError("Embedded image preprocessing profile does not match preprocessing_plan.json.")
+    profile_hash = metadata.get("image_preprocessing_sha256")
+    if profile_hash is not None:
+        if not isinstance(profile_hash, str) or image_preprocessing_hash(plan.image_preprocessing) != profile_hash:
+            raise ValueError("Image preprocessing profile hash does not match run_manifest.json.")
+        profile_file = metadata.get("image_preprocessing_file")
+        if profile_file != "image_preprocessing.json":
+            raise ValueError("Run manifest image preprocessing profile filename is invalid.")
+        profile = read_image_preprocessing_config(run_directory / profile_file)
+        if profile != plan.image_preprocessing:
+            raise ValueError("Standalone image preprocessing profile does not match preprocessing_plan.json.")
     return plan
 
 

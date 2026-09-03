@@ -11,6 +11,7 @@ import cv2
 import numpy as np
 from PIL import Image
 
+from app.core.image_preprocessor import ImagePreprocessor
 from app.core.inspection_region import InspectionRegionProcessor
 from app.models.inspection_region import InspectionRegionConfig
 from app.models.preprocessing_config import (
@@ -47,6 +48,7 @@ class PreprocessingPipeline:
         self.inspection_region = inspection_region
         self.inspection_region_processor = InspectionRegionProcessor(inspection_region)
         self.plan = plan
+        self.image_preprocessor = ImagePreprocessor(plan.image_preprocessing)
         if inspection_region.enabled and inspection_region.rectified_size() != plan.rectified_size:
             raise ValueError("Preprocessing plan rectified size does not match the saved inspection ROI.")
 
@@ -75,7 +77,19 @@ class PreprocessingPipeline:
         if image_rgb.ndim != 3 or image_rgb.shape[2] != 3:
             raise ValueError("Preprocessing v2 requires a three-channel RGB image.")
         rectified = self._rectify(image_rgb)
-        return tuple(self._prepare_tile(rectified, tile) for tile in self.plan.tiles), rectified
+        preprocessed = self.preprocess_rectified(rectified)
+        return tuple(self._prepare_tile(preprocessed, tile) for tile in self.plan.tiles), rectified
+
+    def preprocess_rectified(self, rectified_rgb: np.ndarray) -> np.ndarray:
+        """Apply the frozen image profile before any model-specific padding or tiling."""
+        self._validate_rectified_size(rectified_rgb)
+        return self.image_preprocessor.apply(rectified_rgb)
+
+    def preview_arrays(self, image_rgb: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return rectified, preprocessed, and fixed-range absolute-difference preview arrays."""
+        rectified = self._rectify(image_rgb)
+        preprocessed = self.preprocess_rectified(rectified)
+        return rectified, preprocessed, self.image_preprocessor.absolute_difference(rectified, preprocessed)
 
     def prepare_mask_array(self, mask: np.ndarray) -> tuple[np.ndarray, ...]:
         """Rectify, pad, and tile a single-channel mask with nearest-neighbor semantics."""

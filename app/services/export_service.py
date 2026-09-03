@@ -16,7 +16,7 @@ from app.core.dataset_manifest import sha256_file
 from app.core.model_registry import ModelRegistry, ModelSupportLevel
 from app.core.result_parser import ResultParser
 from app.core.inspection_region import InspectionRegionProcessor, inspection_region_hash
-from app.core.preprocessing_contract import resolved_preprocessing_hash
+from app.core.preprocessing_contract import image_preprocessing_hash, resolved_preprocessing_hash, write_image_preprocessing_config
 from app.core.preprocessing_pipeline import PreprocessingPipeline
 from app.core.run_artifacts import (
     read_canonical_checkpoint,
@@ -25,6 +25,7 @@ from app.core.run_artifacts import (
     read_verified_preprocessing_plan,
 )
 from app.models.prediction_result import PredictionResult
+from app.models.image_preprocessing import ImagePreprocessingConfig
 from app.models.preprocessing_config import LEGACY_PREPROCESSING_CONTRACT_VERSION
 from app.models.training_config import TrainingConfig
 from app.services.anomalib_service import AnomalibService, REQUIRED_ANOMALIB_VERSION
@@ -119,6 +120,9 @@ class ExportService:
         preprocessing_pipeline = (
             PreprocessingPipeline(inspection_region, preprocessing_plan) if preprocessing_plan is not None else None
         )
+        image_preprocessing = (
+            preprocessing_plan.image_preprocessing if preprocessing_plan is not None else ImagePreprocessingConfig()
+        )
         inspection_processor = InspectionRegionProcessor(inspection_region) if preprocessing_pipeline is None else None
         decision_threshold = float(threshold_metadata["threshold_value"])
         final_test_predictions = self._load_final_test_predictions(
@@ -133,6 +137,7 @@ class ExportService:
             package_directory,
             checkpoint_path,
             active_revision,
+            image_preprocessing,
         )
         components = (
             self.anomalib_service.create_inference_components(config, package_directory, preprocessing_plan)
@@ -211,9 +216,17 @@ class ExportService:
                     "model_input_size": list(preprocessing_plan.model_input_size),
                     "score_aggregation": preprocessing_plan.score_aggregation.value,
                     "tiled": preprocessing_plan.tiled,
+                    "image_preprocessing_file": "preprocessing.json",
+                    "image_preprocessing_sha256": image_preprocessing_hash(image_preprocessing),
+                    "image_preprocessing": image_preprocessing.to_dict(),
                 }
                 if preprocessing_plan is not None
-                else {"legacy": True}
+                else {
+                    "legacy": True,
+                    "image_preprocessing_file": "preprocessing.json",
+                    "image_preprocessing_sha256": image_preprocessing_hash(image_preprocessing),
+                    "image_preprocessing": image_preprocessing.to_dict(),
+                }
             ),
         )
         return ModelExportReport(exported=exported, failures=failures, package_directory=package_directory)
@@ -229,6 +242,7 @@ class ExportService:
         package_directory: Path,
         canonical_checkpoint_path: Path,
         active_revision: ThresholdRevisionResult | None = None,
+        image_preprocessing: ImagePreprocessingConfig = ImagePreprocessingConfig(),
     ) -> tuple[Path, dict[str, str]]:
         """Copy all immutable records required to audit deployment decisions."""
         required_names = (
@@ -254,6 +268,11 @@ class ExportService:
         packaged_checkpoint_path = package_directory / "canonical_checkpoint.ckpt"
         shutil.copy2(canonical_checkpoint_path, packaged_checkpoint_path)
         copied[packaged_checkpoint_path.name] = sha256_file(packaged_checkpoint_path)
+        standalone_profile_path = write_image_preprocessing_config(
+            package_directory / "preprocessing.json", image_preprocessing
+        )
+        copied[standalone_profile_path.name] = sha256_file(standalone_profile_path)
+        ExportService._copy_preprocessing_reference_runner(package_directory, copied)
 
         run_manifest_path = package_directory / "run_manifest.json"
         run_manifest = json.loads(run_manifest_path.read_text(encoding="utf-8"))
@@ -278,6 +297,42 @@ class ExportService:
                 shutil.copy2(source_path, target_path)
                 copied[relative_path.as_posix()] = sha256_file(target_path)
         return packaged_checkpoint_path, copied
+
+    @staticmethod
+    def _copy_preprocessing_reference_runner(package_directory: Path, copied: dict[str, str]) -> None:
+        """Copy the canonical runner source instead of maintaining a bundle-only implementation."""
+        workspace_root = Path(__file__).resolve().parents[2]
+        runner_directory = package_directory / "reference_runner"
+        for relative_path in (
+            Path("app/__init__.py"),
+            Path("app/version.py"),
+            Path("app/core/__init__.py"),
+            Path("app/core/image_preprocessor.py"),
+            Path("app/core/inspection_region.py"),
+            Path("app/core/preprocessing_pipeline.py"),
+            Path("app/core/preprocessing_reference.py"),
+            Path("app/models/__init__.py"),
+            Path("app/models/image_preprocessing.py"),
+            Path("app/models/inspection_region.py"),
+            Path("app/models/preprocessing_config.py"),
+            Path("scripts/preprocessing_reference_runner.py"),
+            Path("app/resources/preprocessing_golden_vectors.json"),
+        ):
+            source_path = workspace_root / relative_path
+            target_relative = (
+                Path("run_preprocessing_reference.py")
+                if relative_path == Path("scripts/preprocessing_reference_runner.py")
+                else Path("golden_vectors.json")
+                if relative_path == Path("app/resources/preprocessing_golden_vectors.json")
+                else relative_path
+            )
+            target_path = runner_directory / target_relative
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            if relative_path == Path("app/models/__init__.py"):
+                target_path.write_text("", encoding="utf-8")
+            else:
+                shutil.copy2(source_path, target_path)
+            copied[(Path("reference_runner") / target_relative).as_posix()] = sha256_file(target_path)
 
     @staticmethod
     def _write_package_manifest(

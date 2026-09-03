@@ -83,8 +83,50 @@ The Inspection Region page can define one fixed four-point perspective quadrilat
 When enabled, every training, calibration, final-test, inference, reevaluation, and deployment-parity image follows the same contract:
 
 ```text
-raw camera frame -> InspectionRegionProcessor -> rectified ROI -> Anomalib model
+decode RGB camera frame
+	-> InspectionRegionProcessor four-point perspective rectification
+	-> deterministic image preprocessing profile
+	-> model-specific alignment/padding
+	-> Anomalib preprocessing and normalization
 ```
+
+## Preprocess Images
+
+The **Preprocess Images** tab configures the deterministic profile that runs after the four-point ROI and before model-specific padding. It opens on **Project Good Images** by default; these images are preview-only and never estimate learned preprocessing parameters. A preview may instead use exactly one **Custom Image** or a deterministic non-recursive **Custom Folder**. Custom preview paths are saved only as project draft UI state and never enter run or deployment metadata. The tab provides Previous, Next, Random, and Reset-to-Project-Good navigation.
+
+Custom raw camera frames must match the saved ROI source resolution. Mismatched inputs are displayed with a warning and are never stretched. A custom image can be explicitly declared already rectified; this is never inferred automatically and must match the saved rectified ROI size.
+
+Profiles use RGB `uint8` input/output in the fixed $[0,255]$ range, preserve rectified dimensions, and serialize a strict ordered operation list:
+
+```json
+{
+	"schema_version": 1,
+	"profile_id": "custom_v1",
+	"input_color_order": "RGB",
+	"input_dtype": "uint8",
+	"input_range": "0_255",
+	"operation_order": "roi_then_image_operations_then_padding",
+	"operations": [
+		{"type": "grayscale", "luminance_standard": "itu_r_bt601_full_range", "output_channels": 3, "channel_replication": true},
+		{"type": "gaussian_blur", "sigma": 1.0, "kernel_size": "automatic", "border_mode": "reflect"},
+		{"type": "disk_morphological_opening", "radius": 2, "diameter": 5, "iterations": 1, "border_mode": "reflect"}
+	]
+}
+```
+
+Available color modes are Preserve RGB and BT.601 grayscale replicated to three identical channels. Smoothing supports None, Box Blur, Gaussian Blur, and Median Blur with curated Reflect or Replicate borders. Gaussian is the recommended interactive choice, but None remains the compatibility default; blur can suppress fine texture and weaken defects below its scale. Disk opening is grayscale erosion followed by grayscale dilation using an elliptical kernel with diameter $2r+1$. Select a disk larger than expected fiber thickness but smaller than the smallest important defect. Optional operator-supplied fiber, defect, and pixels-per-millimetre values produce only evidence-based warnings and physical disk metadata; the application never estimates them from Good images.
+
+Convenience presets populate the same explicit controls: No Additional Preprocessing, Grayscale Only, Grayscale + Gaussian, Grayscale + Median, Grayscale + Disk Opening, and Grayscale + Gaussian + Disk Opening. The preview shows raw image plus ROI overlay, rectified ROI, final preprocessed ROI, and a fixed-range absolute difference. It uses the same `PreprocessingPipeline` as staging and inference; it does not use per-image display normalization.
+
+Saving changed operations or parameters updates the preprocessing hash, marks prior results stale, and requires training plus recalibration. Changing only the preview source never changes a dataset split, model profile, hash, manifest, or result. Projects and historic runs without profile metadata resolve to `legacy_none_v1`, reproducing the prior RGB no-op behavior exactly.
+
+New runs record the full profile in `config.json`, `preprocessing_plan.json` when non-legacy, `image_preprocessing.json`, `results.json`, `run_manifest.json`, and model provenance. The deployment bundle contains standalone `preprocessing.json`, its semantic SHA-256, runtime OpenCV/NumPy versions, `reference_runner/run_preprocessing_reference.py`, and `reference_runner/golden_vectors.json`. Run the bundle checker with:
+
+```powershell
+python reference_runner\run_preprocessing_reference.py --golden reference_runner\golden_vectors.json
+```
+
+For exact raw-frame model inputs, give the runner `--input`, `--output`, `--inspection-region inspection_region.json`, and `--resolved-plan preprocessing_plan.json`. The golden vectors verify both the profile and the full ROI-to-model-input route before a future runtime accepts a bundle.
 
 The project and every run persist canonical `inspection_region.json` metadata. Runs store its SHA-256 hash, source resolution, and rectified dimensions in `run_manifest.json`. Inputs at another resolution are rejected; the source files remain unchanged. A changed ROI requires retraining and prevents stale result/inference-run selection.
 
@@ -101,6 +143,7 @@ The supported profiles are fixed and use Anomalib-native preprocessing: PatchCor
 Threshold calibration always uses held-out calibration predictions, never final-test predictions. Automatic calibration uses labeled F1 when genuine held-out OK and NG samples exist; otherwise it uses normal-only conformal calibration at the selected normal false-reject target (default $0.5\%$). Normal-only calibration establishes an operating point, not universal defect detection. The legacy maximum-score method is explicitly marked as conservative; synthetic anomaly calibration is unavailable until a dedicated generator can provide honest provenance.
 
 Every prediction records its raw model score separately from its Anomalib-postprocessed score and map. Calibration and operational image thresholds apply only to the declared postprocessed score semantic and use `score >= threshold`. Raw scores are preserved for provenance and are not clamped into the postprocessed $[0, 1]$ domain.
+Every prediction records its raw model score separately from its Anomalib-postprocessed score and map. Calibration and operational image thresholds apply only to the declared decision-score semantic and use `score >= threshold`. Raw scores are preserved for provenance and are not clamped into the postprocessed $[0, 1]$ domain. SuperADD retains its native top-$0.1\%$ score aggregation and internal patching; its operational score semantic is recorded explicitly and its native normalized values remain provenance only.
 
 For preprocessing contract v3, overlapping external tiles are feather-blended and the image decision score is calculated from the reconstructed valid-ROI map. Legacy v2 keeps its original maximum-overlap reconstruction behavior. SuperADD does not allow external tiling: its native patching and top-$0.1\%$ mean score aggregation are retained. Its native normalization and percentile thresholds are fitted from held-out OK validation images only; the application still performs its own post-fit calibration on all held-out evidence.
 

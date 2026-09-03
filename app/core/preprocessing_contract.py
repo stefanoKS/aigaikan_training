@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
+from app.models.image_preprocessing import ImagePreprocessingConfig
 from app.models.preprocessing_config import PreprocessingConfig, ResolvedPreprocessingPlan
 
 
@@ -18,6 +19,16 @@ def canonical_preprocessing_json(config: PreprocessingConfig) -> str:
 def preprocessing_hash(config: PreprocessingConfig) -> str:
     """Return the deterministic SHA-256 identity for a project policy."""
     return _sha256(canonical_preprocessing_json(config))
+
+
+def canonical_image_preprocessing_json(config: ImagePreprocessingConfig) -> str:
+    """Return canonical profile bytes reproducible by the reference preprocessing runner."""
+    return json.dumps(config.to_dict(), ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+
+
+def image_preprocessing_hash(config: ImagePreprocessingConfig) -> str:
+    """Return the semantic SHA-256 identity of the image-operation profile."""
+    return _sha256(canonical_image_preprocessing_json(config))
 
 
 def canonical_resolved_preprocessing_json(plan: ResolvedPreprocessingPlan) -> str:
@@ -35,9 +46,28 @@ def write_preprocessing_config(path: Path, config: PreprocessingConfig) -> Path:
     return _atomic_write(path, canonical_preprocessing_json(config))
 
 
+def write_image_preprocessing_config(path: Path, config: ImagePreprocessingConfig) -> Path:
+    """Atomically persist a standalone full profile for a run or deployment bundle."""
+    import cv2
+    import numpy as np
+
+    payload = config.to_dict()
+    payload["implementation"] = {
+        "component": "app.core.image_preprocessor.ImagePreprocessor",
+        "opencv_version": cv2.__version__,
+        "numpy_version": np.__version__,
+    }
+    return _atomic_write(path, json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+
+
 def read_preprocessing_config(path: Path) -> PreprocessingConfig:
     """Load an internally consistent project preprocessing sidecar."""
     return PreprocessingConfig.from_dict(_read_payload(path, "Preprocessing configuration"))
+
+
+def read_image_preprocessing_config(path: Path) -> ImagePreprocessingConfig:
+    """Load one strict versioned image-operation profile."""
+    return ImagePreprocessingConfig.from_dict(_read_payload(path, "Image preprocessing configuration"))
 
 
 def write_resolved_preprocessing_plan(path: Path, plan: ResolvedPreprocessingPlan) -> Path:

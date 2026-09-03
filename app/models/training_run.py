@@ -34,6 +34,8 @@ class TrainingRun:
     final_test_manifest_sha256: str = ""
     inspection_region_hash: str = ""
     preprocessing_hash: str = ""
+    image_preprocessing_hash: str = ""
+    image_preprocessing: dict[str, Any] = field(default_factory=dict)
     preprocessing_contract_version: int = 0
     preprocessing_model_input: str = ""
     score_aggregation: str = ""

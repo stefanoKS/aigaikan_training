@@ -18,6 +18,8 @@ COMPARISON_METRICS = (
     "AUROC",
     "Decision Threshold",
     "Threshold Method",
+    "Image Preprocessing Profile",
+    "Image Preprocessing SHA-256",
     "Training Duration",
     "Mean Inference Latency (ms/image)",
     "P95 Inference Latency (ms/image)",

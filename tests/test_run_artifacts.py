@@ -21,7 +21,13 @@ from app.core.run_artifacts import (
 from app.core.threshold_contract import PixelThresholdOperatingPoint
 from app.core.inspection_region import inspection_region_hash, write_inspection_region
 from app.models.inspection_region import InspectionRegionConfig
-from app.core.preprocessing_contract import resolved_preprocessing_hash, write_resolved_preprocessing_plan
+from app.core.preprocessing_contract import (
+    image_preprocessing_hash,
+    resolved_preprocessing_hash,
+    write_image_preprocessing_config,
+    write_resolved_preprocessing_plan,
+)
+from app.models.image_preprocessing import ColorMode, ImagePreprocessingConfig
 from app.models.preprocessing_config import LEGACY_PREPROCESSING_CONTRACT_VERSION, PreprocessingConfig
 
 
@@ -240,6 +246,43 @@ def test_run_preprocessing_v2_sidecar_must_match_its_manifest_hash(tmp_path: Pat
     )
 
     assert read_verified_preprocessing_plan(tmp_path) == plan
+
+
+def test_profiled_run_requires_matching_embedded_and_standalone_image_preprocessing_metadata(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "model.ckpt"
+    checkpoint.write_bytes(b"trusted model")
+    canonical = resolve_canonical_checkpoint(FakeEngine(checkpoint))
+    profile = ImagePreprocessingConfig(profile_id="gray-v1", color_mode=ColorMode.GRAYSCALE_REPLICATED_RGB)
+    plan = PreprocessingConfig(image_preprocessing=profile).resolve("patchcore", (20, 10))
+    write_resolved_preprocessing_plan(tmp_path / "preprocessing_plan.json", plan)
+    profile_path = write_image_preprocessing_config(tmp_path / "image_preprocessing.json", profile)
+    write_run_manifest(
+        tmp_path / "run_manifest.json",
+        canonical_checkpoint=canonical,
+        dataset_manifest_sha256="a" * 64,
+        split_counts={"final_test": {"ok": 1, "ng": 0}},
+        threshold=0.5,
+        extra={
+            "preprocessing_contract": {
+                "preprocessing_contract_version": plan.preprocessing_contract_version,
+                "metadata_file": "preprocessing_plan.json",
+                "metadata_sha256": resolved_preprocessing_hash(plan),
+                "model_id": plan.model_id,
+                "model_input_size": list(plan.model_input_size),
+                "score_aggregation": plan.score_aggregation.value,
+                "tiled": plan.tiled,
+                "image_preprocessing": profile.to_dict(),
+                "image_preprocessing_file": profile_path.name,
+                "image_preprocessing_sha256": image_preprocessing_hash(profile),
+            }
+        },
+    )
+
+    assert read_verified_preprocessing_plan(tmp_path) == plan
+
+    profile_path.write_text("{}", encoding="utf-8")
+    with pytest.raises(ValueError, match="Unsupported image preprocessing schema version"):
+        read_verified_preprocessing_plan(tmp_path)
 
 
 def test_completed_legacy_run_has_no_v2_preprocessing_plan(tmp_path: Path) -> None:

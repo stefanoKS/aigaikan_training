@@ -10,6 +10,7 @@ from typing import Any
 from .dataset_config import DatasetConfig
 from .inspection_region import InspectionRegionConfig
 from .preprocessing_config import PreprocessingConfig
+from .preprocessing_preview import PreprocessingPreviewState
 from .training_config import TrainingConfig
 
 ISO_FORMAT = "%Y-%m-%dT%H:%M:%S.%f%z"
@@ -43,6 +44,7 @@ class ProjectConfig:
     training: TrainingConfig = field(default_factory=TrainingConfig)
     inspection_region: InspectionRegionConfig = field(default_factory=InspectionRegionConfig)
     preprocessing: PreprocessingConfig = field(default_factory=PreprocessingConfig)
+    preprocessing_preview: PreprocessingPreviewState = field(default_factory=PreprocessingPreviewState)
 
     @property
     def root_path(self) -> Path:
@@ -75,4 +77,5 @@ class ProjectConfig:
             training=TrainingConfig.from_dict(payload.get("training", {})),
             inspection_region=InspectionRegionConfig.from_dict(payload.get("inspection_region", {})),
             preprocessing=PreprocessingConfig.from_dict(payload.get("preprocessing", {})),
+            preprocessing_preview=PreprocessingPreviewState.from_dict(payload.get("preprocessing_preview")),
         )

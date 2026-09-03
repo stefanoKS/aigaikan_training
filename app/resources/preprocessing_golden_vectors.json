@@ -1,0 +1,143 @@
+{
+  "version": 1,
+  "vectors": [
+    {
+      "id": "rgb_to_bt601_grayscale_replicated_v1",
+      "profile": {
+        "schema_version": 1,
+        "profile_id": "golden_grayscale_v1",
+        "input_color_order": "RGB",
+        "input_dtype": "uint8",
+        "input_range": "0_255",
+        "output_color_order": "RGB",
+        "output_dtype": "uint8",
+        "output_range": "0_255",
+        "operation_order": "roi_then_image_operations_then_padding",
+        "operations": [
+          {
+            "type": "grayscale",
+            "luminance_standard": "itu_r_bt601_full_range",
+            "output_channels": 3,
+            "channel_replication": true
+          }
+        ],
+        "guidance": {
+          "expected_maximum_fiber_thickness_px": null,
+          "expected_minimum_defect_diameter_px": null,
+          "pixels_per_millimetre": null
+        }
+      },
+      "input_rgb": [
+        [[255, 0, 0], [0, 255, 0]],
+        [[0, 0, 255], [255, 255, 255]]
+      ],
+      "expected_output_rgb": [
+        [[76, 76, 76], [150, 150, 150]],
+        [[29, 29, 29], [255, 255, 255]]
+      ],
+      "tolerance": 0
+    },
+    {
+      "id": "full_pipeline_patchcore_grayscale_v1",
+      "profile": {
+        "schema_version": 1,
+        "profile_id": "golden_grayscale_v1",
+        "input_color_order": "RGB",
+        "input_dtype": "uint8",
+        "input_range": "0_255",
+        "output_color_order": "RGB",
+        "output_dtype": "uint8",
+        "output_range": "0_255",
+        "operation_order": "roi_then_image_operations_then_padding",
+        "operations": [
+          {
+            "type": "grayscale",
+            "luminance_standard": "itu_r_bt601_full_range",
+            "output_channels": 3,
+            "channel_replication": true
+          }
+        ],
+        "guidance": {
+          "expected_maximum_fiber_thickness_px": null,
+          "expected_minimum_defect_diameter_px": null,
+          "pixels_per_millimetre": null
+        }
+      },
+      "inspection_region": {
+        "roi_contract_version": 1,
+        "enabled": false,
+        "type": "perspective_quad",
+        "source_size": {"width": 0, "height": 0},
+        "points_px": [],
+        "points_normalized": [],
+        "point_order": ["top_left", "top_right", "bottom_right", "bottom_left"],
+        "rectified_size": {"width": 0, "height": 0},
+        "interpolation": "linear",
+        "transform": "perspective"
+      },
+      "resolved_plan": {
+        "preprocessing_contract_version": 3,
+        "model_id": "patchcore",
+        "patch_size": 1,
+        "rectified_size": [2, 2],
+        "padding_mode": "constant",
+        "padding_value_rgb": [0, 0, 0],
+        "padding_policy": "automatic",
+        "resolved_padding": [0, 0, 0, 0],
+        "model_alignment": [1, 1],
+        "minimum_model_input_size": [0, 0],
+        "score_aggregation": "max",
+        "top_k_fraction": 0.01,
+        "aspect_ratio_tolerance": 0.005,
+        "tiles": [
+          {
+            "index": 0,
+            "rectified_box": [0, 0, 2, 2],
+            "padded_size": [2, 2],
+            "model_input_size": [2, 2],
+            "valid_pixel_mask": {
+              "encoding": "rectangular_valid_region",
+              "size": [2, 2],
+              "box": [0, 0, 2, 2]
+            }
+          }
+        ],
+        "image_preprocessing": {
+          "schema_version": 1,
+          "profile_id": "golden_grayscale_v1",
+          "input_color_order": "RGB",
+          "input_dtype": "uint8",
+          "input_range": "0_255",
+          "output_color_order": "RGB",
+          "output_dtype": "uint8",
+          "output_range": "0_255",
+          "operation_order": "roi_then_image_operations_then_padding",
+          "operations": [
+            {
+              "type": "grayscale",
+              "luminance_standard": "itu_r_bt601_full_range",
+              "output_channels": 3,
+              "channel_replication": true
+            }
+          ],
+          "guidance": {
+            "expected_maximum_fiber_thickness_px": null,
+            "expected_minimum_defect_diameter_px": null,
+            "pixels_per_millimetre": null
+          }
+        }
+      },
+      "input_raw_rgb": [
+        [[255, 0, 0], [0, 255, 0]],
+        [[0, 0, 255], [255, 255, 255]]
+      ],
+      "expected_model_inputs_rgb": [
+        [
+          [[76, 76, 76], [150, 150, 150]],
+          [[29, 29, 29], [255, 255, 255]]
+        ]
+      ],
+      "tolerance": 0
+    }
+  ]
+}

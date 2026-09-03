@@ -57,6 +57,8 @@ from app.models.preprocessing_config import (
     ScoreAggregation,
     TilingConfig,
 )
+from app.models.image_preprocessing import ImagePreprocessingConfig
+from app.models.preprocessing_preview import PreprocessingPreviewState
 from app.models.project_config import ProjectConfig
 from app.models.training_config import DeviceMode, TrainingConfig
 from app.models.training_run import TrainingRun
@@ -68,6 +70,7 @@ from app.ui.pages.dataset_page import DatasetPage
 from app.ui.pages.home_page import HomePage
 from app.ui.pages.inference_page import InferencePage
 from app.ui.pages.inspection_region_page import InspectionRegionPage
+from app.ui.pages.preprocess_images_page import PreprocessImagesPage
 from app.ui.pages.results_page import ResultsPage
 from app.ui.pages.training_page import TrainingPage
 from app.ui.localization import UiTranslator
@@ -81,6 +84,7 @@ class MainWindow(QMainWindow):
         ("Home / Projects", HomePage),
         ("Dataset", DatasetPage),
         ("Inspection Region", InspectionRegionPage),
+        ("Preprocess Images", PreprocessImagesPage),
         ("Training Configuration", ConfigPage),
         ("Training", TrainingPage),
         ("Results", ResultsPage),
@@ -178,6 +182,7 @@ class MainWindow(QMainWindow):
         self.home_page = cast(HomePage, self.page_instances["Home / Projects"])
         self.dataset_page = cast(DatasetPage, self.page_instances["Dataset"])
         self.inspection_region_page = cast(InspectionRegionPage, self.page_instances["Inspection Region"])
+        self.preprocess_images_page = cast(PreprocessImagesPage, self.page_instances["Preprocess Images"])
         self.config_page = cast(ConfigPage, self.page_instances["Training Configuration"])
         self.training_page = cast(TrainingPage, self.page_instances["Training"])
         self.results_page = cast(ResultsPage, self.page_instances["Results"])
@@ -257,6 +262,8 @@ class MainWindow(QMainWindow):
         self.dataset_page.validate_button.clicked.connect(lambda: self._validate_dataset(show_dialog=True))
         self.dataset_page.clear_button.clicked.connect(self._clear_dataset)
         self.inspection_region_page.save_button.clicked.connect(self._save_inspection_region)
+        self.preprocess_images_page.profile_save_requested.connect(self._save_image_preprocessing_profile)
+        self.preprocess_images_page.preview_state_changed.connect(self._save_preprocessing_preview_state)
 
         self.config_page.save_button.clicked.connect(lambda: self._save_training_config(show_dialog=True))
         self.config_page.load_button.clicked.connect(self._refresh_config_page)
@@ -587,6 +594,7 @@ class MainWindow(QMainWindow):
         self._refresh_dataset_page()
         self._refresh_inspection_region_page()
         self._refresh_config_page()
+        self._refresh_preprocess_images_page()
         self._load_latest_results(project)
         self._load_default_inference_run(project)
 
@@ -750,6 +758,71 @@ class MainWindow(QMainWindow):
             project.inspection_region if project is not None else InspectionRegionConfig()
         )
         self.inspection_region_page.set_dataset_images(tuple(dict.fromkeys(sorted(source_paths))))
+
+    def _refresh_preprocess_images_page(self) -> None:
+        """Load project Good images as the default non-mutating preprocessing preview source."""
+        project = self.current_project
+        if project is None:
+            self.preprocess_images_page.set_context(
+                project_root=self._default_dialog_directory(),
+                preprocessing=PreprocessingConfig(),
+                inspection_region=InspectionRegionConfig(),
+                model_id="patchcore",
+                project_good_paths=(),
+                preview_state=PreprocessingPreviewState(),
+            )
+            return
+        good_directory = project.dataset.folders[DatasetRole.OK_TRAIN].resolved_path()
+        good_paths = (
+            tuple(
+                path.resolve()
+                for path in sorted(good_directory.rglob("*"), key=lambda item: str(item).casefold())
+                if path.is_file() and path.suffix.casefold() in SUPPORTED_IMAGE_EXTENSIONS
+            )
+            if good_directory is not None and good_directory.is_dir()
+            else ()
+        )
+        self.preprocess_images_page.set_context(
+            project_root=project.root_path,
+            preprocessing=project.preprocessing,
+            inspection_region=project.inspection_region,
+            model_id=project.training.model_name,
+            project_good_paths=good_paths,
+            preview_state=project.preprocessing_preview,
+        )
+
+    def _save_preprocessing_preview_state(self, state: object) -> None:
+        """Persist preview-only navigation without changing the frozen model input policy."""
+        if self.current_project is None or not isinstance(state, PreprocessingPreviewState):
+            return
+        self.current_project.preprocessing_preview = state
+        self._save_project(show_dialog=False)
+
+    def _save_image_preprocessing_profile(self, profile: object) -> None:
+        """Freeze explicit image operations into the editable project policy and invalidate prior runs."""
+        project = self.current_project
+        if project is None or not isinstance(profile, ImagePreprocessingConfig):
+            return
+        try:
+            profile.validate()
+        except ValueError as exc:
+            QMessageBox.warning(self, "Invalid Preprocessing Profile", str(exc))
+            return
+        previous_hash = preprocessing_hash(project.preprocessing)
+        updated_preprocessing = replace(project.preprocessing, image_preprocessing=profile)
+        if preprocessing_hash(updated_preprocessing) == previous_hash:
+            self.preprocess_images_page.set_status("Preprocessing profile is unchanged.")
+            return
+        project.preprocessing = updated_preprocessing
+        self._mark_retraining_required()
+        self._save_project(show_dialog=False)
+        self._refresh_config_page()
+        self._refresh_preprocess_images_page()
+        QMessageBox.information(
+            self,
+            "Preprocessing Profile Saved",
+            "Image preprocessing changed. Train and calibrate a new run before using inference.",
+        )
 
     def _save_inspection_region(self) -> None:
         project = self.current_project
@@ -983,6 +1056,7 @@ class MainWindow(QMainWindow):
             score_aggregation=ScoreAggregation(str(self.config_page.score_aggregation_combo.currentData())),
             top_k_fraction=self.config_page.top_k_fraction_spin.value() / 100,
             aspect_ratio_tolerance=existing.aspect_ratio_tolerance,
+            image_preprocessing=existing.image_preprocessing,
         )
 
     def _effective_preprocessing_size(self) -> tuple[int, int] | None:

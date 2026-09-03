@@ -15,6 +15,7 @@ from app.core.preprocessing_contract import (
 )
 from app.core.preprocessing_pipeline import PreprocessingPipeline, resolve_preprocessing_plan
 from app.models.inspection_region import InspectionRegionConfig
+from app.models.image_preprocessing import ColorMode, ImagePreprocessingConfig
 from app.models.preprocessing_config import (
     LEGACY_PREPROCESSING_CONTRACT_VERSION,
     PaddingPolicy,
@@ -132,6 +133,35 @@ def test_preprocessing_config_and_resolved_plan_have_stable_content_hashes(tmp_p
     assert restored_plan == plan
     assert preprocessing_hash(restored_config) == preprocessing_hash(config)
     assert resolved_preprocessing_hash(restored_plan) == resolved_preprocessing_hash(plan)
+
+
+def test_image_preprocessing_profile_changes_project_and_resolved_plan_hashes() -> None:
+    legacy = PreprocessingConfig()
+    grayscale = PreprocessingConfig(
+        image_preprocessing=ImagePreprocessingConfig(
+            profile_id="gray-v1",
+            color_mode=ColorMode.GRAYSCALE_REPLICATED_RGB,
+        )
+    )
+
+    assert preprocessing_hash(legacy) != preprocessing_hash(grayscale)
+    assert resolved_preprocessing_hash(legacy.resolve("patchcore", (20, 10))) != resolved_preprocessing_hash(
+        grayscale.resolve("patchcore", (20, 10))
+    )
+    assert "image_preprocessing" not in legacy.to_dict()
+    assert grayscale.to_dict()["image_preprocessing"]["schema_version"] == 1
+
+
+def test_resolved_plan_without_image_profile_metadata_migrates_to_exact_legacy_none(tmp_path) -> None:
+    plan_path = tmp_path / "legacy-plan.json"
+    legacy_payload = PreprocessingConfig().resolve("patchcore", (20, 10)).to_dict()
+
+    restored = read_resolved_preprocessing_plan(
+        write_resolved_preprocessing_plan(plan_path, PreprocessingConfig().resolve("patchcore", (20, 10)))
+    )
+
+    assert "image_preprocessing" not in legacy_payload
+    assert restored.image_preprocessing.is_legacy_none
 
 
 def _reference_roi() -> InspectionRegionConfig:

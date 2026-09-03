@@ -23,6 +23,7 @@ class UiTranslator(QObject):
         "Home / Projects": "ホーム / プロジェクト",
         "Dataset": "データセット",
         "Inspection Region": "検査領域",
+        "Preprocess Images": "画像前処理",
         "Training Configuration": "学習設定",
         "Training": "学習",
         "Results": "結果",

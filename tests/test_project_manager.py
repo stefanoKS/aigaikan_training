@@ -6,6 +6,9 @@ from pathlib import Path
 
 from app.core.project_manager import ProjectManager
 from app.models.inspection_region import InspectionRegionConfig
+from app.models.preprocessing_preview import PreprocessingPreviewState, PreviewSource
+from app.models.image_preprocessing import ColorMode, ImagePreprocessingConfig
+from app.models.preprocessing_config import PreprocessingConfig
 
 
 def test_create_and_reopen_project_with_unicode_path(project_manager: ProjectManager) -> None:
@@ -30,6 +33,38 @@ def test_project_persists_its_canonical_inspection_region_sidecar(project_manage
     restored = project_manager.load_project(project.root_path)
 
     assert restored.inspection_region == project.inspection_region
+
+
+def test_project_persists_preview_source_as_draft_state_without_touching_preprocessing_sidecar(
+    project_manager: ProjectManager,
+) -> None:
+    project = project_manager.create_project("Preprocessing Preview")
+    project.preprocessing_preview = PreprocessingPreviewState(
+        source=PreviewSource.CUSTOM_IMAGE,
+        custom_image_path=r"C:\camera\preview.png",
+        already_rectified=True,
+    )
+    project_manager.save_project(project)
+
+    restored = project_manager.load_project(project.root_path)
+
+    assert restored.preprocessing_preview == project.preprocessing_preview
+    assert "custom_image_path" not in (project.root_path / "preprocessing.json").read_text(encoding="utf-8")
+
+
+def test_project_persists_image_preprocessing_profile_across_restart(project_manager: ProjectManager) -> None:
+    project = project_manager.create_project("Image Profile")
+    project.preprocessing = PreprocessingConfig(
+        image_preprocessing=ImagePreprocessingConfig(
+            profile_id="gray-v1",
+            color_mode=ColorMode.GRAYSCALE_REPLICATED_RGB,
+        )
+    )
+    project_manager.save_project(project)
+
+    restored = project_manager.load_project(project.root_path)
+
+    assert restored.preprocessing == project.preprocessing
 
 
 def test_create_unique_run_directory(project_manager: ProjectManager) -> None:

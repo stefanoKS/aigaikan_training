@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
+from app.models.image_preprocessing import ImagePreprocessingConfig
+
 PREPROCESSING_CONTRACT_VERSION = 3
 LEGACY_PREPROCESSING_CONTRACT_VERSION = 2
 SUPPORTED_PREPROCESSING_CONTRACT_VERSIONS = frozenset(
@@ -96,6 +98,7 @@ class PreprocessingConfig:
     score_aggregation: ScoreAggregation = ScoreAggregation.MAX
     top_k_fraction: float = 0.01
     aspect_ratio_tolerance: float = 0.005
+    image_preprocessing: ImagePreprocessingConfig = field(default_factory=ImagePreprocessingConfig)
 
     def validate(self) -> None:
         """Validate the project-owned behavior before it becomes a run contract."""
@@ -113,6 +116,7 @@ class PreprocessingConfig:
         ):
             raise ValueError("Legacy preprocessing-v2 supports only its saved automatic padding behavior.")
         self.tiling.validate()
+        self.image_preprocessing.validate()
         if not 0 < self.top_k_fraction <= 1:
             raise ValueError("Top-k score fraction must be greater than zero and at most one.")
         if not 0 <= self.aspect_ratio_tolerance < 1:
@@ -138,6 +142,8 @@ class PreprocessingConfig:
                     "custom_padding_bottom": self.custom_padding_bottom,
                 }
             )
+        if not self.image_preprocessing.is_legacy_none:
+            payload["image_preprocessing"] = self.image_preprocessing.to_dict()
         return payload
 
     @classmethod
@@ -164,6 +170,7 @@ class PreprocessingConfig:
             score_aggregation=ScoreAggregation(payload.get("score_aggregation", ScoreAggregation.MAX.value)),
             top_k_fraction=float(payload.get("top_k_fraction", 0.01)),
             aspect_ratio_tolerance=float(payload.get("aspect_ratio_tolerance", 0.005)),
+            image_preprocessing=ImagePreprocessingConfig.from_dict(payload.get("image_preprocessing")),
         )
         result.validate()
         return result
@@ -250,6 +257,7 @@ class ResolvedPreprocessingPlan:
     top_k_fraction: float
     aspect_ratio_tolerance: float
     tiles: tuple[PreprocessingTile, ...]
+    image_preprocessing: ImagePreprocessingConfig = field(default_factory=ImagePreprocessingConfig)
 
     @property
     def tiled(self) -> bool:
@@ -270,6 +278,7 @@ class ResolvedPreprocessingPlan:
             raise ValueError(f"Unsupported preprocessing contract version: {self.preprocessing_contract_version}")
         if self.patch_size < 1:
             raise ValueError("Patch size must be positive.")
+        self.image_preprocessing.validate()
         width, height = self.rectified_size
         if width < 2 or height < 2:
             raise ValueError("Rectified ROI dimensions must both be at least two pixels.")
@@ -325,6 +334,8 @@ class ResolvedPreprocessingPlan:
                     "valid_content_rect": [0, 0, *self.rectified_size],
                 }
             )
+        if not self.image_preprocessing.is_legacy_none:
+            payload["image_preprocessing"] = self.image_preprocessing.to_dict()
         return payload
 
     @classmethod
@@ -372,6 +383,7 @@ class ResolvedPreprocessingPlan:
             top_k_fraction=float(payload.get("top_k_fraction", 0.01)),
             aspect_ratio_tolerance=float(payload.get("aspect_ratio_tolerance", 0.005)),
             tiles=tiles,
+            image_preprocessing=ImagePreprocessingConfig.from_dict(payload.get("image_preprocessing")),
         )
         result.validate()
         return result
@@ -477,6 +489,7 @@ def _plan(
         top_k_fraction=config.top_k_fraction,
         aspect_ratio_tolerance=config.aspect_ratio_tolerance,
         tiles=tiles,
+        image_preprocessing=config.image_preprocessing,
     )
     result.validate()
     return result

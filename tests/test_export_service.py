@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from pathlib import Path
+import subprocess
 import sys
 from types import ModuleType
 
@@ -207,6 +208,9 @@ def test_export_model_uses_configured_formats_native_preprocessing_and_names(tmp
     assert (report.package_directory / "calibration_manifest.json").is_file()
     assert (report.package_directory / "final_test_manifest.json").is_file()
     assert (report.package_directory / "inspection_region.json").is_file()
+    assert (report.package_directory / "preprocessing.json").is_file()
+    assert (report.package_directory / "reference_runner" / "run_preprocessing_reference.py").is_file()
+    assert (report.package_directory / "reference_runner" / "golden_vectors.json").is_file()
     assert (report.package_directory / "canonical_checkpoint.ckpt").read_text(encoding="utf-8") == "checkpoint"
     assert (report.package_directory / "active_threshold_revision.json").is_file()
     assert (report.package_directory / "threshold_revisions" / "threshold-001.json").is_file()
@@ -231,6 +235,19 @@ def test_export_model_uses_configured_formats_native_preprocessing_and_names(tmp
     assert deployment_manifest["canonical_checkpoint"] == "canonical_checkpoint.ckpt"
     assert deployment_manifest["format_score_tolerances"] == FORMAT_SCORE_TOLERANCES
     assert deployment_manifest["inspection_preprocessing"]["metadata_sha256"] == inspection_region_hash(inspection_region)
+    assert deployment_manifest["preprocessing_contract"]["image_preprocessing_file"] == "preprocessing.json"
+    assert deployment_manifest["preprocessing_contract"]["image_preprocessing"]["schema_version"] == 1
+    standalone_preprocessing = json.loads((report.package_directory / "preprocessing.json").read_text(encoding="utf-8"))
+    assert standalone_preprocessing["implementation"]["component"] == "app.core.image_preprocessor.ImagePreprocessor"
+    runner = report.package_directory / "reference_runner" / "run_preprocessing_reference.py"
+    runner_result = subprocess.run(
+        [sys.executable, str(runner), "--golden", str(runner.with_name("golden_vectors.json"))],
+        cwd=runner.parent,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert runner_result.returncode == 0, runner_result.stderr
     assert deployment_manifest["model"]["profile"]["preprocessing"] == "anomalib-native"
     assert deployment_manifest["exports"][0]["validation"]["maximum_score_delta"] == 0.0
     validation_report = json.loads(report.exported[0].validation_report.read_text(encoding="utf-8"))

@@ -7,11 +7,13 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 from PIL import Image
 
 from app.models.dataset_config import DatasetRole, FolderImportMode
 from app.models.preprocessing_config import LEGACY_PREPROCESSING_CONTRACT_VERSION, PaddingPolicy, PreprocessingConfig
+from app.models.image_preprocessing import ColorMode, ImagePreprocessingConfig
+from app.models.preprocessing_preview import PreprocessingPreviewState, PreviewSource
 from app.core.preprocessing_contract import read_preprocessing_config
 from app.core.threshold_contract import ImageThresholdOperatingPoint, PixelThresholdOperatingPoint
 from app.services.threshold_revision_service import ThresholdRevisionResult
@@ -158,6 +160,35 @@ def test_saving_preprocessing_policy_marks_existing_results_for_retraining(tmp_p
     assert project.training.dinomaly_encoder_id == "vit_base_patch16_dinov3.lvd1689m"
     assert project.last_training_status == "Retraining required"
     assert window.inference_page.status_label.text() == "Retraining required"
+
+
+def test_saving_image_preprocessing_profile_marks_results_stale_but_preview_source_does_not(
+    tmp_path: Path, monkeypatch
+) -> None:
+    application = QApplication.instance() or QApplication([])
+    manager = ProjectManager(tmp_path / "projects")
+    window = MainWindow(SettingsManager(), manager)
+    project = manager.create_project("image-profile")
+    window._set_current_project(project)
+    project.last_training_status = "Completed"
+    original_hash = read_preprocessing_config(project.root_path / "preprocessing.json")
+    monkeypatch.setattr(QMessageBox, "information", lambda *_args, **_kwargs: None)
+
+    window._save_preprocessing_preview_state(
+        PreprocessingPreviewState(source=PreviewSource.CUSTOM_IMAGE, custom_image_path=r"C:\preview\custom.png")
+    )
+
+    assert project.last_training_status == "Completed"
+    assert read_preprocessing_config(project.root_path / "preprocessing.json") == original_hash
+
+    window._save_image_preprocessing_profile(
+        ImagePreprocessingConfig(profile_id="gray-v1", color_mode=ColorMode.GRAYSCALE_REPLICATED_RGB)
+    )
+
+    assert project.last_training_status == "Retraining required"
+    assert read_preprocessing_config(project.root_path / "preprocessing.json").image_preprocessing.color_mode is ColorMode.GRAYSCALE_REPLICATED_RGB
+    assert application is not None
+    window.close()
     window.close()
 
 

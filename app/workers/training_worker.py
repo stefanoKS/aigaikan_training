@@ -22,7 +22,13 @@ from app.core.prediction_artifacts import PredictionArtifacts, inspection_region
 from app.core.prediction_adapter import explicitly_postprocessed_predict, iter_anomalib_predictions, iter_preprocessed_predictions
 from app.core.prediction_contract import PREDICTION_CONTRACT_VERSION, RAW_SCORE_SEMANTIC
 from app.core.prepared_data_cache import PreparedDataCache
-from app.core.preprocessing_contract import preprocessing_hash, resolved_preprocessing_hash, write_resolved_preprocessing_plan
+from app.core.preprocessing_contract import (
+    image_preprocessing_hash,
+    preprocessing_hash,
+    resolved_preprocessing_hash,
+    write_image_preprocessing_config,
+    write_resolved_preprocessing_plan,
+)
 from app.core.preprocessing_pipeline import PreprocessingPipeline, resolve_preprocessing_plan
 from app.core.project_manager import ProjectManager
 from app.core.quality_metrics import FinalTestAcceptancePolicy, calculate_quality_metrics
@@ -365,6 +371,8 @@ def _model_provenance(
         payload["encoder"] = {"family": "DINOv3", "name": config.dinomaly_encoder_name}
     if preprocessing_plan is not None:
         payload["preprocessing_v2"] = preprocessing_plan.to_dict()
+        payload["image_preprocessing"] = preprocessing_plan.image_preprocessing.to_dict()
+        payload["image_preprocessing_sha256"] = image_preprocessing_hash(preprocessing_plan.image_preprocessing)
     return payload
 
 
@@ -439,8 +447,10 @@ def run(project_file: Path) -> int:
         preprocessing_pipeline = PreprocessingPipeline(project.inspection_region, preprocessing_plan)
         prepared_data_cache = PreparedDataCache(project.root_path / "prepared_data_cache", preprocessing_pipeline)
         preprocessing_plan_hash = resolved_preprocessing_hash(preprocessing_plan)
+        image_preprocessing_profile_hash = image_preprocessing_hash(preprocessing_plan.image_preprocessing)
         project_preprocessing_hash = preprocessing_hash(project.preprocessing)
         write_resolved_preprocessing_plan(run_dir / "preprocessing_plan.json", preprocessing_plan)
+        write_image_preprocessing_config(run_dir / "image_preprocessing.json", preprocessing_plan.image_preprocessing)
         roi_hash = inspection_region_hash(project.inspection_region)
         rectified_width, rectified_height = project.inspection_region.rectified_size()
         write_inspection_region(run_dir / "inspection_region.json", project.inspection_region)
@@ -484,7 +494,10 @@ def run(project_file: Path) -> int:
         )
         environment = collect_environment_info(Path(project.project_path), project.training.random_seed)
         (run_dir / "environment.json").write_text(json.dumps(environment, indent=2), encoding="utf-8")
-        (run_dir / "config.json").write_text(json.dumps(project.training.to_dict(), indent=2), encoding="utf-8")
+        run_config = project.training.to_dict()
+        run_config["image_preprocessing"] = preprocessing_plan.image_preprocessing.to_dict()
+        run_config["image_preprocessing_sha256"] = image_preprocessing_profile_hash
+        (run_dir / "config.json").write_text(json.dumps(run_config, indent=2), encoding="utf-8")
         emit(
             {
                 "type": "log",
@@ -677,6 +690,8 @@ def run(project_file: Path) -> int:
         run_metrics["Inspection Region SHA-256"] = roi_hash
         run_metrics["Inspection ROI Rectified Size"] = f"{rectified_width}x{rectified_height}"
         run_metrics["Preprocessing SHA-256"] = preprocessing_plan_hash
+        run_metrics["Image Preprocessing SHA-256"] = image_preprocessing_profile_hash
+        run_metrics["Image Preprocessing Profile"] = preprocessing_plan.image_preprocessing.profile_id
         run_metrics["Preprocessing Model Input"] = f"{preprocessing_plan.model_input_size[0]}x{preprocessing_plan.model_input_size[1]}"
         run_metrics["Preprocessing Tile Count"] = len(preprocessing_plan.tiles)
         run_metrics["Score Aggregation"] = preprocessing_plan.score_aggregation.value
@@ -702,6 +717,8 @@ def run(project_file: Path) -> int:
                 final_test_manifest_sha256=str(final_test_manifest["manifest_sha256"]),
                 inspection_region_hash=roi_hash,
                 preprocessing_hash=preprocessing_plan_hash,
+                image_preprocessing_hash=image_preprocessing_profile_hash,
+                image_preprocessing=preprocessing_plan.image_preprocessing.to_dict(),
                 preprocessing_contract_version=preprocessing_plan.preprocessing_contract_version,
                 preprocessing_model_input=(
                     f"{preprocessing_plan.model_input_size[0]}x{preprocessing_plan.model_input_size[1]}"
@@ -763,6 +780,9 @@ def run(project_file: Path) -> int:
                     "model_input_size": list(preprocessing_plan.model_input_size),
                     "score_aggregation": preprocessing_plan.score_aggregation.value,
                     "tiled": preprocessing_plan.tiled,
+                    "image_preprocessing_file": "image_preprocessing.json",
+                    "image_preprocessing_sha256": image_preprocessing_profile_hash,
+                    "image_preprocessing": preprocessing_plan.image_preprocessing.to_dict(),
                 },
                 "prepared_data_cache": cache_report,
                 "quality_status": quality_report.status,
