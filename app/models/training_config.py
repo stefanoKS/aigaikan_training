@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from app.core.dinomaly_encoder_registry import DinomalyEncoderRegistry
+from app.core.superadd_backbone_registry import LEGACY_HUGE_BACKBONE_ID, SuperAddBackboneRegistry
 from app.core.threshold_calibrator import ThresholdCalibrationConfig, ThresholdMethod
 from app.core.threshold_contract import PixelThresholdOperatingPoint
 
@@ -52,6 +53,8 @@ class TrainingConfig:
     num_workers: int = 0
     output_dir: str = ""
     dinomaly_encoder_id: str = ""
+    superadd_backbone_id: str = LEGACY_HUGE_BACKBONE_ID
+    superadd_precision: str = "float32"
     dinomaly_decoder_depth: int = 8
     dinomaly_bottleneck_dropout: float = 0.2
     dinomaly_context_recentering: bool = False
@@ -120,6 +123,10 @@ class TrainingConfig:
                 self.dinomaly_encoder_name,
                 "DINOv3" if self.is_dinomaly_dinov3 else "DINOv2",
             )
+        if self.is_super_add:
+            SuperAddBackboneRegistry().validate(self.superadd_backbone_id)
+            if self.superadd_precision not in {"float32", "float16"}:
+                raise ValueError("SuperADD precision must be float32 or float16.")
         ThresholdCalibrationConfig(
             method=self.threshold_method,
             target_normal_false_reject_rate=self.target_normal_false_reject_rate,
@@ -199,6 +206,11 @@ class TrainingConfig:
             return "vit_base_patch16_dinov3.lvd1689m"
         return "vit_base_patch14_reg4_dinov2"
 
+    @property
+    def superadd_backbone_name(self) -> str:
+        """Return the exact backbone ID retained by this run's compatibility contract."""
+        return self.superadd_backbone_id
+
     def model_profile(self) -> dict[str, object]:
         """Return the fixed model-specific contract persisted with each run."""
         if self.is_patchcore:
@@ -229,9 +241,14 @@ class TrainingConfig:
             }
         if self._normalized_model_name == "superadd":
             return {
-                "backbone": "vit_huge_plus_patch16_dinov3",
+                "backbone": self.superadd_backbone_name,
+                "precision": self.superadd_precision,
+                "layers": "automatic",
                 "patch_size": 448,
                 "patch_overlap": 16,
+                "score_quantile": 0.001,
+                "memory_bank_limit": 100000,
+                "memory_bank_limit_source": "anomalib_default",
                 "max_epochs": 1,
                 "preprocessing": "anomalib-native",
             }
@@ -352,6 +369,8 @@ class TrainingConfig:
             dinomaly_encoder_id=_curated_dinomaly_encoder_id(
                 payload.get("dinomaly_encoder_id", payload.get("dinomaly_encoder", ""))
             ),
+            superadd_backbone_id=str(payload.get("superadd_backbone_id", LEGACY_HUGE_BACKBONE_ID)),
+            superadd_precision=str(payload.get("superadd_precision", "float32")),
             dinomaly_decoder_depth=8,
             dinomaly_bottleneck_dropout=0.2,
             dinomaly_context_recentering=False,

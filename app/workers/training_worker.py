@@ -380,6 +380,17 @@ def _model_provenance(
         payload["encoder"] = {"family": "DINOv2", "name": config.dinomaly_encoder_name}
     elif definition.key == "dinomaly_dinov3":
         payload["encoder"] = {"family": "DINOv3", "name": config.dinomaly_encoder_name}
+    elif definition.key == "super_add":
+        memory_bank_shape, memory_bank_dtype = _memory_bank_metadata(model)
+        payload["superadd"] = {
+            "backbone": config.superadd_backbone_name,
+            "precision": config.superadd_precision,
+            "layers": "automatic",
+            "patch_size": 448,
+            "patch_overlap": 16,
+            "memory_bank_shape": list(memory_bank_shape),
+            "memory_bank_dtype": memory_bank_dtype,
+        }
     if preprocessing_plan is not None:
         payload["preprocessing_v2"] = preprocessing_plan.to_dict()
         payload["image_preprocessing"] = preprocessing_plan.image_preprocessing.to_dict()
@@ -403,6 +414,15 @@ def _peak_gpu_memory_mb(device: str) -> float | None:
     """Return measured CUDA peak memory when the runtime provides it."""
     if device != "gpu":
         return None
+
+
+def _memory_bank_metadata(model: Any) -> tuple[tuple[int, ...], str]:
+    """Record observed memory-bank dimensions without changing the model's trained state."""
+    for name in ("memory_bank", "memory_bank_features", "memory_bank_embedding"):
+        value = getattr(model, name, None)
+        if value is not None and hasattr(value, "shape"):
+            return tuple(int(size) for size in value.shape), str(getattr(value, "dtype", ""))
+    return (), ""
     try:
         import torch
 

@@ -139,14 +139,17 @@ def test_folder_inference_streams_explicit_eight_item_batches(tmp_path: Path, mo
     prediction_messages = [message for message in messages if message["type"] == "prediction"]
     assert len(prediction_messages) == 9
     timing = prediction_messages[0]["timing_metadata"]
-    assert timing["timing_record_version"] == 1
+    assert timing["timing_record_version"] == 2
     assert timing["model_forward_ms"] is not None
     assert timing["artifact_io_ms"] is not None
+    assert timing["input_color_order"] == "RGB"
+    assert timing["input_dtype"] == "uint8"
+    assert timing["true_batch_one_latency_ms"] is None
     assert prediction_messages[0]["decision_revision_id"] == "calibrated"
     inference_manifest = json.loads(
         next((run_directory / "inference").glob("*/inference_manifest.json")).read_text(encoding="utf-8")
     )
-    assert inference_manifest["timing"]["timing_record_version"] == 1
+    assert inference_manifest["timing"]["timing_record_version"] == 2
     assert len(inference_manifest["timing"]["per_image"]) == 9
 
 

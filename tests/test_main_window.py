@@ -323,3 +323,36 @@ def test_results_json_export_view_uses_displayed_threshold_revision(tmp_path: Pa
     assert run.predictions[0].source_path == "canonical.png"
     assert application is not None
     window.close()
+
+
+def test_saving_changed_superadd_backbone_or_precision_requires_retraining(tmp_path: Path) -> None:
+    application = QApplication.instance() or QApplication([])
+    manager = ProjectManager(tmp_path / "projects")
+    window = MainWindow(SettingsManager(), manager)
+    project = manager.create_project("superadd-contract")
+    project.last_training_status = "Completed"
+    window._set_current_project(project)
+    window.config_page.model_combo.setCurrentIndex(window.config_page.model_combo.findData("super_add"))
+    window.config_page.superadd_backbone_combo.setCurrentIndex(
+        window.config_page.superadd_backbone_combo.findData("vit_small_plus_patch16_dinov3.lvd1689m")
+    )
+    window.config_page.superadd_precision_combo.setCurrentIndex(
+        window.config_page.superadd_precision_combo.findData("float32")
+    )
+
+    assert window._save_training_config(show_dialog=False)
+    assert project.training.superadd_backbone_id == "vit_small_plus_patch16_dinov3.lvd1689m"
+    assert project.training.superadd_precision == "float32"
+    assert project.last_training_status == "Retraining required"
+    persisted = manager.load_project(project.root_path)
+    assert persisted.training.superadd_backbone_id == "vit_small_plus_patch16_dinov3.lvd1689m"
+    assert persisted.training.superadd_precision == "float32"
+
+    project.last_training_status = "Completed"
+    window.config_page.superadd_backbone_combo.setCurrentIndex(
+        window.config_page.superadd_backbone_combo.findData("vit_base_patch16_dinov3.lvd1689m")
+    )
+    assert window._save_training_config(show_dialog=False)
+    assert project.last_training_status == "Retraining required"
+    assert application is not None
+    window.close()

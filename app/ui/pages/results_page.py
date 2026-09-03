@@ -114,7 +114,6 @@ class ResultsPage(QWidget):
         pixel_row.addWidget(self.revision_pixel_mask_check)
         pixel_row.addWidget(self.revision_pixel_threshold_spin)
         pixel_row.addStretch(1)
-        self.apply_threshold_revision_button = QPushButton("Apply Threshold Revision")
         self.preview_threshold_effect_button = QPushButton("Preview Effect")
         self.threshold_preview_label = QLabel("Preview uses persisted scores and does not run the model.")
         self.threshold_preview_label.setObjectName("ModelSupport")

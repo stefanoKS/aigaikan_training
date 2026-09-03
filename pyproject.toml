@@ -12,6 +12,6 @@ requires-python = ">=3.11,<3.12"
 pythonpath = ["."]
 testpaths = ["tests"]
 markers = [
-	"anomalib_smoke: real Anomalib train, export, reload, and parity integration tests",
+	"anomalib_smoke: opt-in real Anomalib constructor and integration smoke tests requiring local weights/runtime",
 ]
 

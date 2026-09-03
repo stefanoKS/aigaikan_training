@@ -140,6 +140,22 @@ The project and every run persist canonical `inspection_region.json` metadata. R
 
 The supported profiles are fixed and use Anomalib-native preprocessing: PatchCore uses `wide_resnet50_2`, `layer2`/`layer3`, coreset ratio `0.1`, nine neighbors, batch size 8, and one epoch; PaDiM uses `resnet18` with `layer1`/`layer2`/`layer3` and one epoch; Dinomaly-DINOv2 uses `vit_base_patch14_reg4_dinov2`; and Dinomaly-DINOv3 uses `vit_base_patch16_dinov3.lvd1689m`. Both Dinomaly profiles use decoder depth 8, bottleneck dropout 0.2, context recentering disabled, and an automatic budget of $\max(5000, \lceil \text{training images} / \text{batch size} \rceil)$ optimizer steps unless an explicit advanced override is saved. Dinomaly-DINOv3 uses Anomalib's `448x448` resize with a `384x384` center crop, because its $16$-pixel patch grid requires dimensions divisible by $16$. The application does not impose a global image-size preprocessor override.
 
+### SuperADD backbones and precision
+
+SuperADD has a dedicated **SuperADD Settings** group. It exposes only the installed, curated DINOv3 `timm` backbones: Small, Small+, Base, Large, and Huge+. New selections persist their exact `timm` identifier and SuperADD precision (`float32` or CUDA-only `float16`) in the project and every completed run. Historical configurations that do not contain SuperADD fields continue to use the existing Huge+ `float32` profile, automatic feature layers, patch size `448`, overlap `16`, score quantile `0.001`, and the unchanged Anomalib memory-bank default.
+
+Small is the fastest candidate, Small+ is the recommended real-time candidate, Base is a balanced quality/latency candidate, Large is slow, and Huge+ is the current/reference configuration and is expected to be very slow. Changing the SuperADD backbone or precision requires retraining and recalibration. Never copy a threshold between different backbone or precision runs: its score distribution is run-specific. SuperADD external tiling remains disabled and native top-$0.1\%$ anomaly-map aggregation remains unchanged.
+
+Use this controlled experiment on the same inputs, ROI, preprocessing profile, padding, automatic feature layers, patch size, overlap, memory-bank default, and seeds:
+
+1. Huge+ FP32 reference.
+2. Base FP32.
+3. Small+ FP32.
+4. Base FP16 on CUDA.
+5. Small+ FP16 on CUDA.
+
+Retrain and recalibrate each run before comparison.
+
 Threshold calibration always uses held-out calibration predictions, never final-test predictions. Automatic calibration uses labeled F1 when genuine held-out OK and NG samples exist; otherwise it uses normal-only conformal calibration at the selected normal false-reject target (default $0.5\%$). Normal-only calibration establishes an operating point, not universal defect detection. The legacy maximum-score method is explicitly marked as conservative; synthetic anomaly calibration is unavailable until a dedicated generator can provide honest provenance.
 
 Every prediction records its raw model score separately from its Anomalib-postprocessed score and map. Calibration and operational image thresholds apply only to the declared postprocessed score semantic and use `score >= threshold`. Raw scores are preserved for provenance and are not clamped into the postprocessed $[0, 1]$ domain.
@@ -208,13 +224,16 @@ Example timing payload:
 
 ```json
 {
-	"timing_record_version": 1,
-	"preprocess_compute_ms": 1.42,
+	"timing_record_version": 2,
+	"preprocess_total_ms": 1.42,
+	"anomalib_transform_ms": 0.28,
+	"host_to_device_ms": 0.14,
 	"model_forward_ms": 4.83,
-	"application_postprocess_ms": 0.31,
-	"inference_total_ms": 5.14,
-	"artifact_io_ms": 2.02,
-	"end_to_end_ms": 7.16,
+	"native_postprocess_ms": 0.31,
+	"decision_postprocess_ms": 0.03,
+	"model_pipeline_ms": 5.31,
+	"end_to_end_compute_ms": 7.01,
+	"artifact_io_ms": 0.0,
 	"batch_size": 1,
 	"tile_count": 1,
 	"warmup_status": "not_warmed"
@@ -222,6 +241,31 @@ Example timing payload:
 ```
 
 The existing temporary-PNG trainer inference path remains available for compatibility and records `staging_io_ms` separately. It reports batch wall time and amortized per-image time; true batch-one timing is recorded only when a real batch contains one image. CUDA reference timing uses synchronized CUDA events when a CUDA runner is selected. This is Anomalib deployment evidence only; it is not compatibility evidence for the separate AIGAIKAN runtime or defect-detection evidence when genuine NG test data is absent.
+
+## Industrial checkpoint benchmark
+
+The **Industrial Inference Benchmark** section on the Inference page launches a separate process, so the GUI remains responsive. It loads a completed SuperADD checkpoint once, keeps it resident, uses `model.eval()` and eager `torch.inference_mode()`, and measures batch size one. This is a checkpoint benchmark only, **not** a validated deployment export and it does not change any export-support status.
+
+`camera-equivalent` preloads sorted source images as RGB `uint8` arrays before warmup. It measures from an available camera frame in RAM and explicitly excludes file decode, camera exposure/transport, PLC, and actuator latency. `file-end-to-end` decodes each source once per measured frame, reports decode separately, and includes it in file-source end-to-end latency. Neither mode saves PNGs, masks, heatmaps, overlays, NPZ files, or CSV rows in its timed production path.
+
+The result reports P50/P95/P99, mean, standard deviation, min, and max for each measured phase. Industrial pass/fail uses P95 end-to-end compute latency with the selected reserve, not model-forward timing alone:
+
+$$
+	ext{allowed compute budget} = \frac{1000}{\text{target FPS}} \left(1 - \frac{\text{reserve percent}}{100}\right)
+$$
+
+Run the same benchmark from PowerShell for each completed training run:
+
+```powershell
+python scripts\benchmark_run_inference.py --run-dir "C:\runs\superadd-huge-fp32" --input "C:\benchmark-images" --device cuda --mode camera-equivalent --warmup 20 --iterations 200 --target-fps 10 --reserve-percent 20 --output "C:\benchmarks\huge-fp32.json" --csv-output "C:\benchmarks\huge-fp32.csv"
+python scripts\benchmark_run_inference.py --run-dir "C:\runs\superadd-base-fp32" --input "C:\benchmark-images" --device cuda --mode camera-equivalent --warmup 20 --iterations 200 --target-fps 10 --reserve-percent 20 --output "C:\benchmarks\base-fp32.json"
+python scripts\benchmark_run_inference.py --run-dir "C:\runs\superadd-small-plus-fp32" --input "C:\benchmark-images" --device cuda --mode camera-equivalent --warmup 20 --iterations 200 --target-fps 10 --reserve-percent 20 --output "C:\benchmarks\small-plus-fp32.json"
+python scripts\benchmark_run_inference.py --run-dir "C:\runs\superadd-base-fp16" --input "C:\benchmark-images" --device cuda --mode camera-equivalent --warmup 20 --iterations 200 --target-fps 10 --reserve-percent 20 --output "C:\benchmarks\base-fp16.json"
+python scripts\benchmark_run_inference.py --run-dir "C:\runs\superadd-small-plus-fp16" --input "C:\benchmark-images" --device cuda --mode camera-equivalent --warmup 20 --iterations 200 --target-fps 10 --reserve-percent 20 --output "C:\benchmarks\small-plus-fp16.json"
+python scripts\compare_inference_benchmarks.py C:\benchmarks\base-fp32.json C:\benchmarks\base-fp16.json C:\benchmarks\small-plus-fp32.json C:\benchmarks\small-plus-fp16.json --output C:\benchmarks\comparison.csv
+```
+
+The comparison script warns when benchmark documents differ in input manifest, ROI, preprocessing profile, prepared canvas size, warmup count, measured count, or target FPS.
 
 ## Reevaluation without retraining
 

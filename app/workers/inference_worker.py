@@ -17,7 +17,7 @@ from lightning.pytorch.callbacks import BasePredictionWriter
 
 from app.core.inspection_region import InspectionRegionProcessor
 from app.core.decision_score import resolve_decision_score
-from app.core.inference_timing import InferenceTimingRecord, timing_percentiles
+from app.core.inference_timing import InferenceTimingRecord, timed_model_call, timing_percentiles
 from app.core.prediction_artifacts import inspection_region_metadata, save_prediction_artifacts
 from app.core.prediction_adapter import (
     ANOMALIB_POSTPROCESSED_SCORE_SEMANTIC,
@@ -324,12 +324,18 @@ class InferenceResultCollector:
         model_forward_ms = _optional_timing(batch.get("model_forward_ms"))
         application_postprocess_ms = _optional_timing(batch.get("application_postprocess_ms"))
         preprocess_compute_ms = _optional_timing(base.get("preprocess_compute_ms"))
-        staging_io_ms = _optional_timing(base.get("staging_io_ms"))
-        end_to_end_ms = sum(
+        preprocess_total_ms = _optional_timing(base.get("preprocess_total_ms")) or preprocess_compute_ms
+        input_decode_ms = _optional_timing(base.get("input_decode_ms"))
+        model_forward_ms = _optional_timing(batch.get("model_forward_ms"))
+        native_postprocess_ms = _optional_timing(batch.get("native_postprocess_ms"))
+        application_postprocess_ms = _optional_timing(batch.get("application_postprocess_ms")) or 0.0
+        model_pipeline_ms = sum(
             value
-            for value in (preprocess_compute_ms, staging_io_ms, model_forward_ms, application_postprocess_ms, artifact_io_ms)
+            for value in (_optional_timing(batch.get("host_to_device_ms")), model_forward_ms, native_postprocess_ms, application_postprocess_ms)
             if value is not None
         )
+        end_to_end_compute_ms = sum(value for value in (preprocess_total_ms, model_pipeline_ms) if value is not None)
+        file_source_end_to_end_ms = sum(value for value in (input_decode_ms, end_to_end_compute_ms) if value is not None)
         raw_size = _timing_size(base.get("raw_input_size"), source_path)
         rectified_size = _timing_size(base.get("rectified_size"), source_path)
         model_input_size = _timing_size(
@@ -338,23 +344,36 @@ class InferenceResultCollector:
             self._preprocessing_pipeline.plan.model_input_size if self._preprocessing_pipeline is not None else (0, 0),
         )
         return InferenceTimingRecord(
-            input_decode_ms=_optional_timing(base.get("input_decode_ms")),
+            input_decode_ms=input_decode_ms,
             roi_rectification_ms=_optional_timing(base.get("roi_rectification_ms")),
             image_filter_ms=_optional_timing(base.get("image_filter_ms")),
             padding_tiling_ms=_optional_timing(base.get("padding_tiling_ms")),
+            padding_ms=_optional_timing(base.get("padding_ms", base.get("padding_tiling_ms"))),
             preprocess_compute_ms=preprocess_compute_ms,
-            staging_io_ms=staging_io_ms,
-            host_to_device_ms=None,
+            preprocess_total_ms=preprocess_total_ms,
+            staging_io_ms=_optional_timing(base.get("staging_io_ms")),
+            host_to_device_ms=_optional_timing(batch.get("host_to_device_ms")),
             model_forward_ms=model_forward_ms,
-            native_postprocess_ms=_optional_timing(batch.get("native_postprocess_ms")),
+            native_postprocess_ms=native_postprocess_ms,
             application_postprocess_ms=application_postprocess_ms,
-            inference_total_ms=_optional_timing(batch.get("inference_total_ms")),
+            decision_postprocess_ms=application_postprocess_ms,
+            inference_total_ms=model_pipeline_ms,
+            model_pipeline_ms=model_pipeline_ms,
+            end_to_end_compute_ms=end_to_end_compute_ms,
+            file_source_end_to_end_ms=file_source_end_to_end_ms,
             artifact_io_ms=artifact_io_ms,
-            end_to_end_ms=end_to_end_ms,
+            end_to_end_ms=file_source_end_to_end_ms,
             model_load_ms=_optional_timing(batch.get("model_load_ms")),
             device=str(batch.get("device", "")),
-            dtype="uint8_rgb",
+            input_color_order="RGB",
+            input_dtype="uint8",
+            model_precision=str(batch.get("model_precision", "")),
+            memory_bank_dtype=str(batch.get("memory_bank_dtype", "")),
+            memory_bank_shape=tuple(int(value) for value in batch.get("memory_bank_shape", ())),
             batch_size=int(batch.get("batch_size", 1)),
+            batch_wall_ms=_optional_timing(batch.get("batch_wall_ms")),
+            amortized_batch_ms_per_image=_optional_timing(batch.get("amortized_batch_ms_per_image")),
+            true_batch_one_latency_ms=_optional_timing(batch.get("true_batch_one_latency_ms")),
             tile_count=int(base.get("tile_count", 1)),
             raw_input_size=raw_size,
             rectified_size=rectified_size,
@@ -384,7 +403,11 @@ class InferencePredictionWriter(BasePredictionWriter):
         self._predict_started_ns: int | None = None
         self._batch_started_ns: int | None = None
         self._cuda_start_event: Any = None
+        self._device = "cpu"
         self._model_load_ms: float | None = None
+        self._model_precision = ""
+        self._memory_bank_shape: tuple[int, ...] = ()
+        self._memory_bank_dtype = ""
         self._emitted_batches = 0
 
     def start_prediction_timing(self) -> None:
@@ -414,6 +437,7 @@ class InferencePredictionWriter(BasePredictionWriter):
         root_device = getattr(getattr(trainer, "strategy", None), "root_device", None)
         if getattr(root_device, "type", "") != "cuda":
             return
+        self._device = "cuda"
         try:
             import torch
 
@@ -423,11 +447,13 @@ class InferencePredictionWriter(BasePredictionWriter):
         except Exception:
             self._cuda_start_event = None
 
-    def configure_postprocessor(self, model: Any) -> None:
+    def configure_postprocessor(self, model: Any, config: TrainingConfig | None = None) -> None:
         """Install explicit, idempotent native postprocessing before prediction callbacks run."""
         post_processor = getattr(model, "post_processor", None)
         if post_processor is not None:
             self._postprocessor = ExplicitPredictionPostProcessor(post_processor)
+        self._model_precision = config.superadd_precision if config is not None and config.is_super_add else "float32"
+        self._memory_bank_shape, self._memory_bank_dtype = _memory_bank_metadata(model)
 
     def write_on_batch_end(
         self,
@@ -439,20 +465,30 @@ class InferencePredictionWriter(BasePredictionWriter):
         batch_idx: int,
         dataloader_idx: int,
     ) -> None:
-        output = self._postprocessor.postprocess(prediction) if self._postprocessor is not None else prediction
-        batch_wall_ms = self._batch_elapsed_ms()
+        model_forward_ms = self._batch_elapsed_ms()
+        if self._postprocessor is None:
+            output, native_postprocess_ms = prediction, 0.0
+        else:
+            output, native_postprocess_ms = timed_model_call(
+                lambda: self._postprocessor.postprocess(prediction), self._device
+            )
+        batch_wall_ms = self._batch_wall_elapsed_ms()
         batch_size = max(_prediction_batch_size(output), 1)
         timing = {
             "model_load_ms": self._model_load_ms if self._emitted_batches == 0 else 0.0,
-            "model_forward_ms": batch_wall_ms / batch_size,
-            "native_postprocess_ms": None,
+            "host_to_device_ms": None,
+            "model_forward_ms": model_forward_ms / batch_size,
+            "native_postprocess_ms": native_postprocess_ms / batch_size,
             "application_postprocess_ms": 0.0,
-            "inference_total_ms": batch_wall_ms / batch_size,
+            "inference_total_ms": (model_forward_ms + native_postprocess_ms) / batch_size,
             "batch_wall_ms": batch_wall_ms,
             "amortized_batch_ms_per_image": batch_wall_ms / batch_size,
             "true_batch_one_latency_ms": batch_wall_ms if batch_size == 1 else None,
             "batch_size": batch_size,
-            "device": "cuda" if self._cuda_start_event is not None else "cpu",
+            "device": self._device,
+            "model_precision": self._model_precision,
+            "memory_bank_shape": list(self._memory_bank_shape),
+            "memory_bank_dtype": self._memory_bank_dtype,
         }
         timed_add_batch = getattr(self._collector, "add_timed_batch", None)
         if callable(timed_add_batch):
@@ -480,6 +516,18 @@ class InferencePredictionWriter(BasePredictionWriter):
         started = self._batch_started_ns or perf_counter_ns()
         return (perf_counter_ns() - started) / 1_000_000
 
+    def _batch_wall_elapsed_ms(self) -> float:
+        """Return synchronized wall time for the whole callback batch, including native postprocessing."""
+        if self._device == "cuda":
+            try:
+                import torch
+
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+        started = self._batch_started_ns or perf_counter_ns()
+        return (perf_counter_ns() - started) / 1_000_000
+
 
 def _stage_preprocessed_inputs(
     source_paths: tuple[Path, ...],
@@ -498,8 +546,8 @@ def _stage_preprocessed_inputs(
     preprocessing_tile_by_staged_path: dict[Path, PreprocessingTile] = {}
     preview_path_by_source: dict[Path, Path] = {}
     for source_index, source_path in enumerate(source_paths):
-        staging_started = perf_counter_ns()
         prepared_images, rectified_image, timing = preprocessing_pipeline.prepare_path_with_timing(source_path)
+        staging_started = perf_counter_ns()
         preview_path = (preview_directory / f"{source_index:06d}.png").resolve()
         Image.fromarray(rectified_image, "RGB").save(preview_path)
         preview_path_by_source[source_path] = preview_path
@@ -511,9 +559,9 @@ def _stage_preprocessed_inputs(
             source_path_by_staged_path[staged_path] = source_path
             preprocessing_tile_by_staged_path[staged_path] = prepared.tile
         if preprocessing_timing_by_source is not None:
-            timing["staging_io_ms"] = (perf_counter_ns() - staging_started) / 1_000_000 - float(
-                timing["preprocess_compute_ms"]
-            )
+            timing["padding_ms"] = timing["padding_tiling_ms"]
+            timing["preprocess_total_ms"] = timing["preprocess_compute_ms"]
+            timing["staging_io_ms"] = (perf_counter_ns() - staging_started) / 1_000_000
             preprocessing_timing_by_source[source_path] = timing
     return prepared_directory, source_path_by_staged_path, preprocessing_tile_by_staged_path, preview_path_by_source
 
@@ -606,7 +654,7 @@ def run(run_directory: Path, input_path: Path) -> int:
                 "message": f"Final-test acceptance warning: {quality_warning}",
             }
         )
-    prediction_writer.configure_postprocessor(components["model"])
+    prediction_writer.configure_postprocessor(components["model"], config)
     device_note = str(components["device_note"])
     if device_note:
         emit({"type": "log", "level": "warning", "message": device_note})
@@ -675,10 +723,10 @@ def run(run_directory: Path, input_path: Path) -> int:
     manifest_path = output_directory / "inference_manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["timing"] = {
-        "timing_record_version": 1,
+        "timing_record_version": 2,
         "per_image": [prediction.timing_metadata for prediction in collector.predictions],
         "summary": timing_summary,
-        "batch_mode": "explicit_loader_batch_wall_and_amortized_per_image",
+        "batch_mode": "folder_inference_batch_wall_and_amortized_per_image; true_batch_one_latency_is_present_only_for_batch_size_one",
     }
     manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
     emit({"type": "completed", "result_dir": str(output_directory)})
@@ -729,6 +777,15 @@ def _prediction_batch_size(output: Any) -> int:
     batch = output.output if hasattr(output, "output") else output
     paths = batch.get("image_path") if isinstance(batch, dict) else getattr(batch, "image_path", None)
     return len(paths) if isinstance(paths, (list, tuple)) else 1
+
+
+def _memory_bank_metadata(model: Any) -> tuple[tuple[int, ...], str]:
+    """Return observable memory-bank dimensions without changing the trained bank."""
+    for name in ("memory_bank", "memory_bank_features", "memory_bank_embedding"):
+        value = getattr(model, name, None)
+        if value is not None and hasattr(value, "shape"):
+            return tuple(int(size) for size in value.shape), str(getattr(value, "dtype", ""))
+    return (), ""
 
 
 if __name__ == "__main__":

@@ -80,6 +80,13 @@ QScrollArea#PageScrollArea {
 QScrollArea#PageScrollArea::viewport, QWidget#WorkspacePage {
     background: #0d1012;
 }
+QScrollArea#PreprocessSettingsScrollArea {
+    border: none;
+    border-top: 1px solid #2c3d40;
+}
+QScrollArea#PreprocessSettingsScrollArea::viewport {
+    background: #0d1012;
+}
 QSplitter::handle {
     background: #223236;
     width: 1px;

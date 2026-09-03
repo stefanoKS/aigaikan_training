@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import pytest
+import sys
+from types import ModuleType
 
 from app.core.inference_timing import InferenceTimingRecord, timed_model_call, timing_percentiles
 
@@ -31,3 +33,45 @@ def test_cuda_model_timing_uses_a_synchronized_path_when_cuda_is_available() -> 
     _value, elapsed_ms = timed_model_call(lambda: torch.ones(1, device="cuda").sum(), "cuda")
 
     assert elapsed_ms >= 0
+
+
+def test_cuda_timing_synchronizes_and_invokes_work_once_with_test_double(monkeypatch) -> None:
+    calls: list[str] = []
+
+    class FakeEvent:
+        def __init__(self, enable_timing: bool) -> None:
+            assert enable_timing
+
+        def record(self) -> None:
+            calls.append("record")
+
+        def synchronize(self) -> None:
+            calls.append("event_synchronize")
+
+        def elapsed_time(self, _other: object) -> float:
+            return 2.5
+
+    fake_torch = ModuleType("torch")
+    fake_torch.cuda = type(
+        "FakeCuda",
+        (),
+        {
+            "is_available": staticmethod(lambda: True),
+            "synchronize": staticmethod(lambda: calls.append("cuda_synchronize")),
+            "Event": FakeEvent,
+        },
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    work_calls = 0
+
+    def work() -> str:
+        nonlocal work_calls
+        work_calls += 1
+        return "done"
+
+    value, elapsed_ms = timed_model_call(work, "cuda")
+
+    assert value == "done"
+    assert elapsed_ms == 2.5
+    assert work_calls == 1
+    assert calls == ["cuda_synchronize", "record", "record", "event_synchronize"]

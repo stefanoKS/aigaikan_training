@@ -7,7 +7,7 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QAbstractButton, QApplication
 
 from app.core.project_manager import ProjectManager
 from app.core.settings_manager import SettingsManager
@@ -38,4 +38,49 @@ def test_language_selector_translates_ui_without_changing_runtime_input_paths() 
     assert window.inference_page.load_run_button.text() == "Load Training Run"
     assert window.inference_page.export_ng_images_button.text() == "Export NG Images"
     assert window.inference_page.input_label.text() == str(input_path)
+    window.close()
+
+
+def test_japanese_translation_covers_every_static_button_caption() -> None:
+    application = QApplication.instance() or QApplication([])
+    settings = SettingsManager()
+    window = MainWindow(settings, ProjectManager(settings.default_projects_directory()))
+    button_sources = {
+        button: button.text()
+        for button in window.findChildren(QAbstractButton)
+        if button.text()
+    }
+
+    assert button_sources
+    assert all(source in window.ui_translator._JAPANESE for source in button_sources.values())
+
+    window.language_combo.setCurrentIndex(window.language_combo.findData("ja"))
+    application.processEvents()
+
+    for button, source in button_sources.items():
+        assert button.text() == window.ui_translator.text(source)
+
+    window.language_combo.setCurrentIndex(window.language_combo.findData("en"))
+    application.processEvents()
+
+    for button, source in button_sources.items():
+        assert button.text() == source
+    window.close()
+
+
+def test_dynamic_training_action_button_remains_translated_after_update() -> None:
+    application = QApplication.instance() or QApplication([])
+    settings = SettingsManager()
+    window = MainWindow(settings, ProjectManager(settings.default_projects_directory()))
+
+    window.language_combo.setCurrentIndex(window.language_combo.findData("ja"))
+    window.ui_translator.set_button_text(window.training_page.start_button, "Run Evaluation")
+    application.processEvents()
+
+    assert window.training_page.start_button.text() == "評価を実行"
+
+    window.ui_translator.set_button_text(window.training_page.start_button, "Start Training")
+    application.processEvents()
+
+    assert window.training_page.start_button.text() == "学習を開始"
     window.close()

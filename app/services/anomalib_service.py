@@ -180,8 +180,9 @@ class AnomalibService:
         Engine = self._anomalib_engine()
         self._seed_everything(config.random_seed)
 
-        model = self._create_model(definition, config, preprocessing_plan)
         device = self.resolve_device(config.device)
+        self._validate_superadd_precision(config, device)
+        model = self._create_model(definition, config, preprocessing_plan)
         if device == "gpu":
             self._configure_gpu_precision()
 
@@ -289,6 +290,7 @@ class AnomalibService:
         Engine = self._anomalib_engine()
 
         device = self.resolve_device(config.device)
+        self._validate_superadd_precision(config, device)
         if device == "gpu":
             self._configure_gpu_precision()
         engine_kwargs: dict[str, Any] = {
@@ -453,15 +455,28 @@ class AnomalibService:
         self,
         model_class: Any,
         definition: ModelDefinition,
-        _config: TrainingConfig,
+        config: TrainingConfig,
         preprocessing_plan: ResolvedPreprocessingPlan | None,
     ) -> Any:
         return self._instantiate_model(
             model_class,
             definition,
             preprocessing_plan,
-            {"backbone": "vit_huge_plus_patch16_dinov3", "patch_size": 448, "patch_overlap": 16},
+            {
+                "backbone": config.superadd_backbone_name,
+                "precision": config.superadd_precision,
+                "patch_size": 448,
+                "patch_overlap": 16,
+            },
         )
+
+    @staticmethod
+    def _validate_superadd_precision(config: TrainingConfig, device: str) -> None:
+        """Reject an FP16 request when Auto or explicit selection resolves to CPU."""
+        if config.is_super_add and config.superadd_precision == "float16" and device != "gpu":
+            raise ValueError(
+                "SuperADD FP16 requires CUDA. The selected device resolved to CPU; select CUDA with a supported GPU or use FP32."
+            )
 
     def _create_efficient_ad_model(
         self,

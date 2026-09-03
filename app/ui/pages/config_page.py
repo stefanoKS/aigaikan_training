@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
 from app.core.model_registry import ModelExecutionMode, ModelRegistry
 from app.core.threshold_calibrator import ThresholdMethod
 from app.core.dinomaly_encoder_registry import DinomalyEncoderRegistry
+from app.core.superadd_backbone_registry import LEGACY_HUGE_BACKBONE_ID, SuperAddBackboneRegistry
 from app.models.preprocessing_config import PaddingPolicy, ScoreAggregation
 
 
@@ -111,6 +112,30 @@ class ConfigPage(QWidget):
         dinomaly_form.addRow("Training Steps Override", self.target_training_steps_spin)
         root.addWidget(self.dinomaly_group)
 
+        self.superadd_group = QGroupBox("SuperADD Settings")
+        superadd_form = QFormLayout(self.superadd_group)
+        self.superadd_backbone_registry = SuperAddBackboneRegistry()
+        self.superadd_backbone_combo = QComboBox()
+        self.superadd_backbone_combo.setMinimumContentsLength(32)
+        self.superadd_precision_combo = QComboBox()
+        self.superadd_precision_combo.addItem("FP32", "float32")
+        self.superadd_precision_combo.addItem("FP16 - CUDA only", "float16")
+        self.superadd_feature_layers_label = QLabel("Automatic")
+        self.superadd_guidance_label = QLabel()
+        self.superadd_guidance_label.setObjectName("ModelSupport")
+        self.superadd_guidance_label.setWordWrap(True)
+        self.superadd_native_score_label = QLabel(
+            "SuperADD uses its native top-0.1% anomaly-map mean; this setting is not modified."
+        )
+        self.superadd_native_score_label.setObjectName("ModelSupport")
+        self.superadd_native_score_label.setWordWrap(True)
+        superadd_form.addRow("Backbone", self.superadd_backbone_combo)
+        superadd_form.addRow("Precision", self.superadd_precision_combo)
+        superadd_form.addRow("Feature Layers", self.superadd_feature_layers_label)
+        superadd_form.addRow(self.superadd_guidance_label)
+        superadd_form.addRow(self.superadd_native_score_label)
+        root.addWidget(self.superadd_group)
+
         self.preprocessing_group = QGroupBox("Preprocessing Policy")
         preprocessing_form = QFormLayout(self.preprocessing_group)
         self.rectified_roi_size_label = QLabel("Select an inspection ROI or dataset image")
@@ -144,6 +169,11 @@ class ConfigPage(QWidget):
         self.top_k_fraction_spin.setSingleStep(0.1)
         self.top_k_fraction_spin.setSuffix("%")
         self.top_k_fraction_spin.setValue(1.0)
+        self.superadd_score_aggregation_note = QLabel(
+            "SuperADD uses its native top-0.1% anomaly-map mean; this setting is not modified."
+        )
+        self.superadd_score_aggregation_note.setObjectName("ModelSupport")
+        self.superadd_score_aggregation_note.setWordWrap(True)
         preprocessing_form.addRow("Rectified ROI Size", self.rectified_roi_size_label)
         preprocessing_form.addRow("Padding Policy", self.padding_policy_combo)
         preprocessing_form.addRow("Automatic Right Padding", self.automatic_right_padding_label)
@@ -157,6 +187,7 @@ class ConfigPage(QWidget):
         preprocessing_form.addRow("Tiling", self.tiling_check)
         preprocessing_form.addRow("Score Aggregation", self.score_aggregation_combo)
         preprocessing_form.addRow("Top-k Fraction", self.top_k_fraction_spin)
+        preprocessing_form.addRow(self.superadd_score_aggregation_note)
         root.addWidget(self.preprocessing_group)
 
         self.threshold_group = QGroupBox("Decision Threshold Calibration")
@@ -237,6 +268,7 @@ class ConfigPage(QWidget):
         root.addLayout(button_row)
         root.addStretch(1)
         self.model_combo.currentIndexChanged.connect(self._update_model_support)
+        self.superadd_backbone_combo.currentIndexChanged.connect(self._update_superadd_guidance)
         self.threshold_fpr_combo.currentIndexChanged.connect(self._update_threshold_controls)
         self.minimum_ng_recall_check.toggled.connect(self._update_threshold_controls)
         self.pixel_threshold_check.toggled.connect(self._update_threshold_controls)
@@ -363,6 +395,10 @@ class ConfigPage(QWidget):
         self.dinomaly_group.setVisible(is_dinomaly)
         if is_dinomaly:
             self._populate_dinomaly_encoders(model_key)
+        is_superadd = model_key == "super_add"
+        self.superadd_group.setVisible(is_superadd)
+        if is_superadd:
+            self._populate_superadd_backbones()
         is_training_model = self._model_definitions[model_key].execution_mode is ModelExecutionMode.TRAIN
         self.trainer_group.setEnabled(is_training_model)
         self.trainer_group.setTitle("Trainer Settings" if is_training_model else "Trainer Settings (Not used for zero-shot evaluation)")
@@ -392,6 +428,62 @@ class ConfigPage(QWidget):
         self.tiling_check.setToolTip("Tiling is currently supported only by Dinomaly models." if not supports_tiling else "")
         if not supports_tiling:
             self.tiling_check.setChecked(False)
+        self.score_aggregation_combo.setEnabled(not is_superadd)
+        self.top_k_fraction_spin.setEnabled(not is_superadd and self.score_aggregation_combo.currentData() == ScoreAggregation.TOP_K_MEAN.value)
+        self.superadd_score_aggregation_note.setVisible(is_superadd)
+
+    def set_superadd_settings(self, backbone_id: str, precision: str) -> None:
+        """Load a persisted SuperADD contract without accepting arbitrary text values."""
+        if str(self.model_combo.currentData()) != "super_add":
+            return
+        self._populate_superadd_backbones(backbone_id)
+        precision_index = self.superadd_precision_combo.findData(precision)
+        self.superadd_precision_combo.setCurrentIndex(max(precision_index, 0))
+
+    def _populate_superadd_backbones(self, requested_identifier: str = "") -> None:
+        """Populate fixed DINOv3 backbones and disable runtime-unavailable choices."""
+        current_identifier = requested_identifier or str(self.superadd_backbone_combo.currentData() or "")
+        presets = self.superadd_backbone_registry.all()
+        if current_identifier == LEGACY_HUGE_BACKBONE_ID:
+            current_identifier = presets[-1].identifier
+        self.superadd_backbone_combo.blockSignals(True)
+        self.superadd_backbone_combo.clear()
+        first_available_index = -1
+        requested_available_index = -1
+        unavailable_labels: list[str] = []
+        for preset in presets:
+            available = self.superadd_backbone_registry.is_available(preset)
+            self.superadd_backbone_combo.addItem(preset.display_name, preset.identifier)
+            index = self.superadd_backbone_combo.count() - 1
+            item = getattr(self.superadd_backbone_combo.model(), "item", lambda _index: None)(index)
+            if item is not None:
+                item.setEnabled(available)
+                item.setToolTip(preset.identifier if available else f"Unavailable: {preset.identifier}")
+            if available and first_available_index < 0:
+                first_available_index = index
+            if available and preset.identifier == current_identifier:
+                requested_available_index = index
+            if not available:
+                unavailable_labels.append(preset.display_name)
+        self.superadd_backbone_combo.setCurrentIndex(
+            requested_available_index if requested_available_index >= 0 else first_available_index
+        )
+        self.superadd_backbone_combo.blockSignals(False)
+        self._update_superadd_guidance()
+        if first_available_index < 0:
+            self.superadd_guidance_label.setText("No curated SuperADD backbone is available in the installed timm runtime.")
+        elif unavailable_labels:
+            self.superadd_guidance_label.setText("Unavailable: " + ", ".join(unavailable_labels))
+
+    def _update_superadd_guidance(self) -> None:
+        """Show short latency guidance for the currently selected curated backbone."""
+        identifier = str(self.superadd_backbone_combo.currentData() or "")
+        try:
+            preset = self.superadd_backbone_registry.get(identifier)
+        except ValueError:
+            self.superadd_guidance_label.setText("Select an available curated SuperADD backbone.")
+            return
+        self.superadd_guidance_label.setText(f"{preset.display_name}: {preset.guidance}.")
 
     def set_dinomaly_encoder(self, identifier: str) -> None:
         """Select a persisted curated encoder after the current model family is loaded."""
@@ -454,7 +546,8 @@ class ConfigPage(QWidget):
     def _update_preprocessing_controls(self) -> None:
         """Expose top-k tuning only when its aggregation strategy is active."""
         self.top_k_fraction_spin.setEnabled(
-            self.score_aggregation_combo.currentData() == ScoreAggregation.TOP_K_MEAN.value
+            self.score_aggregation_combo.isEnabled()
+            and self.score_aggregation_combo.currentData() == ScoreAggregation.TOP_K_MEAN.value
         )
         custom_padding = self.padding_policy() is PaddingPolicy.CUSTOM and self.padding_policy_combo.isEnabled()
         self.custom_right_padding_spin.setEnabled(custom_padding)

@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QPushButton,
     QRadioButton,
+    QScrollArea,
     QSlider,
     QSpinBox,
     QStyle,
@@ -64,7 +65,7 @@ class _ArrayPreviewLabel(QLabel):
         self._zoom_percent = 100
         self.setObjectName("DatasetThumbnail")
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setMinimumSize(220, 180)
+        self.setMinimumSize(180, 140)
         self.setMouseTracking(True)
 
     def set_array(self, values: np.ndarray | None) -> None:
@@ -143,11 +144,27 @@ class PreprocessImagesPage(QWidget):
         self._active_index = -1
         self._state = PreprocessingPreviewState()
         self._preview_arrays: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(28, 24, 28, 28)
-        root.setSpacing(16)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        self.preview_workspace = QWidget()
+        preview_workspace_layout = QVBoxLayout(self.preview_workspace)
+        preview_workspace_layout.setContentsMargins(28, 20, 28, 12)
+        preview_workspace_layout.setSpacing(10)
+
+        self.settings_scroll_area = QScrollArea()
+        self.settings_scroll_area.setObjectName("PreprocessSettingsScrollArea")
+        self.settings_scroll_area.setWidgetResizable(True)
+        self.settings_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.settings_scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        settings_content = QWidget()
+        settings_content.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        settings_layout = QVBoxLayout(settings_content)
+        settings_layout.setContentsMargins(28, 8, 28, 28)
+        settings_layout.setSpacing(16)
 
         source_group = QGroupBox("Preview Source")
         source_layout = QVBoxLayout(source_group)
@@ -188,12 +205,12 @@ class PreprocessImagesPage(QWidget):
         source_layout.addLayout(source_navigation)
         source_layout.addWidget(self.reset_source_button)
         source_layout.addWidget(self.already_rectified_check)
-        root.addWidget(source_group)
+        settings_layout.addWidget(source_group)
 
         self.active_source_label = QLabel("Active preview source: Project Good Images")
         self.active_source_label.setObjectName("ModelSupport")
         self.active_source_label.setWordWrap(True)
-        root.addWidget(self.active_source_label)
+        settings_layout.addWidget(self.active_source_label)
 
         profile_group = QGroupBox("Image Preprocessing Profile")
         profile_form = QFormLayout(profile_group)
@@ -283,14 +300,14 @@ class PreprocessImagesPage(QWidget):
         profile_form.addRow("Expected Minimum Defect Diameter", self.minimum_defect_spin)
         profile_form.addRow("Pixels per Millimetre", self.pixels_per_mm_spin)
         profile_form.addRow(self.profile_warning_label)
-        root.addWidget(profile_group)
+        settings_layout.addWidget(profile_group)
 
         profile_buttons = QHBoxLayout()
         self.save_profile_button = QPushButton("Save Preprocessing Profile")
         self.save_profile_button.setObjectName("PrimaryButton")
         profile_buttons.addWidget(self.save_profile_button)
         profile_buttons.addStretch(1)
-        root.addLayout(profile_buttons)
+        preview_workspace_layout.addLayout(profile_buttons)
 
         inspection_controls = QGridLayout()
         inspection_controls.setHorizontalSpacing(12)
@@ -309,14 +326,14 @@ class PreprocessImagesPage(QWidget):
         inspection_controls.addWidget(self.pixel_inspection_check, 1, 0)
         inspection_controls.addWidget(self.pixel_value_label, 1, 1)
         inspection_controls.setColumnStretch(1, 1)
-        root.addLayout(inspection_controls)
+        preview_workspace_layout.addLayout(inspection_controls)
 
         previews = QGridLayout()
         previews.setHorizontalSpacing(16)
         previews.setVerticalSpacing(16)
         self.original_canvas = InspectionRegionCanvas()
         self.original_canvas.setObjectName("DatasetThumbnail")
-        self.original_canvas.setMinimumSize(220, 200)
+        self.original_canvas.setMinimumSize(180, 140)
         self.original_canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.rectified_preview = _ArrayPreviewLabel("Rectified ROI")
         self.preprocessed_preview = _ArrayPreviewLabel("Preprocessed ROI")
@@ -336,13 +353,16 @@ class PreprocessImagesPage(QWidget):
             previews.addLayout(column, index // 2, index % 2)
         previews.setColumnStretch(0, 1)
         previews.setColumnStretch(1, 1)
-        root.addLayout(previews, stretch=1)
+        preview_workspace_layout.addLayout(previews, stretch=1)
 
         self.status_label = QLabel("Project Good Images are used only for preview.")
         self.status_label.setObjectName("ModelSupport")
         self.status_label.setWordWrap(True)
-        root.addWidget(self.status_label)
-        root.addStretch(1)
+        preview_workspace_layout.addWidget(self.status_label)
+        settings_layout.addStretch(1)
+        self.settings_scroll_area.setWidget(settings_content)
+        root.addWidget(self.preview_workspace)
+        root.addWidget(self.settings_scroll_area, stretch=1)
 
         self.project_good_radio.toggled.connect(lambda checked: checked and self.reset_to_project_good_images())
         self.custom_image_radio.toggled.connect(lambda checked: checked and self._select_custom_radio(PreviewSource.CUSTOM_IMAGE))

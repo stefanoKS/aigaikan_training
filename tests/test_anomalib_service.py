@@ -506,7 +506,12 @@ def test_preprocessing_v2_uses_explicit_model_geometry_without_a_second_folder_t
         (
             "super_add",
             "SuperADD",
-            {"backbone": "vit_huge_plus_patch16_dinov3", "patch_size": 448, "patch_overlap": 16},
+                {
+                    "backbone": "vit_huge_plus_patch16_dinov3",
+                    "precision": "float32",
+                    "patch_size": 448,
+                    "patch_overlap": 16,
+                },
         ),
         ("efficient_ad", "EfficientAd", {}),
         (

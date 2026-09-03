@@ -102,11 +102,38 @@ class PreprocessingPipeline:
 
     def prepare_array_with_rectified(self, image_rgb: np.ndarray) -> tuple[tuple[PreparedImage, ...], np.ndarray]:
         """Apply the v2 plan and retain its rectified pre-padding RGB image."""
+        prepared, rectified, _timing = self.prepare_array_with_timing(image_rgb)
+        return prepared, rectified
+
+    def prepare_array_with_timing(self, image_rgb: np.ndarray) -> tuple[tuple[PreparedImage, ...], np.ndarray, dict[str, object]]:
+        """Prepare an in-memory RGB camera frame with the same separated CPU phase timings as file input."""
         if image_rgb.ndim != 3 or image_rgb.shape[2] != 3:
             raise ValueError("Preprocessing v2 requires a three-channel RGB image.")
-        rectified = self._rectify(image_rgb)
+        if image_rgb.dtype != np.uint8:
+            raise ValueError("Preprocessing v2 requires uint8 RGB input.")
+        source = np.ascontiguousarray(image_rgb)
+        roi_started = perf_counter_ns()
+        rectified = self._rectify(source)
+        roi_ms = (perf_counter_ns() - roi_started) / 1_000_000
+        filter_started = perf_counter_ns()
         preprocessed = self.preprocess_rectified(rectified)
-        return tuple(self._prepare_tile(preprocessed, tile) for tile in self.plan.tiles), rectified
+        filter_ms = (perf_counter_ns() - filter_started) / 1_000_000
+        padding_started = perf_counter_ns()
+        prepared = tuple(self._prepare_tile(preprocessed, tile) for tile in self.plan.tiles)
+        padding_ms = (perf_counter_ns() - padding_started) / 1_000_000
+        return prepared, rectified, {
+            "input_decode_ms": 0.0,
+            "roi_rectification_ms": roi_ms,
+            "image_filter_ms": filter_ms,
+            "padding_tiling_ms": padding_ms,
+            "padding_ms": padding_ms,
+            "preprocess_compute_ms": roi_ms + filter_ms + padding_ms,
+            "preprocess_total_ms": roi_ms + filter_ms + padding_ms,
+            "raw_input_size": [source.shape[1], source.shape[0]],
+            "rectified_size": [rectified.shape[1], rectified.shape[0]],
+            "model_input_size": list(self.plan.model_input_size),
+            "tile_count": len(prepared),
+        }
 
     def preprocess_rectified(self, rectified_rgb: np.ndarray) -> np.ndarray:
         """Apply the frozen image profile before any model-specific padding or tiling."""

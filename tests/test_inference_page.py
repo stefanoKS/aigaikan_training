@@ -95,3 +95,40 @@ def test_inference_page_shows_original_overlay_and_binary_mask_previews(tmp_path
     assert not page.preview_labels["Mask"].pixmap().isNull()
 
     page.close()
+
+
+def test_inference_page_displays_industrial_batch_one_benchmark_summary() -> None:
+    application = QApplication.instance() or QApplication([])
+    page = InferencePage()
+    payload = {
+        "metadata": {
+            "backbone": "vit_small_plus_patch16_dinov3.lvd1689m",
+            "model_precision": "float16",
+            "prepared_canvas_size": [448, 448],
+            "peak_cuda_memory_allocated": 256 * 1024 * 1024,
+        },
+        "timing": {
+            "preprocess_total_ms": {"p50_ms": 2.0, "p95_ms": 3.0},
+            "model_forward_ms": {"p50_ms": 20.0, "p95_ms": 24.0},
+            "model_pipeline_ms": {"p50_ms": 22.0, "p95_ms": 26.0},
+            "end_to_end_compute_ms": {"p50_ms": 25.0, "p95_ms": 30.0, "p99_ms": 35.0},
+        },
+        "measured_steady_state_fps": 40.0,
+        "conservative_p95_fps": 33.333,
+        "deadline": {
+            "frame_period_ms": 100.0,
+            "allowed_compute_budget_ms": 80.0,
+            "pass": False,
+            "reason": "P95 end-to-end compute latency exceeds the budget.",
+        },
+    }
+
+    page.display_benchmark(payload)
+
+    assert application is not None
+    assert page.benchmark_summary_labels["Backbone"].text().startswith("vit_small_plus")
+    assert page.benchmark_summary_labels["PASS / FAIL"].text() == "FAIL"
+    assert "exceeds" in page.benchmark_summary_labels["Assessment"].text()
+    assert page.export_benchmark_json_button.isEnabled()
+    assert page.export_benchmark_csv_button.isEnabled()
+    page.close()

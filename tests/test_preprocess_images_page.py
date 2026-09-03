@@ -174,6 +174,27 @@ def test_narrow_layout_does_not_need_horizontal_scrolling(tmp_path: Path) -> Non
     scroll_area.close()
 
 
+def test_preview_workspace_stays_fixed_while_settings_scroll(tmp_path: Path) -> None:
+    page = _page((_image(tmp_path / "good.png", (20, 30, 40)),))
+    scroll_area = MainWindow._create_page_scroll_area(page)
+    scroll_area.resize(760, 700)
+    scroll_area.show()
+    QApplication.processEvents()
+
+    settings_content = page.settings_scroll_area.widget()
+    assert settings_content is not None
+    assert page.preview_workspace.isAncestorOf(page.save_profile_button)
+    assert page.preview_workspace.isAncestorOf(page.zoom_slider)
+    assert page.preview_workspace.isAncestorOf(page.original_canvas)
+    assert page.preview_workspace.isAncestorOf(page.difference_preview)
+    assert settings_content.isAncestorOf(page.preset_combo)
+    assert settings_content.isAncestorOf(page.project_good_radio)
+    assert scroll_area.verticalScrollBarPolicy() is Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+    assert page.settings_scroll_area.verticalScrollBar().maximum() > 0
+
+    scroll_area.close()
+
+
 def test_inactive_numeric_controls_are_disabled_until_their_operation_is_selected(tmp_path: Path) -> None:
     page = _page((_image(tmp_path / "good.png", (20, 30, 40)),))
 

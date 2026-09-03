@@ -130,6 +130,7 @@ class UiTranslator(QObject):
         "Start Training": "学習を開始",
         "Cancel Training": "学習をキャンセル",
         "Open Log File": "ログファイルを開く",
+        "Run Evaluation": "評価を実行",
         "Training Status": "学習ステータス",
         "Current Stage": "現在のステージ",
         "Stage Progress": "ステージ進捗",
@@ -191,6 +192,12 @@ class UiTranslator(QObject):
         "Cancel": "キャンセル",
         "Export Inference CSV": "推論 CSV を出力",
         "Export NG Images": "NG 画像を出力",
+        "Select Training Run": "学習実行を選択",
+        "Select Benchmark Image": "ベンチマーク画像を選択",
+        "Select Benchmark Folder": "ベンチマークフォルダーを選択",
+        "Start Benchmark": "ベンチマークを開始",
+        "Export Benchmark JSON": "ベンチマーク JSON を出力",
+        "Export Benchmark CSV": "ベンチマーク CSV を出力",
         "Exports selected NG rows, or every NG detection when no rows are selected.": "選択した NG 行を出力します。行を選択しない場合は、すべての NG 検出を出力します。",
         "Inference Summary": "推論概要",
         "Training Run": "学習実行",
@@ -200,6 +207,7 @@ class UiTranslator(QObject):
         "Training Threshold": "学習しきい値",
         "NG Export Threshold": "NG 出力しきい値",
         "Use custom export threshold": "カスタム出力しきい値を使用",
+        "Use custom NG image copy filter": "カスタム NG 画像コピー条件を使用",
         "Status": "ステータス",
         "Inference Log": "推論ログ",
         "Selected Prediction": "選択した予測",
@@ -270,6 +278,23 @@ class UiTranslator(QObject):
         "No selected results meet the current NG export threshold.": "選択した結果に現在の NG 出力しきい値を満たすものはありません。",
         "Export Raw NG Images": "生の NG 画像を出力",
         "Could Not Export NG Images": "NG 画像を出力できません",
+        "Select Custom Image": "カスタム画像を選択",
+        "Select Custom Folder": "カスタムフォルダーを選択",
+        "Reset to Project Good Images": "プロジェクトの正常画像に戻す",
+        "Save Preprocessing Profile": "前処理プロファイルを保存",
+        "Project Good Images": "プロジェクトの正常画像",
+        "Custom Image": "カスタム画像",
+        "Custom Folder": "カスタムフォルダー",
+        "Custom source is already rectified": "カスタム入力はすでに補正済み",
+        "Automatic odd kernel": "奇数カーネルを自動選択",
+        "Enable preview zoom": "プレビュー拡大を有効化",
+        "Enable pixel-value inspection": "ピクセル値の確認を有効化",
+        "Torch (.pt)": "PyTorch（.pt）",
+        "OpenVINO IR (.xml + .bin)": "OpenVINO IR（.xml + .bin）",
+        "ONNX (.onnx)": "ONNX（.onnx）",
+        "Generate pixel mask": "ピクセルマスクを生成",
+        "Preview Effect": "影響をプレビュー",
+        "Save and Activate Decision Revision": "判定改訂を保存して有効化",
     }
 
     def __init__(self) -> None:
@@ -293,6 +318,13 @@ class UiTranslator(QObject):
     def text(self, english: str) -> str:
         """Translate an English UI source string for the active language."""
         return self._JAPANESE.get(english, english) if self._language == "ja" else english
+
+    def set_button_text(self, button: QAbstractButton, english: str) -> None:
+        """Set dynamic button text while retaining its English source for later language changes."""
+        translated = self.text(english)
+        button.setProperty(self._TEXT_SOURCE_PROPERTY, english)
+        button.setProperty(f"{self._TEXT_SOURCE_PROPERTY}_rendered", translated)
+        button.setText(translated)
 
     def apply(self, root: QWidget) -> None:
         """Translate fixed child-widget text while leaving runtime data values intact."""

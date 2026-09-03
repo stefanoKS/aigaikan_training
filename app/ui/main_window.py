@@ -28,6 +28,8 @@ from PySide6.QtWidgets import (
 )
 
 from app.core.dataset_manager import DatasetManager
+from app.core.benchmark_controller import BenchmarkController
+from app.core.inference_benchmark import read_benchmark_json
 from app.core.dataset_manifest import build_effective_split
 from app.core.dataset_validator import DatasetValidationReport, DatasetValidator
 from app.core.inference_controller import InferenceController
@@ -103,6 +105,7 @@ class MainWindow(QMainWindow):
         self.model_registry = ModelRegistry()
         self.training_controller = TrainingController(self)
         self.inference_controller = InferenceController(self)
+        self.benchmark_controller = BenchmarkController(self)
         self.result_parser = ResultParser()
         self.export_service = ExportService()
         self.threshold_revision_service = ThresholdRevisionService()
@@ -110,6 +113,10 @@ class MainWindow(QMainWindow):
         self._run_metrics: dict[str, str] = {}
         self._inference_run_directory: Path | None = None
         self._inference_input_path: Path | None = None
+        self._benchmark_run_directory: Path | None = None
+        self._benchmark_input_path: Path | None = None
+        self._benchmark_json_path: Path | None = None
+        self._benchmark_csv_path: Path | None = None
         self.setWindowTitle("Anomalib Trainer")
         self.resize(1400, 900)
 
@@ -248,7 +255,11 @@ class MainWindow(QMainWindow):
             if isinstance(page, PreprocessImagesPage)
             else Qt.ScrollBarPolicy.ScrollBarAsNeeded
         )
-        scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll_area.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+            if isinstance(page, PreprocessImagesPage)
+            else Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
         scroll_area.setWidget(page)
         return scroll_area
 
@@ -319,6 +330,18 @@ class MainWindow(QMainWindow):
         self.inference_controller.completed.connect(self._inference_completed)
         self.inference_controller.failed.connect(self._inference_failed)
         self.inference_controller.running_changed.connect(self.inference_page.set_running)
+        self.inference_page.benchmark_select_run_button.clicked.connect(self._choose_benchmark_run)
+        self.inference_page.benchmark_select_image_button.clicked.connect(self._choose_benchmark_image)
+        self.inference_page.benchmark_select_folder_button.clicked.connect(self._choose_benchmark_folder)
+        self.inference_page.start_benchmark_button.clicked.connect(self._start_benchmark)
+        self.inference_page.cancel_benchmark_button.clicked.connect(self.benchmark_controller.cancel)
+        self.inference_page.export_benchmark_json_button.clicked.connect(lambda: self._export_benchmark_artifact("json"))
+        self.inference_page.export_benchmark_csv_button.clicked.connect(lambda: self._export_benchmark_artifact("csv"))
+        self.benchmark_controller.log_message.connect(self._append_inference_log)
+        self.benchmark_controller.progress_changed.connect(self.inference_page.set_progress)
+        self.benchmark_controller.completed.connect(self._benchmark_completed)
+        self.benchmark_controller.failed.connect(self._benchmark_failed)
+        self.benchmark_controller.running_changed.connect(self.inference_page.set_benchmark_running)
 
     def _create_project(self) -> None:
         name, accepted = QInputDialog.getText(self, "New Project", "Project name")
@@ -905,6 +928,11 @@ class MainWindow(QMainWindow):
             return False
         config = project.training
         previous_preprocessing_hash = preprocessing_hash(project.preprocessing)
+        previous_superadd_settings = (
+            config.model_name,
+            config.superadd_backbone_id,
+            config.superadd_precision,
+        )
         config.model_name = str(self.config_page.model_combo.currentData())
         config.device = DeviceMode(str(self.config_page.device_combo.currentData()))
         config.batch_size = self.config_page.batch_size_spin.value()
@@ -919,6 +947,9 @@ class MainWindow(QMainWindow):
         config.dinomaly_encoder_id = (
             str(self.config_page.dinomaly_encoder_combo.currentData() or "") if config.is_dinomaly else ""
         )
+        if config.is_super_add:
+            config.superadd_backbone_id = str(self.config_page.superadd_backbone_combo.currentData() or "")
+            config.superadd_precision = str(self.config_page.superadd_precision_combo.currentData() or "")
         config.num_workers = self.config_page.workers_spin.value()
         config.threshold_method = ThresholdMethod(str(self.config_page.threshold_method_combo.currentData()))
         config.target_normal_false_reject_rate = self.config_page.threshold_false_reject_rate()
@@ -948,6 +979,12 @@ class MainWindow(QMainWindow):
         project.preprocessing = updated_preprocessing
         if preprocessing_hash(updated_preprocessing) != previous_preprocessing_hash:
             self._mark_retraining_required()
+        if config.is_super_add and previous_superadd_settings != (
+            config.model_name,
+            config.superadd_backbone_id,
+            config.superadd_precision,
+        ):
+            self._mark_retraining_required()
         self._save_project(show_dialog=False)
         self._refresh_config_page()
         if show_dialog:
@@ -975,6 +1012,7 @@ class MainWindow(QMainWindow):
         self.config_page.workers_spin.setValue(config.num_workers)
         self.config_page.target_training_steps_spin.setValue(config.target_training_steps or 0)
         self.config_page.set_dinomaly_encoder(config.dinomaly_encoder_name)
+        self.config_page.set_superadd_settings(config.superadd_backbone_id, config.superadd_precision)
         threshold_method_index = self.config_page.threshold_method_combo.findData(config.threshold_method.value)
         self.config_page.threshold_method_combo.setCurrentIndex(max(threshold_method_index, 0))
         target_rate_index = self.config_page.threshold_fpr_combo.findData(config.target_normal_false_reject_rate)
@@ -1046,8 +1084,9 @@ class MainWindow(QMainWindow):
         except ValueError:
             return
         self.training_page.active_model_label.setText(definition.display_name)
-        self.training_page.start_button.setText(
-            "Run Evaluation" if definition.execution_mode is ModelExecutionMode.EVALUATE else "Start Training"
+        self.ui_translator.set_button_text(
+            self.training_page.start_button,
+            "Run Evaluation" if definition.execution_mode is ModelExecutionMode.EVALUATE else "Start Training",
         )
 
     def _reset_training_config(self) -> None:
@@ -1432,6 +1471,101 @@ class MainWindow(QMainWindow):
         )
         if selected:
             self._set_inference_input(Path(selected))
+
+    def _choose_benchmark_run(self) -> None:
+        initial_directory = self.current_project.root_path / "runs" if self.current_project else self._default_dialog_directory()
+        selected = QFileDialog.getExistingDirectory(self, "Select Completed SuperADD Training Run", str(initial_directory))
+        if selected:
+            self._set_benchmark_run(Path(selected), show_error=True)
+
+    def _set_benchmark_run(self, run_directory: Path, show_error: bool) -> bool:
+        """Accept a completed SuperADD run without changing ordinary inference selection."""
+        candidate = run_directory.expanduser().resolve()
+        try:
+            read_canonical_checkpoint(candidate)
+            read_verified_inspection_region(candidate)
+            read_verified_preprocessing_plan(candidate)
+            config_path = candidate / "config.json"
+            config = TrainingConfig.from_dict(__import__("json").loads(config_path.read_text(encoding="utf-8")))
+            if not config.is_super_add:
+                raise ValueError("Industrial checkpoint benchmarking currently supports completed SuperADD runs only.")
+        except (OSError, ValueError, TypeError) as exc:
+            if show_error:
+                QMessageBox.warning(self, "Invalid Benchmark Run", str(exc))
+            return False
+        self._benchmark_run_directory = candidate
+        self.inference_page.set_benchmark_selection(self._benchmark_run_directory, self._benchmark_input_path)
+        return True
+
+    def _choose_benchmark_image(self) -> None:
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Benchmark Image",
+            str(self.current_project.root_path if self.current_project else self._default_dialog_directory()),
+            "Images (*.bmp *.jpeg *.jpg *.png *.tif *.tiff *.webp)",
+        )
+        if selected:
+            self._set_benchmark_input(Path(selected))
+
+    def _choose_benchmark_folder(self) -> None:
+        selected = QFileDialog.getExistingDirectory(
+            self,
+            "Select Benchmark Image Folder",
+            str(self.current_project.root_path if self.current_project else self._default_dialog_directory()),
+        )
+        if selected:
+            self._set_benchmark_input(Path(selected))
+
+    def _set_benchmark_input(self, input_path: Path) -> None:
+        self._benchmark_input_path = input_path.expanduser().resolve()
+        self.inference_page.set_benchmark_selection(self._benchmark_run_directory, self._benchmark_input_path)
+
+    def _start_benchmark(self) -> None:
+        if self._benchmark_run_directory is None or self._benchmark_input_path is None:
+            QMessageBox.information(self, "Benchmark Input Required", "Select a completed SuperADD training run and benchmark image or folder.")
+            return
+        try:
+            self.benchmark_controller.start(
+                self._benchmark_run_directory,
+                self._benchmark_input_path,
+                device=str(self.inference_page.benchmark_device_combo.currentData()),
+                mode=str(self.inference_page.benchmark_mode_combo.currentData()),
+                warmup_frames=self.inference_page.benchmark_warmup_spin.value(),
+                measured_frames=self.inference_page.benchmark_iterations_spin.value(),
+                target_fps=self.inference_page.benchmark_target_fps_spin.value(),
+                reserve_percent=self.inference_page.benchmark_safety_reserve_spin.value(),
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            QMessageBox.warning(self, "Benchmark Could Not Start", str(exc))
+
+    def _benchmark_completed(self, json_path: str, csv_path: str) -> None:
+        try:
+            payload = read_benchmark_json(Path(json_path))
+        except (OSError, ValueError) as exc:
+            self._benchmark_failed(str(exc))
+            return
+        self._benchmark_json_path = Path(json_path)
+        self._benchmark_csv_path = Path(csv_path)
+        self.inference_page.display_benchmark(payload)
+        self.inference_page.set_status("Industrial benchmark completed")
+
+    def _benchmark_failed(self, message: str) -> None:
+        self.inference_page.set_status("Industrial benchmark failed or cancelled")
+        self._append_inference_log("error", message)
+
+    def _export_benchmark_artifact(self, extension: str) -> None:
+        source = self._benchmark_json_path if extension == "json" else self._benchmark_csv_path
+        if source is None or not source.is_file():
+            QMessageBox.information(self, "No Benchmark Result", "Run an industrial benchmark before exporting its result.")
+            return
+        selected, _ = QFileDialog.getSaveFileName(
+            self,
+            f"Export Benchmark {extension.upper()}",
+            str(self._default_dialog_directory() / source.name),
+            f"{extension.upper()} Files (*.{extension})",
+        )
+        if selected:
+            shutil.copy2(source, Path(selected))
 
     def _set_inference_input(self, input_path: Path) -> None:
         self._inference_input_path = input_path.resolve()
