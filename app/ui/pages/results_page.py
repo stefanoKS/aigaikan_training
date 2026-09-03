@@ -34,17 +34,16 @@ class ResultsPage(QWidget):
 
         header = QHBoxLayout()
         self.filter_combo = QComboBox()
-        self.filter_combo.addItems(
-            [
-                "All",
-                "Correct OK",
-                "Correct NG",
-                "False OK",
-                "False NG",
-                "Highest anomaly score",
-                "Lowest anomaly score",
-            ]
-        )
+        for label in (
+            "All",
+            "Correct OK",
+            "Correct NG",
+            "False OK",
+            "False NG",
+            "Highest anomaly score",
+            "Lowest anomaly score",
+        ):
+            self.filter_combo.addItem(label, label)
         self.export_csv_button = QPushButton("Export Results CSV")
         self.export_json_button = QPushButton("Export Metrics JSON")
         self.open_folder_button = QPushButton("Open Result Folder")
@@ -250,7 +249,7 @@ class ResultsPage(QWidget):
 
     def filtered_predictions(self) -> list[PredictionResult]:
         """Return the rows currently selected by the Results filter."""
-        selected_filter = self.filter_combo.currentText()
+        selected_filter = str(self.filter_combo.currentData())
         if selected_filter == "Highest anomaly score":
             return sorted(self._predictions, key=lambda item: item.anomaly_score, reverse=True)
         if selected_filter == "Lowest anomaly score":

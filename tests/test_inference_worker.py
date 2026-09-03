@@ -52,20 +52,87 @@ def _write_run(run_directory: Path, pixel_operating_point: PixelThresholdOperati
 
 def _fake_service(prediction_paths: list[Path]):
     class FakeEngine:
-        def predict(self, **_kwargs):
-            return [{"image_path": [str(path) for path in prediction_paths], "pred_score": [0.1] * len(prediction_paths)}]
+        def __init__(self, callbacks: list[object]) -> None:
+            self._callbacks = callbacks
+
+        def predict(self, **_kwargs: object) -> None:
+            for callback in self._callbacks:
+                callback.write_on_batch_end(
+                    None,
+                    None,
+                    {"image_path": [str(path) for path in prediction_paths], "pred_score": [0.1] * len(prediction_paths)},
+                    None,
+                    None,
+                    0,
+                    0,
+                )
 
     class FakeService:
-        def create_inference_components(self, _config, _output_directory):
+        def create_inference_components(self, _config, _output_directory, callbacks=None):
             return {
                 "model": object(),
-                "engine": FakeEngine(),
+                "engine": FakeEngine(callbacks or []),
                 "definition": SimpleNamespace(display_name="PatchCore"),
                 "device": "cpu",
                 "device_note": "",
             }
 
     return FakeService
+
+
+def test_folder_inference_streams_explicit_eight_item_batches(tmp_path: Path, monkeypatch) -> None:
+    run_directory = tmp_path / "run"
+    _write_run(run_directory)
+    input_directory = tmp_path / "input"
+    input_directory.mkdir()
+    source_paths = [input_directory / f"image_{index:02d}.png" for index in range(9)]
+    from PIL import Image
+
+    for source_path in source_paths:
+        Image.new("RGB", (8, 8)).save(source_path)
+    captured: dict[str, object] = {}
+
+    class FakeEngine:
+        def __init__(self, callbacks: list[object]) -> None:
+            self._callbacks = callbacks
+
+        def predict(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+            for batch_index, source_batch in enumerate((source_paths[:8], source_paths[8:])):
+                for callback in self._callbacks:
+                    callback.write_on_batch_end(
+                        None,
+                        None,
+                        {"image_path": [str(path) for path in source_batch], "pred_score": [0.1] * len(source_batch)},
+                        None,
+                        None,
+                        batch_index,
+                        0,
+                    )
+
+    class FakeService:
+        def create_inference_components(self, _config, _output_directory, callbacks=None):
+            return {
+                "model": object(),
+                "engine": FakeEngine(callbacks or []),
+                "definition": SimpleNamespace(display_name="PatchCore"),
+                "device": "cpu",
+                "device_note": "",
+            }
+
+    messages: list[dict[str, object]] = []
+    monkeypatch.setattr(inference_worker, "AnomalibService", FakeService)
+    monkeypatch.setattr(inference_worker, "save_prediction_artifacts", lambda *_args, **_kwargs: PredictionArtifacts())
+    monkeypatch.setattr(inference_worker, "emit", messages.append)
+
+    assert inference_worker.run(run_directory, input_directory) == 0
+
+    loader = captured["dataloaders"]
+    assert loader.batch_size == 8
+    assert "dataset" not in captured
+    assert captured["return_predictions"] is False
+    assert [message["current"] for message in messages if message["type"] == "progress"] == list(range(10))
+    assert len([message for message in messages if message["type"] == "prediction"]) == 9
 
 
 def test_folder_inference_uses_anomalib_discovery_and_logs_selected_patchcore_run(tmp_path: Path, monkeypatch) -> None:
@@ -77,8 +144,10 @@ def test_folder_inference_uses_anomalib_discovery_and_logs_selected_patchcore_ru
     nested_directory = input_directory / "nested"
     nested_directory.mkdir()
     second_image = nested_directory / "second.jpg"
-    first_image.touch()
-    second_image.touch()
+    from PIL import Image
+
+    Image.new("RGB", (8, 8)).save(first_image)
+    Image.new("RGB", (8, 8)).save(second_image)
     messages: list[dict[str, object]] = []
     monkeypatch.setattr(inference_worker, "AnomalibService", _fake_service([first_image, second_image]))
     monkeypatch.setattr(inference_worker, "save_prediction_artifacts", lambda *_args, **_kwargs: PredictionArtifacts())
@@ -98,8 +167,10 @@ def test_folder_inference_fails_when_anomalib_skips_a_discovered_image(tmp_path:
     input_directory.mkdir()
     first_image = input_directory / "first.png"
     second_image = input_directory / "second.png"
-    first_image.touch()
-    second_image.touch()
+    from PIL import Image
+
+    Image.new("RGB", (8, 8)).save(first_image)
+    Image.new("RGB", (8, 8)).save(second_image)
     monkeypatch.setattr(inference_worker, "AnomalibService", _fake_service([first_image]))
     monkeypatch.setattr(inference_worker, "save_prediction_artifacts", lambda *_args, **_kwargs: PredictionArtifacts())
     monkeypatch.setattr(inference_worker, "emit", lambda _message: None)
@@ -152,15 +223,21 @@ def test_enabled_roi_inference_uses_predict_dataset_with_the_saved_processor(tmp
     captured: dict[str, object] = {}
 
     class FakeEngine:
-        def predict(self, **kwargs: object) -> list[dict[str, object]]:
+        def __init__(self, callbacks: list[object]) -> None:
+            self._callbacks = callbacks
+
+        def predict(self, **kwargs: object) -> None:
             captured.update(kwargs)
-            return [{"image_path": [str(image_path)], "pred_score": [0.1]}]
+            for callback in self._callbacks:
+                callback.write_on_batch_end(
+                    None, None, {"image_path": [str(image_path)], "pred_score": [0.1]}, None, None, 0, 0
+                )
 
     class FakeService:
-        def create_inference_components(self, _config: object, _output_directory: Path) -> dict[str, object]:
+        def create_inference_components(self, _config: object, _output_directory: Path, callbacks=None) -> dict[str, object]:
             return {
                 "model": object(),
-                "engine": FakeEngine(),
+                "engine": FakeEngine(callbacks or []),
                 "definition": SimpleNamespace(display_name="PatchCore"),
                 "device": "cpu",
                 "device_note": "",
@@ -172,10 +249,12 @@ def test_enabled_roi_inference_uses_predict_dataset_with_the_saved_processor(tmp
 
     assert inference_worker.run(run_directory, image_path) == 0
 
-    assert "dataset" in captured
+    assert "dataloaders" in captured
     assert "data_path" not in captured
     assert captured["ckpt_path"] == checkpoint
-    assert captured["dataset"].transform.config == roi
+    assert captured["dataloaders"].dataset.transform.config == roi
+    assert captured["dataloaders"].batch_size == 8
+    assert captured["return_predictions"] is False
 
 
 def test_preprocessing_v2_inference_uses_prepared_geometry_and_reconstructed_source_map(tmp_path: Path, monkeypatch) -> None:
@@ -208,22 +287,40 @@ def test_preprocessing_v2_inference_uses_prepared_geometry_and_reconstructed_sou
         def __init__(self, path: Path) -> None:
             self.path = Path(path)
 
+        @property
+        def collate_fn(self):
+            return lambda items: items
+
     class FakeEngine:
-        def predict(self, **kwargs: object) -> list[dict[str, object]]:
+        def __init__(self, callbacks: list[object]) -> None:
+            self._callbacks = callbacks
+
+        def predict(self, **kwargs: object) -> None:
             captured.update(kwargs)
-            prepared_path = next(captured["dataset"].path.rglob("*.png"))
+            prepared_path = next(captured["dataloaders"].dataset.path.rglob("*.png"))
             captured["prepared_size"] = Image.open(prepared_path).size
             anomaly_map = np.zeros((192, 640), dtype=np.float32)
             anomaly_map[176, 638] = 0.7
             anomaly_map[191, 639] = 1.0
-            return [{"image_path": [str(prepared_path)], "pred_score": [1.0], "anomaly_map": [anomaly_map]}]
+            for callback in self._callbacks:
+                callback.write_on_batch_end(
+                    None,
+                    None,
+                    {"image_path": [str(prepared_path)], "pred_score": [1.0], "anomaly_map": [anomaly_map]},
+                    None,
+                    None,
+                    0,
+                    0,
+                )
 
     class FakeService:
-        def create_inference_components(self, _config: object, _output_directory: Path, received_plan: object) -> dict[str, object]:
+        def create_inference_components(
+            self, _config: object, _output_directory: Path, received_plan: object, callbacks=None
+        ) -> dict[str, object]:
             assert received_plan == plan
             return {
                 "model": object(),
-                "engine": FakeEngine(),
+                "engine": FakeEngine(callbacks or []),
                 "definition": SimpleNamespace(display_name="PatchCore"),
                 "device": "cpu",
                 "device_note": "",
@@ -243,9 +340,15 @@ def test_preprocessing_v2_inference_uses_prepared_geometry_and_reconstructed_sou
     prediction = next(message for message in messages if message["type"] == "prediction")
     assert prediction["anomaly_score"] == pytest.approx(0.7)
     assert prediction["predicted_label"] == "NG"
+    assert prediction["threshold"] == pytest.approx(0.5)
     assert np.load(prediction["continuous_anomaly_map"])["anomaly_map"].shape == (177, 639)
     assert prediction["map_display_normalization"]["minimum"] == 0.0
     assert prediction["region_metadata"]["coordinate_space"] == "source_image"
     assert prediction["pixel_threshold"] == 0.6
     assert prediction["pixel_threshold_comparator"] == "greater_than_or_equal"
     assert np.asarray(Image.open(prediction["binary_mask"])).max() == 255
+    inference_manifest = json.loads(
+        next((run_directory / "inference").glob("*/inference_manifest.json")).read_text(encoding="utf-8")
+    )
+    assert inference_manifest["decision_threshold"] == pytest.approx(0.5)
+    assert inference_manifest["decision_threshold_source"] == "run_manifest"

@@ -10,6 +10,7 @@ import pytest
 from app.core.prediction_adapter import (
     ANOMALIB_POSTPROCESSED_SCORE_SEMANTIC,
     LEGACY_VALID_MAP_SCORE_SEMANTIC,
+    PreprocessedPredictionAccumulator,
     iter_anomalib_predictions,
     iter_preprocessed_predictions,
 )
@@ -117,3 +118,39 @@ def test_preprocessing_v2_adapter_reconstructs_tiled_source_predictions(tmp_path
     assert predictions[0].anomaly_map[20, 10] == 1
     assert predictions[0].anomaly_map[20, 200] == 2
     assert predictions[0].anomaly_map[20, 500] == 3
+
+
+def test_preprocessed_prediction_accumulator_streams_a_source_after_its_last_tile(tmp_path) -> None:
+    source_path = (tmp_path / "source.png").resolve()
+    staged_paths = tuple((tmp_path / f"tile_{index}.png").resolve() for index in range(3))
+    pipeline = PreprocessingPipeline(
+        InspectionRegionConfig(),
+        PreprocessingConfig(tiling=TilingConfig(enabled=True)).resolve("dinomaly_dinov3", (639, 177)),
+    )
+    accumulator = PreprocessedPredictionAccumulator(
+        {path: source_path for path in staged_paths},
+        {path: pipeline.plan.tiles[index] for index, path in enumerate(staged_paths)},
+        pipeline,
+    )
+
+    first_batch = {
+        "image_path": [str(staged_paths[0]), str(staged_paths[1])],
+        "pred_score": [0.1, 0.2],
+        "anomaly_map": [
+            np.full((192, 320), 1, dtype=np.float32),
+            np.full((192, 320), 2, dtype=np.float32),
+        ],
+    }
+    final_batch = {
+        "image_path": [str(staged_paths[2])],
+        "pred_score": [0.3],
+        "anomaly_map": [np.full((192, 320), 3, dtype=np.float32)],
+    }
+
+    assert list(accumulator.add_batch(first_batch)) == []
+    streamed = list(accumulator.add_batch(final_batch))
+
+    assert len(streamed) == 1
+    assert streamed[0].source_path == source_path
+    assert streamed[0].score == pytest.approx(0.3)
+    accumulator.finalize()

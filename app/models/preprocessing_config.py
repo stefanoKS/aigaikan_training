@@ -393,9 +393,10 @@ def _model_profile(model_id: str) -> _ModelPreprocessingProfile:
         return _ModelPreprocessingProfile(canonical, 14, (0, 0), (644, 182), (448, 252))
     if normalized == "superadd":
         return _ModelPreprocessingProfile("super_add", 16, (448, 448), (640, 448), None)
-    if normalized in {"efficientad", "supersimplenet"}:
-        canonical = "efficient_ad" if normalized == "efficientad" else "supersimplenet"
-        return _ModelPreprocessingProfile(canonical, 1, (0, 0), (640, 192), None)
+    if normalized == "efficientad":
+        return _ModelPreprocessingProfile("efficient_ad", 1, (256, 256), (640, 256), None)
+    if normalized == "supersimplenet":
+        return _ModelPreprocessingProfile("supersimplenet", 1, (0, 0), (640, 192), None)
     if normalized in {"patchcore", "padim"}:
         return _ModelPreprocessingProfile(normalized, 1, (0, 0), (640, 192), None)
     raise ValueError(f"No preprocessing v2 profile is registered for model: {model_id}")

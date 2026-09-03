@@ -323,6 +323,32 @@ def test_inference_components_disable_console_progress(tmp_path: Path, monkeypat
     }
 
 
+def test_inference_components_preserve_prediction_callbacks(tmp_path: Path, monkeypatch) -> None:
+    class FakeEngine:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+    class FakePatchcore:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+    anomalib_engine = ModuleType("anomalib.engine")
+    anomalib_models = ModuleType("anomalib.models")
+    anomalib_engine.Engine = FakeEngine
+    anomalib_models.Patchcore = FakePatchcore
+    monkeypatch.setitem(sys.modules, "anomalib.engine", anomalib_engine)
+    monkeypatch.setitem(sys.modules, "anomalib.models", anomalib_models)
+    callback = object()
+
+    components = AnomalibService().create_inference_components(
+        TrainingConfig(model_name="patchcore", device=DeviceMode.CPU),
+        tmp_path / "inference",
+        callbacks=[callback],
+    )
+
+    assert components["engine"].kwargs["callbacks"] == [callback]
+
+
 def test_calibration_datamodule_never_splits_the_final_test_subset(tmp_path: Path, monkeypatch) -> None:
     """Calibration reuses its own held-out snapshot rather than splitting it again."""
     class FakeFolder:
@@ -473,12 +499,12 @@ def test_new_model_adapters_use_their_verified_stock_constructor_arguments(
 
 
 @pytest.mark.parametrize(
-    ("model_name", "class_name", "batch_size"),
+    ("model_name", "class_name", "batch_size", "deterministic"),
     (
-        ("anomaly_dino", "AnomalyDINO", 8),
-        ("efficient_ad", "EfficientAd", 1),
-        ("super_add", "SuperADD", 8),
-        ("supersimplenet", "Supersimplenet", 8),
+        ("anomaly_dino", "AnomalyDINO", 8, True),
+        ("efficient_ad", "EfficientAd", 1, True),
+        ("super_add", "SuperADD", 8, True),
+        ("supersimplenet", "Supersimplenet", 8, "warn"),
     ),
 )
 def test_model_specific_engine_limits_are_explicit(
@@ -487,6 +513,7 @@ def test_model_specific_engine_limits_are_explicit(
     model_name: str,
     class_name: str,
     batch_size: int,
+    deterministic: bool | str,
 ) -> None:
     class FakeFolder:
         def __init__(self, **kwargs: object) -> None:
@@ -521,6 +548,7 @@ def test_model_specific_engine_limits_are_explicit(
 
     assert components["engine"].kwargs["max_epochs"] == (1 if model_name in {"anomaly_dino", "super_add"} else 7)
     assert components["datamodule"].kwargs["train_batch_size"] == batch_size
+    assert components["engine"].kwargs["deterministic"] == deterministic
 
 
 def test_unregistered_model_ids_are_rejected_before_training() -> None:

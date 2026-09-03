@@ -87,6 +87,15 @@ def test_super_add_v3_padding_uses_the_dynamic_roi_and_its_verified_minimum_canv
     assert plan.resolved_padding == (0, 0, 9, 251)
 
 
+@pytest.mark.parametrize("contract_version", [LEGACY_PREPROCESSING_CONTRACT_VERSION, 3])
+def test_efficient_ad_padding_uses_its_verified_minimum_encoder_canvas(contract_version: int) -> None:
+    plan = PreprocessingConfig(preprocessing_contract_version=contract_version).resolve("efficient_ad", (640, 192))
+
+    assert plan.model_input_size == (640, 256)
+    assert plan.tiles[0].valid_box == (0, 0, 640, 192)
+    assert plan.minimum_model_input_size == (256, 256)
+
+
 def test_tiled_dinov3_plan_uses_dynamic_tile_height_and_serializes_valid_masks() -> None:
     config = PreprocessingConfig(tiling=TilingConfig(enabled=True))
     plan = config.resolve("dinomaly_dinov3", (639, 177))

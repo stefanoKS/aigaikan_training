@@ -200,7 +200,7 @@ class AnomalibService:
             "check_val_every_n_epoch": config.validation_every_n_epochs,
             "gradient_clip_val": config.gradient_clip_val,
             "accumulate_grad_batches": config.accumulate_grad_batches,
-            "deterministic": True,
+            "deterministic": "warn" if config.uses_warn_only_determinism else True,
         }
         if config.uses_fixed_one_pass:
             engine_kwargs["max_epochs"] = 1
@@ -268,6 +268,7 @@ class AnomalibService:
         config: TrainingConfig,
         output_directory: Path,
         preprocessing_plan: ResolvedPreprocessingPlan | None = None,
+        callbacks: list[Any] | None = None,
     ) -> dict[str, Any]:
         """Create a model and engine for prediction from a saved checkpoint."""
         config.validate()
@@ -281,11 +282,16 @@ class AnomalibService:
         device = self.resolve_device(config.device)
         if device == "gpu":
             self._configure_gpu_precision()
+        engine_kwargs: dict[str, Any] = {
+            "accelerator": device,
+            "devices": 1,
+            "default_root_dir": str(output_directory),
+            "enable_progress_bar": False,
+        }
+        if callbacks is not None:
+            engine_kwargs["callbacks"] = callbacks
         engine = Engine(
-            accelerator=device,
-            devices=1,
-            default_root_dir=str(output_directory),
-            enable_progress_bar=False,
+            **engine_kwargs,
         )
         return {
             "model": self._create_model(definition, config, preprocessing_plan),

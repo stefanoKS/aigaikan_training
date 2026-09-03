@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+import shutil
 from typing import cast
 
 from PySide6.QtCore import QSize, Qt, QUrl
 from PySide6.QtGui import QDesktopServices, QFont, QFontDatabase, QPixmap
 from PySide6.QtWidgets import (
     QFileDialog,
+    QComboBox,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -66,6 +68,7 @@ from app.ui.pages.inference_page import InferencePage
 from app.ui.pages.inspection_region_page import InspectionRegionPage
 from app.ui.pages.results_page import ResultsPage
 from app.ui.pages.training_page import TrainingPage
+from app.ui.localization import UiTranslator
 from app.ui.styles import APP_STYLE
 
 
@@ -84,6 +87,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self, settings_manager: SettingsManager, project_manager: ProjectManager) -> None:
         super().__init__()
+        self.ui_translator = UiTranslator()
         self._configure_application_font()
         self.settings_manager = settings_manager
         self.project_manager = project_manager
@@ -149,12 +153,20 @@ class MainWindow(QMainWindow):
         self.workspace_title.setObjectName("WorkspaceTitle")
         self.project_indicator = QLabel("NO PROJECT OPEN")
         self.project_indicator.setObjectName("ProjectIndicator")
+        self.language_label = QLabel("Language")
+        self.language_combo = QComboBox()
+        self.language_combo.addItem("English", "en")
+        self.language_combo.addItem("Japanese", "ja")
+        self.language_combo.setMinimumContentsLength(10)
         header_layout.addWidget(brand_logo)
         header_layout.addSpacing(10)
         header_layout.addWidget(brand)
         header_layout.addSpacing(16)
         header_layout.addWidget(self.workspace_title)
         header_layout.addStretch(1)
+        header_layout.addWidget(self.language_label)
+        header_layout.addWidget(self.language_combo)
+        header_layout.addSpacing(16)
         header_layout.addWidget(self.project_indicator)
         shell_layout.addWidget(header)
         shell_layout.addWidget(splitter, stretch=1)
@@ -168,6 +180,9 @@ class MainWindow(QMainWindow):
         self.results_page = cast(ResultsPage, self.page_instances["Results"])
         self.inference_page = cast(InferencePage, self.page_instances["Inference"])
         self._connect_actions()
+        self.language_combo.currentIndexChanged.connect(self._change_ui_language)
+        self.ui_translator.language_changed.connect(self._retranslate_ui)
+        self._retranslate_ui()
         self._set_active_page(0)
         self._refresh_project_views()
 
@@ -280,6 +295,7 @@ class MainWindow(QMainWindow):
         self.inference_page.run_inference_button.clicked.connect(self._start_inference)
         self.inference_page.cancel_inference_button.clicked.connect(self.inference_controller.cancel)
         self.inference_page.export_csv_button.clicked.connect(self._export_inference_csv)
+        self.inference_page.export_ng_images_button.clicked.connect(self._export_inference_ng_images)
         self.inference_controller.log_message.connect(self._append_inference_log)
         self.inference_controller.progress_changed.connect(self.inference_page.set_progress)
         self.inference_controller.prediction_emitted.connect(self._record_inference_prediction)
@@ -508,7 +524,20 @@ class MainWindow(QMainWindow):
         """Keep the workspace header aligned with the selected navigation page."""
         self.pages.setCurrentIndex(index)
         if 0 <= index < len(self.PAGE_DEFINITIONS):
-            self.workspace_title.setText(self.PAGE_DEFINITIONS[index][0].upper())
+            self.workspace_title.setText(self.ui_translator.text(self.PAGE_DEFINITIONS[index][0]).upper())
+
+    def _change_ui_language(self, index: int) -> None:
+        """Apply the language selected in the UI without changing project or model data."""
+        language = self.language_combo.itemData(index)
+        if language is not None:
+            self.ui_translator.set_language(str(language))
+
+    def _retranslate_ui(self) -> None:
+        """Refresh static visible UI text for the active display language."""
+        for index, (title, _page_type) in enumerate(self.PAGE_DEFINITIONS):
+            self.navigation.item(index).setText(self.ui_translator.text(title))
+        self.ui_translator.apply(self)
+        self._set_active_page(self.navigation.currentRow())
 
     def _choose_dataset_folder(self, role: DatasetRole) -> None:
         project = self.current_project
@@ -702,7 +731,7 @@ class MainWindow(QMainWindow):
         config = project.training
         previous_preprocessing_hash = preprocessing_hash(project.preprocessing)
         config.model_name = str(self.config_page.model_combo.currentData())
-        config.device = DeviceMode(self.config_page.device_combo.currentText().lower())
+        config.device = DeviceMode(str(self.config_page.device_combo.currentData()))
         config.batch_size = self.config_page.batch_size_spin.value()
         config.max_epochs = self.config_page.max_epochs_spin.value()
         config.validation_every_n_epochs = self.config_page.validation_every_n_epochs_spin.value()
@@ -759,7 +788,8 @@ class MainWindow(QMainWindow):
             definition = self.model_registry.get("patchcore")
         model_index = self.config_page.model_combo.findData(definition.key)
         self.config_page.model_combo.setCurrentIndex(max(model_index, 0))
-        self.config_page.device_combo.setCurrentText(config.device.value.title())
+        device_index = self.config_page.device_combo.findData(config.device.value)
+        self.config_page.device_combo.setCurrentIndex(max(device_index, 0))
         self.config_page.batch_size_spin.setValue(config.batch_size)
         self.config_page.max_epochs_spin.setValue(config.max_epochs)
         self.config_page.validation_every_n_epochs_spin.setValue(config.validation_every_n_epochs)
@@ -1132,7 +1162,7 @@ class MainWindow(QMainWindow):
             return False
         try:
             read_canonical_checkpoint(run_directory)
-            read_persisted_threshold(run_directory)
+            decision_threshold = read_persisted_threshold(run_directory)
             run_inspection_region = read_verified_inspection_region(run_directory)
             run_preprocessing_plan = read_verified_preprocessing_plan(run_directory)
             if self.current_project is not None and inspection_region_hash(run_inspection_region) != inspection_region_hash(
@@ -1157,7 +1187,7 @@ class MainWindow(QMainWindow):
                 )
             return False
         self._inference_run_directory = run_directory
-        self.inference_page.set_training_run(run_directory, model_name)
+        self.inference_page.set_training_run(run_directory, model_name, decision_threshold)
         self.inference_page.set_status(preprocessing_status)
         return True
 
@@ -1197,7 +1227,10 @@ class MainWindow(QMainWindow):
         self.inference_page.set_progress(0, 1)
         self.inference_page.set_status("Running inference")
         try:
-            self.inference_controller.start(self._inference_run_directory, self._inference_input_path)
+            self.inference_controller.start(
+                self._inference_run_directory,
+                self._inference_input_path,
+            )
         except RuntimeError as exc:
             QMessageBox.warning(self, "Could Not Start Inference", str(exc))
 
@@ -1242,4 +1275,45 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Could Not Export Results", str(exc))
             return
         self.inference_page.set_status(f"Exported {path.name}")
+
+    def _export_inference_ng_images(self) -> None:
+        predictions = self.inference_page.ng_predictions_for_export()
+        if not predictions:
+            QMessageBox.information(
+                self,
+                "No NG Detections",
+                "No selected results meet the current NG export threshold.",
+            )
+            return
+        initial_directory = (
+            self.current_project.root_path / "exports" if self.current_project else self._default_dialog_directory()
+        )
+        selected = QFileDialog.getExistingDirectory(self, "Export Raw NG Images", str(initial_directory))
+        if not selected:
+            return
+        try:
+            copied_paths = self._copy_raw_ng_images(predictions, Path(selected))
+        except OSError as exc:
+            QMessageBox.warning(self, "Could Not Export NG Images", str(exc))
+            return
+        self.inference_page.set_status(f"Exported {len(copied_paths)} raw NG image(s)")
+
+    @staticmethod
+    def _copy_raw_ng_images(predictions: list[PredictionResult], destination: Path) -> list[Path]:
+        """Copy source-image bytes for post-inference NG review."""
+        sources = [Path(prediction.source_path).expanduser() for prediction in predictions]
+        missing = next((source for source in sources if not source.is_file()), None)
+        if missing is not None:
+            raise FileNotFoundError(f"Raw NG source image is unavailable: {missing}")
+        destination.mkdir(parents=True, exist_ok=True)
+        copied_paths: list[Path] = []
+        for index, source in enumerate(sources, start=1):
+            candidate = destination / f"NG_{index:04d}_{source.name}"
+            duplicate_index = 1
+            while candidate.exists():
+                candidate = destination / f"NG_{index:04d}_{source.stem}_{duplicate_index}{source.suffix}"
+                duplicate_index += 1
+            shutil.copy2(source, candidate)
+            copied_paths.append(candidate)
+        return copied_paths
 

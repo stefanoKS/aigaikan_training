@@ -9,4 +9,6 @@ release/
 *.pyd
 *.log
 weights/
+/dataset/
+/datasets/
 

@@ -38,6 +38,83 @@ class PreprocessedAnomalibPrediction:
     score_semantic: str
 
 
+class PreprocessedPredictionAccumulator:
+    """Accumulate streamed tile batches until each source image is complete."""
+
+    def __init__(
+        self,
+        source_path_by_staged_path: dict[Path, Path],
+        preprocessing_tile_by_staged_path: dict[Path, PreprocessingTile],
+        preprocessing_pipeline: PreprocessingPipeline,
+    ) -> None:
+        self._source_path_by_staged_path = source_path_by_staged_path
+        self._preprocessing_tile_by_staged_path = preprocessing_tile_by_staged_path
+        self._preprocessing_pipeline = preprocessing_pipeline
+        self._tile_predictions_by_source: dict[Path, dict[int, AnomalibPrediction]] = {}
+        self._staged_paths_by_source: dict[Path, dict[int, Path]] = {}
+        self._completed_sources: set[Path] = set()
+        self._expected_tile_indexes = tuple(tile.index for tile in preprocessing_pipeline.plan.tiles)
+
+    def add_batch(self, output: Any) -> Iterator[PreprocessedAnomalibPrediction]:
+        """Yield source predictions completed by one model prediction batch."""
+        completed_sources: list[Path] = []
+        for prediction in iter_anomalib_predictions(output):
+            source_path = self._source_path_by_staged_path.get(prediction.image_path)
+            tile = self._preprocessing_tile_by_staged_path.get(prediction.image_path)
+            if source_path is None or tile is None:
+                raise ValueError(f"Anomalib prediction path is outside the preprocessing-v2 staged inputs: {prediction.image_path}")
+            if source_path in self._completed_sources:
+                raise ValueError(f"Anomalib returned more than one completed prediction for: {source_path}")
+            tile_predictions = self._tile_predictions_by_source.setdefault(source_path, {})
+            if tile.index in tile_predictions:
+                raise ValueError(f"Anomalib returned more than one prediction for preprocessing tile {tile.index}: {source_path}")
+            tile_predictions[tile.index] = prediction
+            self._staged_paths_by_source.setdefault(source_path, {})[tile.index] = prediction.image_path
+            if tuple(sorted(tile_predictions)) == self._expected_tile_indexes:
+                completed_sources.append(source_path)
+
+        for source_path in completed_sources:
+            self._completed_sources.add(source_path)
+            yield self._build_prediction(source_path)
+
+    def finalize(self) -> None:
+        """Reject an inference run that ends before every received source is complete."""
+        if not self._tile_predictions_by_source:
+            return
+        source_path, tile_predictions = next(iter(self._tile_predictions_by_source.items()))
+        missing_indexes = sorted(set(self._expected_tile_indexes) - set(tile_predictions))
+        raise ValueError(f"Anomalib did not return preprocessing tiles {missing_indexes} for: {source_path}")
+
+    def _build_prediction(self, source_path: Path) -> PreprocessedAnomalibPrediction:
+        tile_predictions = self._tile_predictions_by_source.pop(source_path)
+        staged_paths = self._staged_paths_by_source.pop(source_path)
+        reconstructed = self._preprocessing_pipeline.reconstruct_anomaly_maps(
+            tile_predictions[index].anomaly_map for index in self._expected_tile_indexes
+        )
+        native_tile_scores = tuple(tile_predictions[index].score for index in self._expected_tile_indexes)
+        if self._preprocessing_pipeline.plan.preprocessing_contract_version == LEGACY_PREPROCESSING_CONTRACT_VERSION:
+            score = self._preprocessing_pipeline.score_from_reconstructed_map(reconstructed)
+            native_image_score = None
+            score_semantic = LEGACY_VALID_MAP_SCORE_SEMANTIC
+        elif len(native_tile_scores) == 1:
+            score = native_tile_scores[0]
+            native_image_score = score
+            score_semantic = ANOMALIB_POSTPROCESSED_SCORE_SEMANTIC
+        else:
+            score = self._preprocessing_pipeline.aggregate_tile_scores(native_tile_scores)
+            native_image_score = None
+            score_semantic = f"{NATIVE_TILE_SCORE_SEMANTIC_PREFIX}_{self._preprocessing_pipeline.plan.score_aggregation.value}_v1"
+        return PreprocessedAnomalibPrediction(
+            source_path=source_path,
+            score=score,
+            anomaly_map=reconstructed.anomaly_map,
+            staged_paths=tuple(staged_paths[index] for index in self._expected_tile_indexes),
+            native_image_score=native_image_score,
+            native_tile_scores=native_tile_scores,
+            score_semantic=score_semantic,
+        )
+
+
 def iter_anomalib_predictions(output: Any) -> Iterator[AnomalibPrediction]:
     """Yield finite, path-addressable predictions or fail instead of guessing values."""
     for batch in _prediction_batches(output):

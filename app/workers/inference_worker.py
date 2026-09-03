@@ -12,10 +12,11 @@ from tempfile import TemporaryDirectory
 from typing import Any
 
 import numpy as np
+from lightning.pytorch.callbacks import BasePredictionWriter
 
 from app.core.inspection_region import InspectionRegionProcessor
 from app.core.prediction_artifacts import inspection_region_metadata, save_prediction_artifacts
-from app.core.prediction_adapter import iter_anomalib_predictions, iter_preprocessed_predictions
+from app.core.prediction_adapter import PreprocessedPredictionAccumulator, iter_anomalib_predictions
 from app.core.preprocessing_pipeline import PreprocessingPipeline
 from app.core.result_parser import ResultParser
 from app.core.run_artifacts import (
@@ -29,6 +30,8 @@ from app.models.prediction_result import PredictionResult
 from app.models.preprocessing_config import PreprocessingTile
 from app.models.training_config import TrainingConfig
 from app.services.anomalib_service import AnomalibService
+
+INFERENCE_BATCH_SIZE = 8
 
 def configure_worker_stdio() -> None:
     """Use UTF-8 JSON Lines streams when the Windows locale is not Unicode-safe."""
@@ -67,6 +70,185 @@ def _expected_source_path(predicted_path: Path, expected_paths: set[Path]) -> Pa
         except OSError:
             continue
     return None
+
+
+def _create_prediction_loader(dataset: Any, device: str) -> Any:
+    """Create a Windows-safe loader that balances GPU throughput and result latency."""
+    from torch.utils.data import DataLoader
+
+    return DataLoader(
+        dataset,
+        batch_size=INFERENCE_BATCH_SIZE,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=device == "gpu",
+        collate_fn=dataset.collate_fn,
+    )
+
+
+class InferenceResultCollector:
+    """Convert streamed Anomalib batches into application results and JSON Lines events."""
+
+    def __init__(
+        self,
+        total_images: int,
+        expected_paths: set[Path],
+        visualizations_directory: Path,
+        threshold: float,
+        pixel_threshold: float | None,
+        region_metadata: dict[str, object],
+        inspection_processor: InspectionRegionProcessor | None = None,
+        preprocessing_pipeline: PreprocessingPipeline | None = None,
+    ) -> None:
+        self._total_images = total_images
+        self._expected_paths = expected_paths
+        self._visualizations_directory = visualizations_directory
+        self._threshold = threshold
+        self._pixel_threshold = pixel_threshold
+        self._region_metadata = region_metadata
+        self._inspection_processor = inspection_processor
+        self._preprocessing_pipeline = preprocessing_pipeline
+        self._preprocessed_accumulator: PreprocessedPredictionAccumulator | None = None
+        self._preview_path_by_source: dict[Path, Path] = {}
+        self.predictions: list[PredictionResult] = []
+        self.predicted_paths: set[Path] = set()
+
+    def configure_preprocessed_inputs(
+        self,
+        source_path_by_staged_path: dict[Path, Path],
+        preprocessing_tile_by_staged_path: dict[Path, PreprocessingTile],
+        preview_path_by_source: dict[Path, Path],
+    ) -> None:
+        """Supply temporary file mappings after preprocessing has staged its model inputs."""
+        if self._preprocessing_pipeline is None:
+            raise ValueError("Preprocessed inputs cannot be configured for legacy inference.")
+        self._preprocessed_accumulator = PreprocessedPredictionAccumulator(
+            source_path_by_staged_path,
+            preprocessing_tile_by_staged_path,
+            self._preprocessing_pipeline,
+        )
+        self._preview_path_by_source = preview_path_by_source
+
+    def add_batch(self, output: Any) -> None:
+        """Emit every source result completed by one Anomalib batch."""
+        if self._preprocessing_pipeline is None:
+            for anomalib_prediction in iter_anomalib_predictions(output):
+                source_path = _expected_source_path(anomalib_prediction.image_path, self._expected_paths)
+                if source_path is None:
+                    raise ValueError(
+                        f"Anomalib returned a prediction outside the selected input: {anomalib_prediction.image_path}"
+                    )
+                self._add_prediction(
+                    source_path,
+                    anomalib_prediction.score,
+                    anomalib_prediction.anomaly_map,
+                    anomalib_prediction.score,
+                    (anomalib_prediction.score,),
+                    anomalib_prediction.score_semantic,
+                    self._rectified_image(source_path),
+                )
+            return
+        if self._preprocessed_accumulator is None:
+            raise ValueError("Preprocessed inference results arrived before staged inputs were configured.")
+        for anomalib_prediction in self._preprocessed_accumulator.add_batch(output):
+            self._add_prediction(
+                anomalib_prediction.source_path,
+                anomalib_prediction.score,
+                anomalib_prediction.anomaly_map,
+                anomalib_prediction.native_image_score,
+                anomalib_prediction.native_tile_scores,
+                anomalib_prediction.score_semantic,
+                self._rectified_image(anomalib_prediction.source_path),
+            )
+
+    def finalize(self) -> None:
+        """Verify that all selected sources produced exactly one completed result."""
+        if self._preprocessed_accumulator is not None:
+            self._preprocessed_accumulator.finalize()
+        if self.predicted_paths != self._expected_paths:
+            missing_paths = sorted(self._expected_paths - self.predicted_paths)
+            missing_summary = ", ".join(str(path) for path in missing_paths[:3])
+            raise ValueError(
+                f"Anomalib produced {len(self.predicted_paths)} predictions for {self._total_images} input images; "
+                f"missing: {missing_summary}"
+            )
+
+    def _add_prediction(
+        self,
+        source_path: Path,
+        score: float,
+        anomaly_map: Any,
+        native_image_score: float | None,
+        native_tile_scores: tuple[float, ...],
+        score_semantic: str,
+        rectified_image: np.ndarray | None,
+    ) -> None:
+        if source_path in self.predicted_paths:
+            raise ValueError(f"Anomalib returned more than one prediction for: {source_path}")
+        self.predicted_paths.add(source_path)
+        artifacts = save_prediction_artifacts(
+            source_path,
+            anomaly_map,
+            self._visualizations_directory,
+            len(self.predictions),
+            rectified_image=rectified_image,
+            pixel_threshold=self._pixel_threshold,
+        )
+        prediction = PredictionResult(
+            source_path=str(source_path),
+            predicted_label="NG" if score >= self._threshold else "OK",
+            ground_truth_label="Unknown",
+            anomaly_score=score,
+            threshold=self._threshold,
+            original_image=str(source_path),
+            anomaly_map=artifacts.heatmap_image,
+            overlay_image=artifacts.overlay_image,
+            native_image_score=native_image_score,
+            native_tile_scores=list(native_tile_scores),
+            score_semantic=score_semantic,
+            continuous_anomaly_map=artifacts.continuous_anomaly_map,
+            binary_mask=artifacts.binary_mask,
+            contour_overlay_image=artifacts.contour_overlay_image,
+            pixel_threshold=artifacts.pixel_threshold,
+            pixel_threshold_comparator=artifacts.pixel_threshold_comparator,
+            pixel_threshold_semantic=artifacts.pixel_threshold_semantic,
+            map_display_normalization=artifacts.display_normalization or {},
+            region_metadata=self._region_metadata,
+        )
+        self.predictions.append(prediction)
+        emit({"type": "prediction", **prediction.to_dict()})
+        emit({"type": "progress", "current": len(self.predictions), "total": self._total_images})
+
+    def _rectified_image(self, source_path: Path) -> np.ndarray | None:
+        if self._inspection_processor is not None and self._inspection_processor.config.enabled:
+            return self._inspection_processor.apply_path(source_path)
+        preview_path = self._preview_path_by_source.get(source_path)
+        if preview_path is None:
+            return None
+        from PIL import Image
+
+        with Image.open(preview_path) as preview:
+            return np.asarray(preview.convert("RGB"))
+
+
+class InferencePredictionWriter(BasePredictionWriter):
+    """Bridge each completed Lightning prediction batch to the worker JSONL stream."""
+
+    def __init__(self, collector: InferenceResultCollector) -> None:
+        super().__init__(write_interval="batch")
+        self._collector = collector
+
+    def write_on_batch_end(
+        self,
+        trainer: Any,
+        pl_module: Any,
+        prediction: Any,
+        batch_indices: Any,
+        batch: Any,
+        batch_idx: int,
+        dataloader_idx: int,
+    ) -> None:
+        self._collector.add_batch(prediction)
 
 
 def _stage_preprocessed_inputs(
@@ -122,20 +304,41 @@ def run(run_directory: Path, input_path: Path) -> int:
         PreprocessingPipeline(inspection_region, preprocessing_plan) if preprocessing_plan is not None else None
     )
     inspection_processor = InspectionRegionProcessor(inspection_region) if preprocessing_pipeline is None else None
-    rectified_images = {
-        source_path: inspection_processor.apply_path(source_path)
-        for source_path in source_paths
-    } if inspection_processor is not None and inspection_region.enabled else {}
     output_directory = run_directory / "inference" / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     output_directory.mkdir(parents=True, exist_ok=False)
+    (output_directory / "inference_manifest.json").write_text(
+        json.dumps(
+            {
+                "run_directory": str(run_directory),
+                "input_path": str(input_path),
+                "decision_threshold": threshold,
+                "decision_threshold_source": "run_manifest",
+                "pixel_threshold": pixel_threshold,
+            },
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
     visualizations_directory = output_directory / "visualizations"
     visualizations_directory.mkdir()
     config = TrainingConfig.from_dict(json.loads(config_path.read_text(encoding="utf-8")))
+    collector = InferenceResultCollector(
+        total_images,
+        set(source_paths),
+        visualizations_directory,
+        threshold,
+        pixel_threshold,
+        inspection_region_metadata(inspection_region),
+        inspection_processor=inspection_processor,
+        preprocessing_pipeline=preprocessing_pipeline,
+    )
+    prediction_writer = InferencePredictionWriter(collector)
     service = AnomalibService()
     components = (
-        service.create_inference_components(config, output_directory, preprocessing_plan)
+        service.create_inference_components(config, output_directory, preprocessing_plan, callbacks=[prediction_writer])
         if preprocessing_plan is not None
-        else service.create_inference_components(config, output_directory)
+        else service.create_inference_components(config, output_directory, callbacks=[prediction_writer])
     )
     device_note = str(components["device_note"])
     if device_note:
@@ -153,60 +356,17 @@ def run(run_directory: Path, input_path: Path) -> int:
         }
     )
     emit({"type": "progress", "current": 0, "total": total_images})
-    predictions: list[PredictionResult] = []
-    region_metadata = inspection_region_metadata(inspection_region)
-    expected_paths = set(source_paths)
-    predicted_paths: set[Path] = set()
     if preprocessing_pipeline is None:
         from anomalib.data import PredictDataset
 
-        output = components["engine"].predict(
+        dataset = PredictDataset(input_path, transform=inspection_processor)
+        components["engine"].predict(
             model=components["model"],
-            dataset=PredictDataset(input_path, transform=inspection_processor),
-            return_predictions=True,
+            dataloaders=_create_prediction_loader(dataset, str(components["device"])),
+            return_predictions=False,
             ckpt_path=checkpoint_path,
         )
-        for anomalib_prediction in iter_anomalib_predictions(output):
-            source_path = _expected_source_path(anomalib_prediction.image_path, expected_paths)
-            if source_path is None:
-                raise ValueError(f"Anomalib returned a prediction outside the selected input: {anomalib_prediction.image_path}")
-            if source_path in predicted_paths:
-                raise ValueError(f"Anomalib returned more than one prediction for: {source_path}")
-            predicted_paths.add(source_path)
-            artifacts = save_prediction_artifacts(
-                source_path,
-                anomalib_prediction.anomaly_map,
-                visualizations_directory,
-                len(predictions),
-                rectified_image=rectified_images.get(source_path),
-                pixel_threshold=pixel_threshold,
-            )
-            prediction = PredictionResult(
-                source_path=str(source_path),
-                predicted_label="NG" if anomalib_prediction.score >= threshold else "OK",
-                ground_truth_label="Unknown",
-                anomaly_score=anomalib_prediction.score,
-                threshold=threshold,
-                original_image=str(source_path),
-                anomaly_map=artifacts.heatmap_image,
-                overlay_image=artifacts.overlay_image,
-                native_image_score=anomalib_prediction.score,
-                native_tile_scores=[anomalib_prediction.score],
-                score_semantic=anomalib_prediction.score_semantic,
-                continuous_anomaly_map=artifacts.continuous_anomaly_map,
-                binary_mask=artifacts.binary_mask,
-                contour_overlay_image=artifacts.contour_overlay_image,
-                pixel_threshold=artifacts.pixel_threshold,
-                pixel_threshold_comparator=artifacts.pixel_threshold_comparator,
-                pixel_threshold_semantic=artifacts.pixel_threshold_semantic,
-                map_display_normalization=artifacts.display_normalization or {},
-                region_metadata=region_metadata,
-            )
-            predictions.append(prediction)
-            emit({"type": "prediction", **prediction.to_dict()})
-            emit({"type": "progress", "current": len(predictions), "total": total_images})
     else:
-        from PIL import Image
         from anomalib.data import PredictDataset
 
         with TemporaryDirectory(prefix="aigaikan-preprocessing-v2-") as temporary_directory:
@@ -216,64 +376,20 @@ def run(run_directory: Path, input_path: Path) -> int:
                 preprocessing_tile_by_staged_path,
                 preview_path_by_source,
             ) = _stage_preprocessed_inputs(source_paths, preprocessing_pipeline, Path(temporary_directory))
-            output = components["engine"].predict(
-                model=components["model"],
-                dataset=PredictDataset(prepared_directory),
-                return_predictions=True,
-                ckpt_path=checkpoint_path,
-            )
-            for anomalib_prediction in iter_preprocessed_predictions(
-                output,
+            collector.configure_preprocessed_inputs(
                 source_path_by_staged_path,
                 preprocessing_tile_by_staged_path,
-                preprocessing_pipeline,
-            ):
-                source_path = anomalib_prediction.source_path
-                if source_path in predicted_paths:
-                    raise ValueError(f"Anomalib returned more than one prediction for: {source_path}")
-                predicted_paths.add(source_path)
-                with Image.open(preview_path_by_source[source_path]) as preview:
-                    rectified_image = np.asarray(preview.convert("RGB"))
-                artifacts = save_prediction_artifacts(
-                    source_path,
-                    anomalib_prediction.anomaly_map,
-                    visualizations_directory,
-                    len(predictions),
-                    rectified_image=rectified_image,
-                    pixel_threshold=pixel_threshold,
-                )
-                prediction = PredictionResult(
-                    source_path=str(source_path),
-                    predicted_label="NG" if anomalib_prediction.score >= threshold else "OK",
-                    ground_truth_label="Unknown",
-                    anomaly_score=anomalib_prediction.score,
-                    threshold=threshold,
-                    original_image=str(source_path),
-                    anomaly_map=artifacts.heatmap_image,
-                    overlay_image=artifacts.overlay_image,
-                    native_image_score=anomalib_prediction.native_image_score,
-                    native_tile_scores=list(anomalib_prediction.native_tile_scores),
-                    score_semantic=anomalib_prediction.score_semantic,
-                    continuous_anomaly_map=artifacts.continuous_anomaly_map,
-                    binary_mask=artifacts.binary_mask,
-                    contour_overlay_image=artifacts.contour_overlay_image,
-                    pixel_threshold=artifacts.pixel_threshold,
-                    pixel_threshold_comparator=artifacts.pixel_threshold_comparator,
-                    pixel_threshold_semantic=artifacts.pixel_threshold_semantic,
-                    map_display_normalization=artifacts.display_normalization or {},
-                    region_metadata=region_metadata,
-                )
-                predictions.append(prediction)
-                emit({"type": "prediction", **prediction.to_dict()})
-                emit({"type": "progress", "current": len(predictions), "total": total_images})
-    if predicted_paths != expected_paths:
-        missing_paths = sorted(expected_paths - predicted_paths)
-        missing_summary = ", ".join(str(path) for path in missing_paths[:3])
-        raise ValueError(
-            f"Anomalib produced {len(predicted_paths)} predictions for {total_images} input images; "
-            f"missing: {missing_summary}"
-        )
-    ResultParser().export_predictions_csv(output_directory / "predictions.csv", predictions)
+                preview_path_by_source,
+            )
+            dataset = PredictDataset(prepared_directory)
+            components["engine"].predict(
+                model=components["model"],
+                dataloaders=_create_prediction_loader(dataset, str(components["device"])),
+                return_predictions=False,
+                ckpt_path=checkpoint_path,
+            )
+    collector.finalize()
+    ResultParser().export_predictions_csv(output_directory / "predictions.csv", collector.predictions)
     emit({"type": "completed", "result_dir": str(output_directory)})
     return 0
 

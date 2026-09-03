@@ -1,6 +1,7 @@
 """Tests for training worker progress reporting and calibration data isolation."""
 
 from pathlib import Path
+import pickle
 
 import numpy as np
 from PIL import Image
@@ -14,6 +15,8 @@ from app.workers.training_worker import (
     _peak_gpu_memory_mb,
     calibration_samples_from_predictions,
     configure_worker_stdio,
+    create_training_progress_callback,
+    emit,
 )
 
 
@@ -47,6 +50,14 @@ def test_progress_callback_reports_batch_counts() -> None:
         {"type": "stage_progress", "current": 0, "total": 3},
         {"type": "stage_progress", "current": 3, "total": 3},
     ]
+
+
+def test_lightning_progress_callback_is_pickleable_for_checkpoint_saves() -> None:
+    callback = create_training_progress_callback(emit)
+
+    restored = pickle.loads(pickle.dumps(callback))
+
+    assert type(restored).__module__ == "app.workers.training_worker"
 
 
 def test_calibration_samples_reject_final_test_predictions(tmp_path: Path) -> None:

@@ -11,6 +11,8 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any, Callable
 
+from lightning.pytorch.callbacks import Callback
+
 from app.core.environment_info import collect_environment_info
 from app.core.dataset_manifest import build_dataset_manifest, build_effective_split, stage_effective_split, write_dataset_manifest
 from app.core.dataset_validator import DatasetValidator
@@ -123,15 +125,16 @@ class TrainingProgressReporter:
         self._update_stage_progress(batch_idx, trainer.num_test_batches)
 
 
+class LightningTrainingProgressCallback(TrainingProgressReporter, Callback):
+    """Module-scoped progress callback so Lightning can serialize it into checkpoints."""
+
+    def __init__(self, callback_emitter: Callable[[dict[str, object]], None]) -> None:
+        Callback.__init__(self)
+        TrainingProgressReporter.__init__(self, callback_emitter)
+
+
 def create_training_progress_callback(emitter: Callable[[dict[str, object]], None]) -> Any:
-    """Create a Lightning callback only after the worker is ready to train."""
-    from lightning.pytorch.callbacks import Callback
-
-    class LightningTrainingProgressCallback(TrainingProgressReporter, Callback):
-        def __init__(self, callback_emitter: Callable[[dict[str, object]], None]) -> None:
-            Callback.__init__(self)
-            TrainingProgressReporter.__init__(self, callback_emitter)
-
+    """Create the checkpoint-serializable Lightning progress callback."""
     return LightningTrainingProgressCallback(emitter)
 
 

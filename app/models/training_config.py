@@ -168,6 +168,16 @@ class TrainingConfig:
         return self._normalized_model_name == "superadd"
 
     @property
+    def is_super_simple_net(self) -> bool:
+        """Return whether the selected model uses SuperSimpleNet's CUDA pooling path."""
+        return self._normalized_model_name == "supersimplenet"
+
+    @property
+    def uses_warn_only_determinism(self) -> bool:
+        """Return whether Lightning must warn for a known nondeterministic CUDA backward operation."""
+        return self.is_super_simple_net
+
+    @property
     def uses_fixed_one_pass(self) -> bool:
         """Return whether the selected model builds a memory bank in one pass."""
         return self.is_patchcore or self.is_padim or self.is_anomaly_dino or self.is_super_add
