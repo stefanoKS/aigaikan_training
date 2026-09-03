@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from math import ceil
 from pathlib import Path
+from time import perf_counter_ns
 from typing import Any, Iterable
 
 import cv2
@@ -59,8 +60,35 @@ class PreprocessingPipeline:
 
     def prepare_path_with_rectified(self, source_path: Path) -> tuple[tuple[PreparedImage, ...], np.ndarray]:
         """Decode once and retain the rectified RGB image for an optional visualization."""
+        prepared, rectified, _timing = self.prepare_path_with_timing(source_path)
+        return prepared, rectified
+
+    def prepare_path_with_timing(self, source_path: Path) -> tuple[tuple[PreparedImage, ...], np.ndarray, dict[str, object]]:
+        """Prepare a source with separated CPU decode, ROI, filter, and padding timings."""
+        decode_started = perf_counter_ns()
         with Image.open(source_path) as image:
-            return self.prepare_array_with_rectified(np.asarray(image.convert("RGB")))
+            image_rgb = np.asarray(image.convert("RGB"))
+        decode_ms = (perf_counter_ns() - decode_started) / 1_000_000
+        roi_started = perf_counter_ns()
+        rectified = self._rectify(image_rgb)
+        roi_ms = (perf_counter_ns() - roi_started) / 1_000_000
+        filter_started = perf_counter_ns()
+        preprocessed = self.preprocess_rectified(rectified)
+        filter_ms = (perf_counter_ns() - filter_started) / 1_000_000
+        padding_started = perf_counter_ns()
+        prepared = tuple(self._prepare_tile(preprocessed, tile) for tile in self.plan.tiles)
+        padding_ms = (perf_counter_ns() - padding_started) / 1_000_000
+        return prepared, rectified, {
+            "input_decode_ms": decode_ms,
+            "roi_rectification_ms": roi_ms,
+            "image_filter_ms": filter_ms,
+            "padding_tiling_ms": padding_ms,
+            "preprocess_compute_ms": roi_ms + filter_ms + padding_ms,
+            "raw_input_size": [image_rgb.shape[1], image_rgb.shape[0]],
+            "rectified_size": [rectified.shape[1], rectified.shape[0]],
+            "model_input_size": list(self.plan.model_input_size),
+            "tile_count": len(prepared),
+        }
 
     def prepare_mask_path(self, source_path: Path) -> tuple[np.ndarray, ...]:
         """Prepare a ground-truth mask with the same geometry as its model inputs."""

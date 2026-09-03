@@ -42,6 +42,7 @@ from app.core.inspection_region import inspection_region_hash
 from app.core.run_artifacts import (
     read_canonical_checkpoint,
     read_persisted_threshold,
+    read_persisted_threshold_metadata,
     read_run_manifest,
     read_verified_inspection_region,
     read_verified_preprocessing_plan,
@@ -242,7 +243,11 @@ class MainWindow(QMainWindow):
         scroll_area.setFrameShape(QScrollArea.Shape.NoFrame)
         page.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         scroll_area.viewport().setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll_area.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+            if isinstance(page, PreprocessImagesPage)
+            else Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
         scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         scroll_area.setWidget(page)
         return scroll_area
@@ -287,6 +292,7 @@ class MainWindow(QMainWindow):
         self.results_page.open_folder_button.clicked.connect(self._open_results_folder)
         self.results_page.compare_button.clicked.connect(self._compare_results)
         self.results_page.threshold_revision_requested.connect(self._apply_threshold_revision)
+        self.results_page.decision_preview_requested.connect(self._preview_deployment_threshold_effect)
 
         self.training_page.start_button.clicked.connect(self._start_training)
         self.training_page.cancel_button.clicked.connect(self.training_controller.cancel)
@@ -439,6 +445,7 @@ class MainWindow(QMainWindow):
                     run_directory,
                     ImageThresholdOperatingPoint(image_threshold, score_semantic),
                     PixelThresholdOperatingPoint(pixel_mask_enabled, pixel_threshold),
+                    operator_note=self.results_page.operator_note(),
                 )
             revised_predictions = self.result_parser.read_predictions_csv(revision.predictions_path)
         except (OSError, ValueError, TypeError) as exc:
@@ -450,6 +457,24 @@ class MainWindow(QMainWindow):
             revision.pixel_operating_point.active_threshold,
             revised_predictions,
         )
+
+    def _preview_deployment_threshold_effect(self, proposed_threshold: float) -> None:
+        """Preview a proposed decision revision against persisted scores without model execution."""
+        run_directory = self.results_page.current_run_directory
+        current_run = self.results_page.current_run
+        if run_directory is None or current_run is None:
+            return
+        score_semantic = str(current_run.threshold_metadata.get("score_semantic", ""))
+        try:
+            preview = self.threshold_revision_service.preview_decision_threshold(
+                run_directory,
+                proposed_threshold,
+                score_semantic,
+            )
+        except (OSError, ValueError, TypeError) as exc:
+            QMessageBox.warning(self, "Deployment Threshold Preview Failed", str(exc))
+            return
+        self.results_page.display_decision_preview(preview)
 
     def _export_results_csv(self) -> None:
         run = self.results_page.current_run
@@ -1315,6 +1340,7 @@ class MainWindow(QMainWindow):
         try:
             read_canonical_checkpoint(run_directory)
             active_revision = self.threshold_revision_service.read_active_revision(run_directory)
+            threshold_metadata = read_persisted_threshold_metadata(run_directory)
             decision_threshold = (
                 active_revision.image_operating_point.threshold
                 if active_revision is not None
@@ -1335,6 +1361,18 @@ class MainWindow(QMainWindow):
                 preprocessing_contract = read_run_manifest(run_directory).get("preprocessing_contract", {})
                 if preprocessing_contract.get("project_policy_sha256") != preprocessing_hash(self.current_project.preprocessing):
                     preprocessing_status = "Historical preprocessing policy"
+            profile = run_preprocessing_plan.image_preprocessing if run_preprocessing_plan is not None else None
+            profile_summary = "legacy_none_v1"
+            if profile is not None:
+                operations = profile.to_dict()["operations"]
+                operation_names = [str(operation.get("type", "")) for operation in operations if isinstance(operation, dict)]
+                profile_summary = f"{profile.profile_id}: {', '.join(operation_names) if operation_names else 'no additional operations'}"
+                manifest_contract = read_run_manifest(run_directory).get("preprocessing_contract", {})
+                plan_hash = manifest_contract.get("metadata_sha256") if isinstance(manifest_contract, dict) else None
+                valid_area = run_preprocessing_plan.rectified_size[0] * run_preprocessing_plan.rectified_size[1]
+                canvas_area = run_preprocessing_plan.model_input_size[0] * run_preprocessing_plan.model_input_size[1]
+                padding_percent = (canvas_area - valid_area) * 100 / valid_area if valid_area else 0
+                profile_summary = f"{profile_summary} | plan {str(plan_hash)[:12]} | padding {padding_percent:.1f}%"
         except (OSError, ValueError, TypeError):
             if show_error:
                 QMessageBox.warning(
@@ -1344,7 +1382,23 @@ class MainWindow(QMainWindow):
                 )
             return False
         self._inference_run_directory = run_directory
-        self.inference_page.set_training_run(run_directory, model_name, decision_threshold)
+        self.inference_page.set_training_run(
+            run_directory,
+            model_name,
+            decision_threshold,
+            calibrated_threshold=float(threshold_metadata.get("threshold_raw", decision_threshold)),
+            threshold_source=(
+                f"active decision revision: {active_revision.revision_path.stem}"
+                if active_revision is not None
+                else "calibrated run manifest"
+            ),
+            score_semantic=(
+                active_revision.image_operating_point.score_semantic
+                if active_revision is not None
+                else str(threshold_metadata.get("score_semantic", ""))
+            ),
+            preprocessing_summary=profile_summary,
+        )
         self.inference_page.set_status(preprocessing_status)
         return True
 

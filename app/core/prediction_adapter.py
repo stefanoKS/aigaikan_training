@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from app.core.decision_score import resolve_decision_score
 from app.core.prediction_contract import (
     POSTPROCESSED_SCORE_SEMANTIC,
     RAW_SCORE_SEMANTIC,
@@ -204,32 +205,23 @@ class PreprocessedPredictionAccumulator:
             else None
         )
         raw_scores = tuple(tile_predictions[index].raw_image_score for index in self._expected_tile_indexes)
-        postprocessed_image_score = score = native_tile_scores[0]
+        postprocessed_image_score = native_tile_scores[0]
         postprocessed_score_semantic = ANOMALIB_POSTPROCESSED_SCORE_SEMANTIC
-        if self._preprocessing_pipeline.plan.preprocessing_contract_version == LEGACY_PREPROCESSING_CONTRACT_VERSION:
-            score = self._preprocessing_pipeline.score_from_reconstructed_map(reconstructed)
-            native_image_score = None
-            score_semantic = LEGACY_VALID_MAP_SCORE_SEMANTIC
+        decision = resolve_decision_score(
+            self._preprocessing_pipeline.plan,
+            postprocessed_image_score=postprocessed_image_score if len(native_tile_scores) == 1 else None,
+            raw_image_score=raw_scores[0] if len(raw_scores) == 1 else None,
+            reconstructed_map=reconstructed,
+            preprocessing_pipeline=self._preprocessing_pipeline,
+        )
+        score = decision.value
+        score_semantic = decision.semantic
+        native_image_score = native_tile_scores[0] if decision.source == "superadd_raw_native_image_score" else (
+            score if decision.source == "anomalib_postprocessed_image_score" else None
+        )
+        if decision.source != "superadd_raw_native_image_score" and decision.source != "anomalib_postprocessed_image_score":
             postprocessed_image_score = score
-        elif self._preprocessing_pipeline.plan.tiled:
-            score = self._preprocessing_pipeline.score_from_reconstructed_map(reconstructed)
-            native_image_score = None
-            score_semantic = RECONSTRUCTED_VALID_MAP_SCORE_SEMANTIC
-            postprocessed_image_score = score
-        elif self._preprocessing_pipeline.plan.model_id == "super_add":
-            if len(raw_scores) != 1 or raw_scores[0] is None:
-                raise ValueError("SuperADD prediction is missing its native top-quantile image score.")
-            score = raw_scores[0]
-            native_image_score = native_tile_scores[0]
-            score_semantic = SUPERADD_NATIVE_IMAGE_SCORE_SEMANTIC
-        elif len(native_tile_scores) == 1:
-            score = native_tile_scores[0]
-            native_image_score = score
-            score_semantic = ANOMALIB_POSTPROCESSED_SCORE_SEMANTIC
-        else:
-            score = self._preprocessing_pipeline.aggregate_tile_scores(native_tile_scores)
-            native_image_score = None
-            score_semantic = f"{NATIVE_TILE_SCORE_SEMANTIC_PREFIX}_{self._preprocessing_pipeline.plan.score_aggregation.value}_v1"
+            postprocessed_score_semantic = score_semantic
         return PreprocessedAnomalibPrediction(
             source_path=source_path,
             score=score,
@@ -313,32 +305,23 @@ def iter_preprocessed_predictions(
             else None
         )
         raw_scores = tuple(tile_predictions[index].raw_image_score for index in expected_indexes)
-        postprocessed_image_score = score = native_tile_scores[0]
+        postprocessed_image_score = native_tile_scores[0]
         postprocessed_score_semantic = ANOMALIB_POSTPROCESSED_SCORE_SEMANTIC
-        if preprocessing_pipeline.plan.preprocessing_contract_version == LEGACY_PREPROCESSING_CONTRACT_VERSION:
-            score = preprocessing_pipeline.score_from_reconstructed_map(reconstructed)
-            native_image_score = None
-            score_semantic = LEGACY_VALID_MAP_SCORE_SEMANTIC
+        decision = resolve_decision_score(
+            preprocessing_pipeline.plan,
+            postprocessed_image_score=postprocessed_image_score if len(native_tile_scores) == 1 else None,
+            raw_image_score=raw_scores[0] if len(raw_scores) == 1 else None,
+            reconstructed_map=reconstructed,
+            preprocessing_pipeline=preprocessing_pipeline,
+        )
+        score = decision.value
+        score_semantic = decision.semantic
+        native_image_score = native_tile_scores[0] if decision.source == "superadd_raw_native_image_score" else (
+            score if decision.source == "anomalib_postprocessed_image_score" else None
+        )
+        if decision.source != "superadd_raw_native_image_score" and decision.source != "anomalib_postprocessed_image_score":
             postprocessed_image_score = score
-        elif preprocessing_pipeline.plan.tiled:
-            score = preprocessing_pipeline.score_from_reconstructed_map(reconstructed)
-            native_image_score = None
-            score_semantic = RECONSTRUCTED_VALID_MAP_SCORE_SEMANTIC
-            postprocessed_image_score = score
-        elif preprocessing_pipeline.plan.model_id == "super_add":
-            if len(raw_scores) != 1 or raw_scores[0] is None:
-                raise ValueError("SuperADD prediction is missing its native top-quantile image score.")
-            score = raw_scores[0]
-            native_image_score = native_tile_scores[0]
-            score_semantic = SUPERADD_NATIVE_IMAGE_SCORE_SEMANTIC
-        elif len(native_tile_scores) == 1:
-            score = native_tile_scores[0]
-            native_image_score = score
-            score_semantic = ANOMALIB_POSTPROCESSED_SCORE_SEMANTIC
-        else:
-            score = preprocessing_pipeline.aggregate_tile_scores(native_tile_scores)
-            native_image_score = None
-            score_semantic = f"{NATIVE_TILE_SCORE_SEMANTIC_PREFIX}_{preprocessing_pipeline.plan.score_aggregation.value}_v1"
+            postprocessed_score_semantic = score_semantic
         yield PreprocessedAnomalibPrediction(
             source_path=source_path,
             score=score,

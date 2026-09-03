@@ -13,6 +13,7 @@ from PySide6.QtWidgets import QApplication
 from app.models.training_run import TrainingRun
 from app.models.prediction_result import PredictionResult
 from app.services.export_service import ModelExportFormat
+from app.services.threshold_revision_service import DecisionThresholdPreview
 from app.ui.pages.results_page import ResultsPage
 
 
@@ -150,4 +151,30 @@ def test_results_page_adds_a_newly_created_threshold_revision_to_the_selector() 
 
     assert page.active_threshold_revision_id == "threshold-001"
     assert page.threshold_revision_combo.currentData() == "threshold-001"
+    assert application is not None
+
+
+def test_results_page_displays_deployment_threshold_preview_with_superadd_warning() -> None:
+    application = QApplication.instance() or QApplication([])
+    page = ResultsPage()
+
+    page.display_decision_preview(
+        DecisionThresholdPreview(
+            calibrated_threshold=0.7,
+            active_threshold=0.8,
+            proposed_threshold=1.7,
+            score_semantic="superadd_native_top_quantile_score_v1",
+            ok_to_ng_changes=2,
+            ng_to_ok_changes=1,
+            false_reject_rate=0.1,
+            ng_recall=0.9,
+            outside_calibration_range=True,
+        )
+    )
+
+    assert page.calibrated_threshold_label.text() == "0.7"
+    assert page.active_deployment_threshold_label.text() == "0.8"
+    assert "OK->NG changes: 2" in page.threshold_preview_label.text()
+    assert "outside observed calibration" in page.threshold_preview_label.text()
+    assert "not probabilities" in page.threshold_preview_label.text()
     assert application is not None

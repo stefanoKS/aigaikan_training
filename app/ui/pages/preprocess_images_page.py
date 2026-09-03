@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -26,6 +27,7 @@ from PySide6.QtWidgets import (
     QSlider,
     QSpinBox,
     QStyle,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -141,20 +143,27 @@ class PreprocessImagesPage(QWidget):
         self._active_index = -1
         self._state = PreprocessingPreviewState()
         self._preview_arrays: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(28, 24, 28, 28)
         root.setSpacing(16)
 
         source_group = QGroupBox("Preview Source")
-        source_layout = QHBoxLayout(source_group)
+        source_layout = QVBoxLayout(source_group)
+        source_layout.setSpacing(8)
         self.project_good_radio = QRadioButton("Project Good Images")
         self.custom_image_radio = QRadioButton("Custom Image")
         self.custom_folder_radio = QRadioButton("Custom Folder")
         self._source_buttons = QButtonGroup(self)
+        source_modes = QGridLayout()
+        source_modes.setHorizontalSpacing(8)
+        source_modes.setVerticalSpacing(4)
         for button in (self.project_good_radio, self.custom_image_radio, self.custom_folder_radio):
             self._source_buttons.addButton(button)
-            source_layout.addWidget(button)
+        source_modes.addWidget(self.project_good_radio, 0, 0)
+        source_modes.addWidget(self.custom_image_radio, 0, 1)
+        source_modes.addWidget(self.custom_folder_radio, 1, 0)
         self.choose_custom_image_button = QPushButton("Select Custom Image")
         self.choose_custom_folder_button = QPushButton("Select Custom Folder")
         self.previous_button = QPushButton()
@@ -166,13 +175,18 @@ class PreprocessImagesPage(QWidget):
         self.random_button = QPushButton("Random")
         self.reset_source_button = QPushButton("Reset to Project Good Images")
         self.already_rectified_check = QCheckBox("Custom source is already rectified")
-        source_layout.addWidget(self.choose_custom_image_button)
-        source_layout.addWidget(self.choose_custom_folder_button)
-        source_layout.addWidget(self.previous_button)
-        source_layout.addWidget(self.next_button)
-        source_layout.addWidget(self.random_button)
+        source_picker_actions = QVBoxLayout()
+        source_picker_actions.addWidget(self.choose_custom_image_button)
+        source_picker_actions.addWidget(self.choose_custom_folder_button)
+        source_navigation = QHBoxLayout()
+        source_navigation.addWidget(self.previous_button)
+        source_navigation.addWidget(self.next_button)
+        source_navigation.addWidget(self.random_button)
+        source_navigation.addStretch(1)
+        source_layout.addLayout(source_modes)
+        source_layout.addLayout(source_picker_actions)
+        source_layout.addLayout(source_navigation)
         source_layout.addWidget(self.reset_source_button)
-        source_layout.addStretch(1)
         source_layout.addWidget(self.already_rectified_check)
         root.addWidget(source_group)
 
@@ -183,6 +197,8 @@ class PreprocessImagesPage(QWidget):
 
         profile_group = QGroupBox("Image Preprocessing Profile")
         profile_form = QFormLayout(profile_group)
+        profile_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        profile_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         self.preset_combo = QComboBox()
         for label, preset in (
             ("No Additional Preprocessing", PreprocessingPreset.NONE),
@@ -193,6 +209,7 @@ class PreprocessImagesPage(QWidget):
             ("Grayscale + Gaussian + Disk Opening", PreprocessingPreset.GRAYSCALE_GAUSSIAN_DISK_OPENING),
         ):
             self.preset_combo.addItem(label, preset.value)
+        self.preset_combo.addItem("Custom", "custom")
         self.color_mode_combo = QComboBox()
         self.color_mode_combo.addItem("Preserve RGB", ColorMode.PRESERVE_RGB.value)
         self.color_mode_combo.addItem("Grayscale, replicated to 3 channels", ColorMode.GRAYSCALE_REPLICATED_RGB.value)
@@ -213,6 +230,8 @@ class PreprocessImagesPage(QWidget):
         self.gaussian_auto_kernel_check = QCheckBox("Automatic odd kernel")
         self.gaussian_auto_kernel_check.setChecked(True)
         self.gaussian_kernel_spin = self._odd_spinbox(7)
+        self.gaussian_auto_kernel_check.setToolTip("Choose the kernel size automatically from the Gaussian sigma.")
+        self.gaussian_kernel_spin.setToolTip("Available when Automatic odd kernel is turned off.")
         self.median_kernel_spin = self._odd_spinbox(3)
         self.morphology_combo = QComboBox()
         self.morphology_combo.addItem("None", MorphologyOperation.NONE.value)
@@ -224,6 +243,15 @@ class PreprocessImagesPage(QWidget):
         self.disk_iterations_spin.setRange(1, 1000)
         self.disk_iterations_spin.setValue(1)
         self.morphology_border_combo = self._border_combo()
+        for combo in (
+            self.preset_combo,
+            self.color_mode_combo,
+            self.smoothing_combo,
+            self.smoothing_border_combo,
+            self.morphology_combo,
+            self.morphology_border_combo,
+        ):
+            combo.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.fiber_thickness_spin = self._optional_positive_spinbox()
         self.minimum_defect_spin = self._optional_positive_spinbox()
         self.pixels_per_mm_spin = self._optional_positive_spinbox()
@@ -264,7 +292,9 @@ class PreprocessImagesPage(QWidget):
         profile_buttons.addStretch(1)
         root.addLayout(profile_buttons)
 
-        inspection_controls = QHBoxLayout()
+        inspection_controls = QGridLayout()
+        inspection_controls.setHorizontalSpacing(12)
+        inspection_controls.setVerticalSpacing(8)
         self.zoom_check = QCheckBox("Enable preview zoom")
         self.zoom_slider = QSlider(Qt.Orientation.Horizontal)
         self.zoom_slider.setRange(50, 200)
@@ -272,30 +302,40 @@ class PreprocessImagesPage(QWidget):
         self.zoom_slider.setEnabled(False)
         self.pixel_inspection_check = QCheckBox("Enable pixel-value inspection")
         self.pixel_value_label = QLabel("Pixel inspection disabled")
-        inspection_controls.addWidget(self.zoom_check)
-        inspection_controls.addWidget(self.zoom_slider)
-        inspection_controls.addWidget(self.pixel_inspection_check)
-        inspection_controls.addWidget(self.pixel_value_label)
-        inspection_controls.addStretch(1)
+        self.pixel_value_label.setWordWrap(True)
+        self.pixel_value_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        inspection_controls.addWidget(self.zoom_check, 0, 0)
+        inspection_controls.addWidget(self.zoom_slider, 0, 1)
+        inspection_controls.addWidget(self.pixel_inspection_check, 1, 0)
+        inspection_controls.addWidget(self.pixel_value_label, 1, 1)
+        inspection_controls.setColumnStretch(1, 1)
         root.addLayout(inspection_controls)
 
-        previews = QHBoxLayout()
+        previews = QGridLayout()
+        previews.setHorizontalSpacing(16)
+        previews.setVerticalSpacing(16)
         self.original_canvas = InspectionRegionCanvas()
         self.original_canvas.setObjectName("DatasetThumbnail")
-        self.original_canvas.setMinimumSize(240, 220)
+        self.original_canvas.setMinimumSize(220, 200)
+        self.original_canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.rectified_preview = _ArrayPreviewLabel("Rectified ROI")
         self.preprocessed_preview = _ArrayPreviewLabel("Preprocessed ROI")
         self.difference_preview = _ArrayPreviewLabel("Absolute Difference")
-        for title, widget in (
+        for index, (title, widget) in enumerate((
             ("Original with ROI", self.original_canvas),
             ("Rectified ROI", self.rectified_preview),
             ("Final Preprocessed ROI", self.preprocessed_preview),
             ("Absolute Difference", self.difference_preview),
-        ):
+        )):
             column = QVBoxLayout()
-            column.addWidget(QLabel(title))
-            column.addWidget(widget)
-            previews.addLayout(column, stretch=1)
+            caption = QLabel(title)
+            caption.setWordWrap(True)
+            caption.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+            column.addWidget(caption)
+            column.addWidget(widget, stretch=1)
+            previews.addLayout(column, index // 2, index % 2)
+        previews.setColumnStretch(0, 1)
+        previews.setColumnStretch(1, 1)
         root.addLayout(previews, stretch=1)
 
         self.status_label = QLabel("Project Good Images are used only for preview.")
@@ -578,8 +618,7 @@ class PreprocessImagesPage(QWidget):
             widget.blockSignals(False)
         if not keep_preset:
             self.preset_combo.blockSignals(True)
-            preset = PreprocessingPreset.NONE if profile.is_legacy_none else PreprocessingPreset.GRAYSCALE_ONLY
-            self.preset_combo.setCurrentIndex(self.preset_combo.findData(preset.value))
+            self.preset_combo.setCurrentIndex(self.preset_combo.findData(self._preset_value(profile)))
             self.preset_combo.blockSignals(False)
         self._update_control_state()
 
@@ -757,6 +796,21 @@ class PreprocessImagesPage(QWidget):
     @staticmethod
     def _optional_spin_value(spin: QDoubleSpinBox) -> float | None:
         return spin.value() or None
+
+    @staticmethod
+    def _preset_value(profile: ImagePreprocessingConfig) -> str:
+        if profile.is_legacy_none:
+            return PreprocessingPreset.NONE.value
+        for preset in (
+            PreprocessingPreset.GRAYSCALE_ONLY,
+            PreprocessingPreset.GRAYSCALE_GAUSSIAN,
+            PreprocessingPreset.GRAYSCALE_MEDIAN,
+            PreprocessingPreset.GRAYSCALE_DISK_OPENING,
+            PreprocessingPreset.GRAYSCALE_GAUSSIAN_DISK_OPENING,
+        ):
+            if profile == ImagePreprocessingConfig.from_preset(preset):
+                return preset.value
+        return "custom"
 
     @staticmethod
     def _readable_images(paths: tuple[Path, ...]) -> tuple[tuple[Path, ...], tuple[str, ...]]:

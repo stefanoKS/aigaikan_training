@@ -9,6 +9,7 @@ from tempfile import TemporaryDirectory
 from typing import Any
 
 from app.core.dataset_manifest import build_dataset_manifest, write_dataset_manifest
+from app.core.decision_score import resolve_decision_score
 from app.core.inspection_region import InspectionRegionProcessor, validate_inspection_region_sources
 from app.core.prediction_artifacts import PredictionArtifacts, inspection_region_metadata, save_prediction_artifacts
 from app.core.prediction_adapter import explicitly_postprocessed_predict, iter_anomalib_predictions, iter_preprocessed_predictions
@@ -274,7 +275,19 @@ class EvaluationRevisionService:
     ) -> list[CalibrationSample]:
         return EvaluationRevisionService._calibration_samples_from_scores(
             (
-                (prediction.image_path, prediction.score, prediction.score_semantic)
+                (
+                    prediction.image_path,
+                    resolve_decision_score(
+                        None,
+                        postprocessed_image_score=prediction.score,
+                        raw_image_score=prediction.raw_image_score,
+                    ).value,
+                    resolve_decision_score(
+                        None,
+                        postprocessed_image_score=prediction.score,
+                        raw_image_score=prediction.raw_image_score,
+                    ).semantic,
+                )
                 for prediction in iter_anomalib_predictions(output)
             ),
             normal_directory=normal_directory,
@@ -324,6 +337,11 @@ class EvaluationRevisionService:
         region_metadata = inspection_region_metadata(inspection_region) if inspection_region is not None else {}
         results: list[PredictionResult] = []
         for prediction in iter_anomalib_predictions(output):
+            decision_score = resolve_decision_score(
+                None,
+                postprocessed_image_score=prediction.score,
+                raw_image_score=prediction.raw_image_score,
+            )
             try:
                 ground_truth, role = labels[prediction.image_path]
             except KeyError as exc:
@@ -341,19 +359,19 @@ class EvaluationRevisionService:
                 PredictionResult(
                     source_path=str(prediction.image_path),
                     original_image=str(prediction.image_path),
-                    predicted_label="NG" if prediction.score >= threshold else "OK",
+                    predicted_label="NG" if decision_score.value >= threshold else "OK",
                     ground_truth_label=ground_truth,
-                    anomaly_score=prediction.score,
+                    anomaly_score=decision_score.value,
                     threshold=threshold,
                     dataset_role=role,
-                    native_image_score=prediction.score,
-                    native_tile_scores=[prediction.score],
-                    score_semantic=prediction.score_semantic,
+                    native_image_score=decision_score.value,
+                    native_tile_scores=[decision_score.value],
+                    score_semantic=decision_score.semantic,
                     raw_image_score=prediction.raw_image_score,
                     raw_score_semantic=RAW_SCORE_SEMANTIC if prediction.raw_image_score is not None else "",
                     raw_anomaly_map=artifacts.raw_anomaly_map,
-                    postprocessed_image_score=prediction.postprocessed_image_score,
-                    postprocessed_score_semantic=prediction.postprocessed_score_semantic,
+                    postprocessed_image_score=decision_score.value,
+                    postprocessed_score_semantic=decision_score.semantic,
                     postprocessed_anomaly_map=artifacts.continuous_anomaly_map,
                     prediction_contract_version=PREDICTION_CONTRACT_VERSION,
                     continuous_anomaly_map=artifacts.continuous_anomaly_map,

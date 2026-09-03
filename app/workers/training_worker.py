@@ -14,6 +14,7 @@ from typing import Any, Callable
 from lightning.pytorch.callbacks import Callback
 
 from app.core.environment_info import collect_environment_info
+from app.core.decision_score import resolve_decision_score
 from app.core.dataset_manifest import build_dataset_manifest, build_effective_split, stage_effective_split, write_dataset_manifest
 from app.core.dataset_validator import DatasetValidator
 from app.core.inspection_region import InspectionRegionProcessor, inspection_region_hash, validate_inspection_region_sources, write_inspection_region
@@ -189,7 +190,12 @@ def calibration_samples_from_predictions(
             label = "NG"
         else:
             raise ValueError(f"Calibration prediction path has an unexpected staged role: {prediction.image_path}")
-        samples.append(CalibrationSample(score=prediction.score, label=label, score_semantic=prediction.score_semantic))
+        decision_score = resolve_decision_score(
+            None,
+            postprocessed_image_score=prediction.score,
+            raw_image_score=prediction.raw_image_score,
+        )
+        samples.append(CalibrationSample(score=decision_score.value, label=label, score_semantic=decision_score.semantic))
     return samples
 
 
@@ -276,6 +282,11 @@ def _final_test_predictions(
             ground_truth = "NG"
         else:
             raise ValueError(f"Final-test prediction path has an unexpected staged role: {staged_path}")
+        decision_score = resolve_decision_score(
+            None,
+            postprocessed_image_score=anomalib_prediction.score,
+            raw_image_score=anomalib_prediction.raw_image_score,
+        )
         artifacts = _prediction_artifacts(
             source_path,
             anomalib_prediction.anomaly_map,
@@ -288,20 +299,20 @@ def _final_test_predictions(
         predictions.append(
             PredictionResult(
                 source_path=str(source_path),
-                predicted_label="NG" if anomalib_prediction.score >= threshold else "OK",
+                predicted_label="NG" if decision_score.value >= threshold else "OK",
                 ground_truth_label=ground_truth,
-                anomaly_score=anomalib_prediction.score,
+                anomaly_score=decision_score.value,
                 threshold=threshold,
                 original_image=str(source_path),
                 dataset_role=dataset_role,
-                native_image_score=anomalib_prediction.score,
-                native_tile_scores=[anomalib_prediction.score],
-                score_semantic=anomalib_prediction.score_semantic,
+                native_image_score=decision_score.value,
+                native_tile_scores=[decision_score.value],
+                score_semantic=decision_score.semantic,
                 raw_image_score=anomalib_prediction.raw_image_score,
                 raw_score_semantic=RAW_SCORE_SEMANTIC if anomalib_prediction.raw_image_score is not None else "",
                 raw_anomaly_map=artifacts.raw_anomaly_map,
-                postprocessed_image_score=anomalib_prediction.score,
-                postprocessed_score_semantic=anomalib_prediction.score_semantic,
+                postprocessed_image_score=decision_score.value,
+                postprocessed_score_semantic=decision_score.semantic,
                 postprocessed_anomaly_map=artifacts.continuous_anomaly_map,
                 prediction_contract_version=PREDICTION_CONTRACT_VERSION,
                 continuous_anomaly_map=artifacts.continuous_anomaly_map,

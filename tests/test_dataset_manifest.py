@@ -8,6 +8,7 @@ import pytest
 from PIL import Image
 
 from app.core.dataset_manifest import (
+    _stage_matching_masks,
     build_dataset_manifest,
     build_effective_split,
     stage_effective_split,
@@ -193,3 +194,33 @@ def test_preprocessed_staging_reuses_immutable_cache_entries_across_runs(tmp_pat
     assert first_report["misses"] == len(first.source_path_by_staged_path)
     assert second_report["hits"] == len(first.source_path_by_staged_path)
     assert all(path.is_file() for path in second.source_path_by_staged_path)
+
+
+def test_mask_staging_uses_exact_documented_names_not_substring_matches(tmp_path: Path) -> None:
+    source = tmp_path / "ng" / "001.png"
+    staged = tmp_path / "staged" / "001.png"
+    mask_directory = tmp_path / "masks"
+    _save_image(source, (1, 2, 3))
+    _save_image(mask_directory / "0012.png", (0, 0, 0))
+    _save_image(mask_directory / "001_mask.png", (255, 255, 255))
+
+    mapping = _stage_matching_masks({source.resolve(): staged.resolve()}, mask_directory, tmp_path / "output")
+
+    assert list(mapping) == [(mask_directory / "001_mask.png").resolve()]
+
+
+def test_mask_staging_rejects_ambiguous_or_wrong_size_exact_matches(tmp_path: Path) -> None:
+    source = tmp_path / "ng" / "part.png"
+    staged = tmp_path / "staged" / "part.png"
+    masks = tmp_path / "masks"
+    _save_image(source, (1, 2, 3))
+    _save_image(masks / "part.png", (0, 0, 0))
+    _save_image(masks / "part_mask.png", (255, 255, 255))
+
+    with pytest.raises(ValueError, match="Ambiguous masks"):
+        _stage_matching_masks({source.resolve(): staged.resolve()}, masks, tmp_path / "output")
+
+    (masks / "part.png").unlink()
+    Image.new("RGB", (10, 10), (0, 0, 0)).save(masks / "part_mask.png")
+    with pytest.raises(ValueError, match="Mask dimensions"):
+        _stage_matching_masks({source.resolve(): staged.resolve()}, masks, tmp_path / "output")

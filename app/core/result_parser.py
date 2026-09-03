@@ -83,38 +83,7 @@ class ResultParser:
         """Read prediction rows from a CSV export."""
         with path.open("r", encoding="utf-8-sig", newline="") as handle:
             reader = csv.DictReader(handle)
-            return [
-                PredictionResult(
-                    source_path=row.get("image_path", row.get("source_path", "")),
-                    predicted_label=row.get("prediction", row.get("predicted_label", "")),
-                    ground_truth_label=row.get("ground_truth", row.get("ground_truth_label", "")),
-                    anomaly_score=float(row.get("score", row.get("anomaly_score", 0.0))),
-                    threshold=float(row.get("threshold", 0.0)),
-                    original_image=row.get("original_image", ""),
-                    anomaly_map=row.get("anomaly_map", ""),
-                    overlay_image=row.get("overlay_image", ""),
-                    dataset_role=row.get("dataset_role", ""),
-                    native_image_score=_optional_float(row.get("native_image_score")),
-                    native_tile_scores=_json_float_list(row.get("native_tile_scores")),
-                    score_semantic=row.get("score_semantic", ""),
-                    raw_image_score=_optional_float(row.get("raw_image_score")),
-                    raw_score_semantic=row.get("raw_score_semantic", ""),
-                    raw_anomaly_map=row.get("raw_anomaly_map", ""),
-                    postprocessed_image_score=_optional_float(row.get("postprocessed_image_score")),
-                    postprocessed_score_semantic=row.get("postprocessed_score_semantic", ""),
-                    postprocessed_anomaly_map=row.get("postprocessed_anomaly_map", ""),
-                    prediction_contract_version=int(row.get("prediction_contract_version") or 0),
-                    continuous_anomaly_map=row.get("continuous_anomaly_map", ""),
-                    binary_mask=row.get("binary_mask", ""),
-                    contour_overlay_image=row.get("contour_overlay_image", ""),
-                    pixel_threshold=_optional_float(row.get("pixel_threshold")),
-                    pixel_threshold_comparator=row.get("pixel_threshold_comparator", ""),
-                    pixel_threshold_semantic=row.get("pixel_threshold_semantic", ""),
-                    map_display_normalization=_json_mapping(row.get("map_display_normalization")),
-                    region_metadata=_json_mapping(row.get("region_metadata")),
-                )
-                for row in reader
-            ]
+            return [PredictionResult.from_dict(row) for row in reader]
 
     def write_training_run(self, path: Path, run: TrainingRun) -> Path:
         """Persist a training run summary for the Results page."""
@@ -124,39 +93,7 @@ class ResultParser:
     def read_training_run(self, path: Path) -> TrainingRun:
         """Load a persisted training run summary."""
         payload = json.loads(path.read_text(encoding="utf-8"))
-        predictions = [
-            PredictionResult(
-                source_path=str(item.get("source_path", "")),
-                predicted_label=str(item.get("predicted_label", "")),
-                ground_truth_label=str(item.get("ground_truth_label", "")),
-                anomaly_score=float(item.get("anomaly_score", 0.0)),
-                threshold=float(item.get("threshold", 0.0)),
-                original_image=str(item.get("original_image", "")),
-                anomaly_map=str(item.get("anomaly_map", "")),
-                overlay_image=str(item.get("overlay_image", "")),
-                dataset_role=str(item.get("dataset_role", "")),
-                native_image_score=_optional_float(item.get("native_image_score")),
-                native_tile_scores=_float_list(item.get("native_tile_scores")),
-                score_semantic=str(item.get("score_semantic", "")),
-                raw_image_score=_optional_float(item.get("raw_image_score")),
-                raw_score_semantic=str(item.get("raw_score_semantic", "")),
-                raw_anomaly_map=str(item.get("raw_anomaly_map", "")),
-                postprocessed_image_score=_optional_float(item.get("postprocessed_image_score")),
-                postprocessed_score_semantic=str(item.get("postprocessed_score_semantic", "")),
-                postprocessed_anomaly_map=str(item.get("postprocessed_anomaly_map", "")),
-                prediction_contract_version=int(item.get("prediction_contract_version", 0)),
-                continuous_anomaly_map=str(item.get("continuous_anomaly_map", "")),
-                binary_mask=str(item.get("binary_mask", "")),
-                contour_overlay_image=str(item.get("contour_overlay_image", "")),
-                pixel_threshold=_optional_float(item.get("pixel_threshold")),
-                pixel_threshold_comparator=str(item.get("pixel_threshold_comparator", "")),
-                pixel_threshold_semantic=str(item.get("pixel_threshold_semantic", "")),
-                map_display_normalization=_mapping(item.get("map_display_normalization")),
-                region_metadata=_mapping(item.get("region_metadata")),
-            )
-            for item in payload.get("predictions", [])
-            if isinstance(item, dict)
-        ]
+        predictions = [PredictionResult.from_dict(item) for item in payload.get("predictions", []) if isinstance(item, dict)]
         metrics = payload.get("metrics", {})
         return TrainingRun(
             run_name=str(payload.get("run_name", "")),
@@ -233,6 +170,8 @@ class ResultParser:
             "postprocessed_score_semantic",
             "postprocessed_anomaly_map",
             "prediction_contract_version",
+            "timing_metadata",
+            "decision_revision_id",
             "classification_bucket",
         ]
         with path.open("w", encoding="utf-8", newline="") as handle:
@@ -272,6 +211,8 @@ class ResultParser:
                         "postprocessed_score_semantic": payload["postprocessed_score_semantic"],
                         "postprocessed_anomaly_map": payload["postprocessed_anomaly_map"],
                         "prediction_contract_version": payload["prediction_contract_version"],
+                        "timing_metadata": json.dumps(payload["timing_metadata"], sort_keys=True),
+                        "decision_revision_id": payload["decision_revision_id"],
                         "classification_bucket": payload["classification_bucket"],
                     }
                 )

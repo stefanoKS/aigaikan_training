@@ -38,6 +38,8 @@ def test_export_and_read_predictions_csv(tmp_path: Path) -> None:
             pixel_threshold=3.5,
             pixel_threshold_comparator="greater_than_or_equal",
             pixel_threshold_semantic="continuous_anomaly_map_gte_v1",
+            timing_metadata={"timing_record_version": 1, "model_forward_ms": 1.25},
+            decision_revision_id="threshold-003",
         )
     ]
     parser.export_predictions_csv(path, predictions)
@@ -47,6 +49,31 @@ def test_export_and_read_predictions_csv(tmp_path: Path) -> None:
     assert restored[0].pixel_threshold == 3.5
     assert restored[0].pixel_threshold_comparator == "greater_than_or_equal"
     assert restored[0].pixel_threshold_semantic == "continuous_anomaly_map_gte_v1"
+    assert restored[0].timing_metadata["model_forward_ms"] == 1.25
+    assert restored[0].decision_revision_id == "threshold-003"
+
+
+def test_prediction_result_from_worker_payload_preserves_every_supported_field() -> None:
+    payload = PredictionResult(
+        source_path="image.png",
+        predicted_label="NG",
+        ground_truth_label="Unknown",
+        anomaly_score=1.7,
+        threshold=1.2,
+        native_image_score=1.0,
+        native_tile_scores=[1.0],
+        score_semantic="superadd_native_top_quantile_score_v1",
+        raw_image_score=1.7,
+        raw_score_semantic="anomalib_model_raw_score_v1",
+        postprocessed_image_score=1.0,
+        postprocessed_score_semantic="anomalib_postprocessed_pred_score_v1",
+        timing_metadata={"model_forward_ms": 5.0},
+        decision_revision_id="threshold-003",
+    ).to_dict()
+
+    restored = PredictionResult.from_dict(payload)
+
+    assert restored.to_dict() == payload
 
 
 def test_write_and_read_training_run(tmp_path: Path) -> None:

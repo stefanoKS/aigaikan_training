@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from enum import StrEnum
+import hashlib
 import json
 from math import isfinite
 from pathlib import Path
@@ -13,11 +15,14 @@ import shutil
 from typing import Any, Iterable
 
 from app.core.dataset_manifest import sha256_file
+from app.core.decision_policy import DecisionPolicy, decision_policy_hash, read_decision_policy, write_decision_policy
+from app.core.decision_score import require_matching_score_semantic, resolve_decision_score
 from app.core.model_registry import ModelRegistry, ModelSupportLevel
 from app.core.result_parser import ResultParser
 from app.core.inspection_region import InspectionRegionProcessor, inspection_region_hash
 from app.core.preprocessing_contract import image_preprocessing_hash, resolved_preprocessing_hash, write_image_preprocessing_config
 from app.core.preprocessing_pipeline import PreprocessingPipeline
+from app.core.threshold_contract import PixelThresholdOperatingPoint
 from app.core.run_artifacts import (
     read_canonical_checkpoint,
     read_persisted_threshold_metadata,
@@ -30,8 +35,9 @@ from app.models.preprocessing_config import LEGACY_PREPROCESSING_CONTRACT_VERSIO
 from app.models.training_config import TrainingConfig
 from app.services.anomalib_service import AnomalibService, REQUIRED_ANOMALIB_VERSION
 from app.services.threshold_revision_service import ThresholdRevisionResult, ThresholdRevisionService
+from app.version import APP_VERSION
 
-DEPLOYMENT_CONTRACT_VERSION = 2
+DEPLOYMENT_CONTRACT_VERSION = 3
 FORMAT_SCORE_TOLERANCES: dict[str, float] = {
     "torch": 1e-4,
     "onnx": 1e-3,
@@ -102,6 +108,8 @@ class ExportService:
         selected_formats = tuple(dict.fromkeys(ModelExportFormat(export_format) for export_format in export_formats))
         if not selected_formats:
             raise ValueError("Select at least one model export format.")
+        if ModelExportFormat.TORCH not in selected_formats:
+            raise ValueError("A production deployment package requires a selected Torch (.pt) export.")
 
         config = self._load_training_config(run_directory)
         definition = self.model_registry.get(config.model_name)
@@ -111,8 +119,9 @@ class ExportService:
             )
         checkpoint_path = read_canonical_checkpoint(run_directory).path
         active_revision = ThresholdRevisionService.read_active_revision(run_directory)
+        calibrated_threshold_metadata = read_persisted_threshold_metadata(run_directory)
         threshold_metadata = self._effective_threshold_metadata(
-            read_persisted_threshold_metadata(run_directory),
+            calibrated_threshold_metadata,
             active_revision,
         )
         inspection_region = read_verified_inspection_region(run_directory)
@@ -169,6 +178,7 @@ class ExportService:
                         self.score_tolerances[result.export_format],
                         inspection_processor,
                         preprocessing_pipeline,
+                        str(threshold_metadata.get("score_semantic", "")),
                     )
                     if not self._has_custom_deployment_validator
                     else self._deployment_validator(
@@ -188,6 +198,23 @@ class ExportService:
                 exported.append(result)
             except Exception as exc:
                 failures[export_format.value] = str(exc)
+
+        torch_result = next((result for result in exported if result.export_format == ModelExportFormat.TORCH.value), None)
+        if torch_result is None:
+            raise RuntimeError("Torch deployment export did not produce a validated artifact; deployment package was not finalized.")
+        policy = self._build_decision_policy(
+            threshold_metadata,
+            calibrated_threshold_metadata,
+            active_revision,
+            model_sha256=torch_result.sha256,
+            preprocessing_plan_sha256=(
+                resolved_preprocessing_hash(preprocessing_plan)
+                if preprocessing_plan is not None
+                else self._legacy_preprocessing_plan_hash()
+            ),
+        )
+        policy_path = write_decision_policy(package_directory / "decision_policy.json", policy)
+        included_artifacts[policy_path.name] = sha256_file(policy_path)
 
         self._write_package_manifest(
             package_directory,
@@ -216,6 +243,8 @@ class ExportService:
                     "model_input_size": list(preprocessing_plan.model_input_size),
                     "score_aggregation": preprocessing_plan.score_aggregation.value,
                     "tiled": preprocessing_plan.tiled,
+                    "padding_policy": preprocessing_plan.padding_policy.value,
+                    "padding_value_rgb": list(preprocessing_plan.padding_value_rgb),
                     "image_preprocessing_file": "preprocessing.json",
                     "image_preprocessing_sha256": image_preprocessing_hash(image_preprocessing),
                     "image_preprocessing": image_preprocessing.to_dict(),
@@ -228,8 +257,57 @@ class ExportService:
                     "image_preprocessing": image_preprocessing.to_dict(),
                 }
             ),
+            decision_policy=policy,
         )
         return ModelExportReport(exported=exported, failures=failures, package_directory=package_directory)
+
+    def create_deployment_policy_revision(
+        self,
+        package_directory: Path,
+        destination_directory: Path,
+        deployment_ng_score_threshold: float,
+        operator_note: str = "",
+    ) -> Path:
+        """Create a new package revision that reuses a verified Torch artifact and changes only decision policy."""
+        package_directory = package_directory.expanduser().resolve()
+        manifest_path = package_directory / "deployment_manifest.json"
+        if not manifest_path.is_file():
+            raise FileNotFoundError(f"Deployment manifest is missing: {manifest_path}")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict) or manifest.get("deployment_contract_version") != DEPLOYMENT_CONTRACT_VERSION:
+            raise ValueError("Deployment package does not use the current revisionable contract.")
+        policy = read_decision_policy(package_directory / "decision_policy.json")
+        next_revision = self._next_deployment_revision_id(destination_directory, package_directory.name)
+        revised_directory = destination_directory.expanduser().resolve() / next_revision
+        if revised_directory.exists():
+            raise FileExistsError(f"Deployment policy revision already exists: {revised_directory}")
+        shutil.copytree(package_directory, revised_directory)
+        revised_policy = replace(
+            policy,
+            threshold=deployment_ng_score_threshold,
+            source="operator_override",
+            revision_id=next_revision,
+            operator_note=operator_note,
+            created_at=datetime.now(timezone.utc).isoformat(),
+        )
+        policy_path = write_decision_policy(revised_directory / "decision_policy.json", revised_policy)
+        artifacts = manifest.get("included_run_artifacts")
+        if not isinstance(artifacts, dict):
+            raise ValueError("Deployment package is missing artifact checksums.")
+        artifacts[policy_path.name] = sha256_file(policy_path)
+        manifest["included_run_artifacts"] = artifacts
+        manifest["decision_policy"] = {
+            "file": policy_path.name,
+            "sha256": decision_policy_hash(revised_policy),
+            "threshold": revised_policy.threshold,
+            "comparator": revised_policy.comparator,
+            "score_semantic": revised_policy.score_semantic,
+            "source": revised_policy.source,
+            "revision_id": revised_policy.revision_id,
+        }
+        manifest["exported_at"] = datetime.now(timezone.utc).isoformat()
+        self._atomic_write_json(revised_directory / "deployment_manifest.json", manifest)
+        return revised_directory
 
     @staticmethod
     def package_directory_name(model_name: str, run_name: str) -> str:
@@ -307,21 +385,36 @@ class ExportService:
             Path("app/__init__.py"),
             Path("app/version.py"),
             Path("app/core/__init__.py"),
+            Path("app/core/decision_policy.py"),
+            Path("app/core/decision_score.py"),
+            Path("app/core/deployment_reference.py"),
             Path("app/core/image_preprocessor.py"),
+            Path("app/core/inference_timing.py"),
             Path("app/core/inspection_region.py"),
+            Path("app/core/prediction_contract.py"),
+            Path("app/core/prediction_artifacts.py"),
+            Path("app/core/preprocessing_contract.py"),
             Path("app/core/preprocessing_pipeline.py"),
             Path("app/core/preprocessing_reference.py"),
+            Path("app/core/threshold_contract.py"),
             Path("app/models/__init__.py"),
             Path("app/models/image_preprocessing.py"),
+            Path("app/models/dataset_config.py"),
             Path("app/models/inspection_region.py"),
             Path("app/models/preprocessing_config.py"),
             Path("scripts/preprocessing_reference_runner.py"),
+            Path("scripts/deployment_reference_inference.py"),
+            Path("scripts/benchmark_deployment_reference.py"),
             Path("app/resources/preprocessing_golden_vectors.json"),
         ):
             source_path = workspace_root / relative_path
             target_relative = (
                 Path("run_preprocessing_reference.py")
                 if relative_path == Path("scripts/preprocessing_reference_runner.py")
+                else Path("deployment_reference_inference.py")
+                if relative_path == Path("scripts/deployment_reference_inference.py")
+                else Path("benchmark_deployment_reference.py")
+                if relative_path == Path("scripts/benchmark_deployment_reference.py")
                 else Path("golden_vectors.json")
                 if relative_path == Path("app/resources/preprocessing_golden_vectors.json")
                 else relative_path
@@ -348,21 +441,45 @@ class ExportService:
         score_tolerances: Mapping[str, float],
         inspection_preprocessing: Mapping[str, object],
         preprocessing_contract: Mapping[str, object],
+        decision_policy: DecisionPolicy,
     ) -> Path:
         """Record deployment package provenance and every verified file digest."""
         payload = {
             "deployment_contract_version": DEPLOYMENT_CONTRACT_VERSION,
+            "exported_at": datetime.now(timezone.utc).isoformat(),
             "anomalib_version": REQUIRED_ANOMALIB_VERSION,
+            "trainer_version": APP_VERSION,
             "model": {
                 "id": config.model_name,
                 "profile": config.model_profile(),
             },
+            "torch_export_type": ModelExportFormat.TORCH.value,
+            "runtime_versions": ExportService._runtime_versions(),
             "canonical_checkpoint": canonical_checkpoint_path.name,
             "canonical_checkpoint_sha256": sha256_file(canonical_checkpoint_path),
             "final_test_prediction_count": len(final_test_predictions),
             "threshold_metadata": threshold_metadata,
             "inspection_preprocessing": dict(inspection_preprocessing),
             "preprocessing_contract": dict(preprocessing_contract),
+            "decision_policy": {
+                "file": "decision_policy.json",
+                "sha256": decision_policy_hash(decision_policy),
+                "threshold": decision_policy.threshold,
+                "comparator": decision_policy.comparator,
+                "score_semantic": decision_policy.score_semantic,
+                "source": decision_policy.source,
+                "revision_id": decision_policy.revision_id,
+            },
+            "input_contract": {
+                "color_order": "RGB",
+                "dtype": "uint8",
+                "range": "0_255",
+                "model_input_size": preprocessing_contract.get("model_input_size"),
+                "tiling_enabled": preprocessing_contract.get("tiled", False),
+                "tile_aggregation": preprocessing_contract.get("score_aggregation"),
+                "padding_policy": preprocessing_contract.get("padding_policy"),
+                "padding_value_rgb": preprocessing_contract.get("padding_value_rgb"),
+            },
             "format_score_tolerances": dict(score_tolerances),
             "included_run_artifacts": included_artifacts,
             "exports": [
@@ -378,8 +495,42 @@ class ExportService:
             "failures": failures,
         }
         manifest_path = package_directory / "deployment_manifest.json"
-        manifest_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        ExportService._atomic_write_json(manifest_path, payload)
         return manifest_path
+
+    @staticmethod
+    def _next_deployment_revision_id(destination_directory: Path, base_name: str) -> str:
+        destination_directory = destination_directory.expanduser().resolve()
+        prefix = f"{base_name}_decision-"
+        revisions = [
+            int(path.name.removeprefix(prefix))
+            for path in destination_directory.glob(f"{prefix}*")
+            if path.is_dir() and path.name.removeprefix(prefix).isdigit()
+        ] if destination_directory.is_dir() else []
+        return f"{prefix}{max(revisions, default=0) + 1:03d}"
+
+    @staticmethod
+    def _runtime_versions() -> dict[str, str]:
+        import cv2
+        import numpy as np
+        import torch
+
+        return {
+            "anomalib": REQUIRED_ANOMALIB_VERSION,
+            "torch": str(torch.__version__),
+            "opencv": str(cv2.__version__),
+            "numpy": str(np.__version__),
+        }
+
+    @staticmethod
+    def _atomic_write_json(path: Path, payload: dict[str, object]) -> None:
+        from tempfile import NamedTemporaryFile
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with NamedTemporaryFile("w", delete=False, dir=path.parent, encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False)
+            temporary_path = Path(handle.name)
+        temporary_path.replace(path)
 
     @staticmethod
     def _load_final_test_predictions(
@@ -428,6 +579,43 @@ class ExportService:
         return effective
 
     @staticmethod
+    def _build_decision_policy(
+        threshold_metadata: Mapping[str, object],
+        calibrated_threshold_metadata: Mapping[str, object],
+        active_revision: ThresholdRevisionResult | None,
+        *,
+        model_sha256: str,
+        preprocessing_plan_sha256: str,
+    ) -> DecisionPolicy:
+        """Bind the selected run/revision threshold to the exact exported Torch artifact."""
+        try:
+            threshold = float(threshold_metadata["threshold_value"])
+            base_threshold = float(calibrated_threshold_metadata.get("threshold_raw", threshold))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("Deployment decision policy requires finite calibrated and active thresholds.") from exc
+        score_semantic = str(threshold_metadata.get("score_semantic", ""))
+        if not score_semantic:
+            raise ValueError("Deployment decision policy requires a saved decision score semantic.")
+        pixel_payload = threshold_metadata.get("pixel_operating_point")
+        if not isinstance(pixel_payload, Mapping):
+            raise ValueError("Deployment decision policy requires a pixel operating point.")
+        return DecisionPolicy(
+            threshold=threshold,
+            score_semantic=score_semantic,
+            source=active_revision.source if active_revision is not None else "calibrated",
+            base_calibrated_threshold=base_threshold,
+            revision_id=active_revision.revision_path.stem if active_revision is not None else "calibrated",
+            model_sha256=model_sha256,
+            preprocessing_plan_sha256=preprocessing_plan_sha256,
+            pixel_operating_point=PixelThresholdOperatingPoint.from_dict(pixel_payload),
+            operator_note=getattr(active_revision, "operator_note", "") if active_revision is not None else "",
+        )
+
+    @staticmethod
+    def _legacy_preprocessing_plan_hash() -> str:
+        return hashlib.sha256(b"legacy_none_v1").hexdigest()
+
+    @staticmethod
     def _write_validation_report(
         result: ExportResult,
         validation: dict[str, object],
@@ -460,6 +648,7 @@ class ExportService:
         score_tolerance: float = DEFAULT_SCORE_TOLERANCE,
         inspection_processor: InspectionRegionProcessor | None = None,
         preprocessing_pipeline: PreprocessingPipeline | None = None,
+        threshold_semantic: str = "",
     ) -> dict[str, object]:
         """Reload an export and require numerical and threshold-decision final-test parity."""
         if export_format == ModelExportFormat.TORCH.value:
@@ -475,6 +664,7 @@ class ExportService:
         decision_mismatches: list[str] = []
         score_mismatches: list[str] = []
         score_deltas: list[float] = []
+        map_shapes: list[list[int]] = []
         for expected in expected_predictions:
             if preprocessing_pipeline is not None:
                 deployed_predictions = [
@@ -486,12 +676,34 @@ class ExportService:
                     for prediction in deployed_predictions
                 ]
                 reconstructed = preprocessing_pipeline.reconstruct_anomaly_maps(deployed_maps)
-                score = preprocessing_pipeline.score_from_reconstructed_map(reconstructed)
+                map_shapes.append(list(reconstructed.anomaly_map.shape))
+                decision_score = resolve_decision_score(
+                    preprocessing_pipeline.plan,
+                    postprocessed_image_score=(
+                        ExportService._deployment_score(deployed_predictions[0]) if len(deployed_predictions) == 1 else None
+                    ),
+                    raw_image_score=(
+                        ExportService._deployment_raw_score(deployed_predictions[0])
+                        if preprocessing_pipeline.plan.model_id == "super_add" and len(deployed_predictions) == 1
+                        else None
+                    ),
+                    reconstructed_map=reconstructed,
+                    preprocessing_pipeline=preprocessing_pipeline,
+                )
             else:
                 deployment_input: str | Any = expected.source_path
                 if inspection_processor is not None:
                     deployment_input = inspection_processor.apply_path(Path(expected.source_path))
-                score = ExportService._deployment_score(inferencer.predict(deployment_input))
+                prediction = inferencer.predict(deployment_input)
+                decision_score = resolve_decision_score(
+                    None,
+                    postprocessed_image_score=ExportService._deployment_score(prediction),
+                    raw_image_score=None,
+                )
+            expected_semantic = threshold_semantic or expected.score_semantic
+            if expected_semantic:
+                require_matching_score_semantic(decision_score, expected_semantic)
+            score = decision_score.value
             expected_score = float(expected.anomaly_score)
             if not isfinite(expected_score):
                 raise ValueError(f"Persisted checkpoint score must be finite: {expected.source_path}")
@@ -520,6 +732,7 @@ class ExportService:
             "score_tolerance": score_tolerance,
             "maximum_score_delta": max(score_deltas, default=0.0),
             "mean_score_delta": sum(score_deltas) / len(score_deltas) if score_deltas else 0.0,
+            "reconstructed_map_shapes": map_shapes,
         }
 
     @staticmethod
@@ -547,6 +760,16 @@ class ExportService:
         if not isfinite(score):
             raise ValueError("Deployment prediction score must be finite.")
         return score
+
+    @staticmethod
+    def _deployment_raw_score(prediction: Any) -> float | None:
+        """Read a deployer-declared raw model score without guessing from a postprocessed field."""
+        for field_name in ("raw_pred_score", "raw_image_score", "raw_score"):
+            value = prediction.get(field_name) if isinstance(prediction, dict) else getattr(prediction, field_name, None)
+            if value is None:
+                continue
+            return ExportService._deployment_score({"pred_score": value})
+        return None
 
     def verify_export(self, path: Path, export_format: str | None = None) -> ExportResult:
         """Verify a nonempty, format-complete deployable artifact before reporting success."""

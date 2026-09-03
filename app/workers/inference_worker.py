@@ -9,12 +9,15 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from time import perf_counter_ns
 from typing import Any
 
 import numpy as np
 from lightning.pytorch.callbacks import BasePredictionWriter
 
 from app.core.inspection_region import InspectionRegionProcessor
+from app.core.decision_score import resolve_decision_score
+from app.core.inference_timing import InferenceTimingRecord, timing_percentiles
 from app.core.prediction_artifacts import inspection_region_metadata, save_prediction_artifacts
 from app.core.prediction_adapter import (
     ANOMALIB_POSTPROCESSED_SCORE_SEMANTIC,
@@ -134,6 +137,7 @@ class InferenceResultCollector:
         pixel_threshold: float | None,
         region_metadata: dict[str, object],
         expected_score_semantic: str = "",
+        decision_revision_id: str = "",
         inspection_processor: InspectionRegionProcessor | None = None,
         preprocessing_pipeline: PreprocessingPipeline | None = None,
     ) -> None:
@@ -142,12 +146,14 @@ class InferenceResultCollector:
         self._visualizations_directory = visualizations_directory
         self._threshold = threshold
         self._expected_score_semantic = expected_score_semantic
+        self._decision_revision_id = decision_revision_id
         self._pixel_threshold = pixel_threshold
         self._region_metadata = region_metadata
         self._inspection_processor = inspection_processor
         self._preprocessing_pipeline = preprocessing_pipeline
         self._preprocessed_accumulator: PreprocessedPredictionAccumulator | None = None
         self._preview_path_by_source: dict[Path, Path] = {}
+        self._preprocessing_timing_by_source: dict[Path, dict[str, object]] = {}
         self.predictions: list[PredictionResult] = []
         self.predicted_paths: set[Path] = set()
 
@@ -156,6 +162,7 @@ class InferenceResultCollector:
         source_path_by_staged_path: dict[Path, Path],
         preprocessing_tile_by_staged_path: dict[Path, PreprocessingTile],
         preview_path_by_source: dict[Path, Path],
+        preprocessing_timing_by_source: dict[Path, dict[str, object]] | None = None,
     ) -> None:
         """Supply temporary file mappings after preprocessing has staged its model inputs."""
         if self._preprocessing_pipeline is None:
@@ -166,8 +173,14 @@ class InferenceResultCollector:
             self._preprocessing_pipeline,
         )
         self._preview_path_by_source = preview_path_by_source
+        self._preprocessing_timing_by_source = preprocessing_timing_by_source or {}
 
     def add_batch(self, output: Any) -> None:
+        """Process one output batch without externally supplied timing metadata."""
+        self.add_timed_batch(output, None)
+
+    def add_timed_batch(self, output: Any, batch_timing: dict[str, object] | None) -> None:
+        """Process one output batch with writer-measured timing metadata."""
         """Emit every source result completed by one Anomalib batch."""
         if self._preprocessing_pipeline is None:
             for anomalib_prediction in iter_anomalib_predictions(output):
@@ -176,19 +189,25 @@ class InferenceResultCollector:
                     raise ValueError(
                         f"Anomalib returned a prediction outside the selected input: {anomalib_prediction.image_path}"
                     )
+                decision_score = resolve_decision_score(
+                    None,
+                    postprocessed_image_score=anomalib_prediction.score,
+                    raw_image_score=anomalib_prediction.raw_image_score,
+                )
                 self._add_prediction(
                     source_path,
-                    anomalib_prediction.score,
+                    decision_score.value,
                     anomalib_prediction.anomaly_map,
                     anomalib_prediction.postprocessed_image_score,
                     (anomalib_prediction.postprocessed_image_score,),
-                    anomalib_prediction.score_semantic,
+                    decision_score.semantic,
                     anomalib_prediction.postprocessed_image_score,
                     ANOMALIB_POSTPROCESSED_SCORE_SEMANTIC,
                     self._rectified_image(source_path),
                     None,
                     anomalib_prediction.raw_image_score,
                     anomalib_prediction.raw_anomaly_map,
+                    batch_timing=batch_timing,
                 )
             return
         if self._preprocessed_accumulator is None:
@@ -207,6 +226,7 @@ class InferenceResultCollector:
                 anomalib_prediction.valid_roi_mask,
                 anomalib_prediction.raw_image_score,
                 anomalib_prediction.raw_anomaly_map,
+                batch_timing=batch_timing,
             )
 
     def finalize(self) -> None:
@@ -235,6 +255,8 @@ class InferenceResultCollector:
         valid_roi_mask: np.ndarray | None,
         raw_image_score: float | None,
         raw_anomaly_map: Any,
+        *,
+        batch_timing: dict[str, object] | None = None,
     ) -> None:
         if source_path in self.predicted_paths:
             raise ValueError(f"Anomalib returned more than one prediction for: {source_path}")
@@ -244,6 +266,7 @@ class InferenceResultCollector:
                 f"expected {self._expected_score_semantic}, received {score_semantic}."
             )
         self.predicted_paths.add(source_path)
+        artifact_started = perf_counter_ns()
         artifacts = save_prediction_artifacts(
             source_path,
             anomaly_map,
@@ -254,6 +277,8 @@ class InferenceResultCollector:
             valid_roi_mask=valid_roi_mask,
             raw_anomaly_map=raw_anomaly_map,
         )
+        artifact_io_ms = (perf_counter_ns() - artifact_started) / 1_000_000
+        timing_metadata = self._prediction_timing(source_path, batch_timing, artifact_io_ms)
         prediction = PredictionResult(
             source_path=str(source_path),
             predicted_label="NG" if score >= self._threshold else "OK",
@@ -281,10 +306,61 @@ class InferenceResultCollector:
             pixel_threshold_semantic=artifacts.pixel_threshold_semantic,
             map_display_normalization=artifacts.display_normalization or {},
             region_metadata=self._region_metadata,
+            timing_metadata=timing_metadata,
+            decision_revision_id=self._decision_revision_id,
         )
         self.predictions.append(prediction)
         emit({"type": "prediction", **prediction.to_dict()})
         emit({"type": "progress", "current": len(self.predictions), "total": self._total_images})
+
+    def _prediction_timing(
+        self,
+        source_path: Path,
+        batch_timing: dict[str, object] | None,
+        artifact_io_ms: float,
+    ) -> dict[str, object]:
+        base = dict(self._preprocessing_timing_by_source.get(source_path, {}))
+        batch = batch_timing or {}
+        model_forward_ms = _optional_timing(batch.get("model_forward_ms"))
+        application_postprocess_ms = _optional_timing(batch.get("application_postprocess_ms"))
+        preprocess_compute_ms = _optional_timing(base.get("preprocess_compute_ms"))
+        staging_io_ms = _optional_timing(base.get("staging_io_ms"))
+        end_to_end_ms = sum(
+            value
+            for value in (preprocess_compute_ms, staging_io_ms, model_forward_ms, application_postprocess_ms, artifact_io_ms)
+            if value is not None
+        )
+        raw_size = _timing_size(base.get("raw_input_size"), source_path)
+        rectified_size = _timing_size(base.get("rectified_size"), source_path)
+        model_input_size = _timing_size(
+            base.get("model_input_size"),
+            None,
+            self._preprocessing_pipeline.plan.model_input_size if self._preprocessing_pipeline is not None else (0, 0),
+        )
+        return InferenceTimingRecord(
+            input_decode_ms=_optional_timing(base.get("input_decode_ms")),
+            roi_rectification_ms=_optional_timing(base.get("roi_rectification_ms")),
+            image_filter_ms=_optional_timing(base.get("image_filter_ms")),
+            padding_tiling_ms=_optional_timing(base.get("padding_tiling_ms")),
+            preprocess_compute_ms=preprocess_compute_ms,
+            staging_io_ms=staging_io_ms,
+            host_to_device_ms=None,
+            model_forward_ms=model_forward_ms,
+            native_postprocess_ms=_optional_timing(batch.get("native_postprocess_ms")),
+            application_postprocess_ms=application_postprocess_ms,
+            inference_total_ms=_optional_timing(batch.get("inference_total_ms")),
+            artifact_io_ms=artifact_io_ms,
+            end_to_end_ms=end_to_end_ms,
+            model_load_ms=_optional_timing(batch.get("model_load_ms")),
+            device=str(batch.get("device", "")),
+            dtype="uint8_rgb",
+            batch_size=int(batch.get("batch_size", 1)),
+            tile_count=int(base.get("tile_count", 1)),
+            raw_input_size=raw_size,
+            rectified_size=rectified_size,
+            model_input_size=model_input_size,
+            warmup_status="not_warmed",
+        ).to_dict()
 
     def _rectified_image(self, source_path: Path) -> np.ndarray | None:
         if self._inspection_processor is not None and self._inspection_processor.config.enabled:
@@ -305,6 +381,47 @@ class InferencePredictionWriter(BasePredictionWriter):
         super().__init__(write_interval="batch")
         self._collector = collector
         self._postprocessor: ExplicitPredictionPostProcessor | None = None
+        self._predict_started_ns: int | None = None
+        self._batch_started_ns: int | None = None
+        self._cuda_start_event: Any = None
+        self._model_load_ms: float | None = None
+        self._emitted_batches = 0
+
+    def start_prediction_timing(self) -> None:
+        """Mark the cold predict invocation before checkpoint restore and data setup begin."""
+        self._predict_started_ns = perf_counter_ns()
+        self._model_load_ms = None
+        self._emitted_batches = 0
+
+    def on_predict_start(self, trainer: Any, pl_module: Any) -> None:
+        """Record cold load/setup time separately from per-batch inference timing."""
+        del trainer, pl_module
+        if self._predict_started_ns is not None:
+            self._model_load_ms = (perf_counter_ns() - self._predict_started_ns) / 1_000_000
+
+    def on_predict_batch_start(
+        self,
+        trainer: Any,
+        pl_module: Any,
+        batch: Any,
+        batch_idx: int,
+        dataloader_idx: int = 0,
+    ) -> None:
+        """Start synchronized CUDA timing only when Lightning actually uses CUDA."""
+        del pl_module, batch, batch_idx, dataloader_idx
+        self._batch_started_ns = perf_counter_ns()
+        self._cuda_start_event = None
+        root_device = getattr(getattr(trainer, "strategy", None), "root_device", None)
+        if getattr(root_device, "type", "") != "cuda":
+            return
+        try:
+            import torch
+
+            torch.cuda.synchronize()
+            self._cuda_start_event = torch.cuda.Event(enable_timing=True)
+            self._cuda_start_event.record()
+        except Exception:
+            self._cuda_start_event = None
 
     def configure_postprocessor(self, model: Any) -> None:
         """Install explicit, idempotent native postprocessing before prediction callbacks run."""
@@ -323,18 +440,52 @@ class InferencePredictionWriter(BasePredictionWriter):
         dataloader_idx: int,
     ) -> None:
         output = self._postprocessor.postprocess(prediction) if self._postprocessor is not None else prediction
-        self._collector.add_batch(output)
+        batch_wall_ms = self._batch_elapsed_ms()
+        batch_size = max(_prediction_batch_size(output), 1)
+        timing = {
+            "model_load_ms": self._model_load_ms if self._emitted_batches == 0 else 0.0,
+            "model_forward_ms": batch_wall_ms / batch_size,
+            "native_postprocess_ms": None,
+            "application_postprocess_ms": 0.0,
+            "inference_total_ms": batch_wall_ms / batch_size,
+            "batch_wall_ms": batch_wall_ms,
+            "amortized_batch_ms_per_image": batch_wall_ms / batch_size,
+            "true_batch_one_latency_ms": batch_wall_ms if batch_size == 1 else None,
+            "batch_size": batch_size,
+            "device": "cuda" if self._cuda_start_event is not None else "cpu",
+        }
+        timed_add_batch = getattr(self._collector, "add_timed_batch", None)
+        if callable(timed_add_batch):
+            timed_add_batch(output, timing)
+        else:
+            self._collector.add_batch(output)
+        self._emitted_batches += 1
 
     def on_predict_end(self, trainer: Any, pl_module: Any) -> None:
         """Release native batch guards only after every prediction callback has completed."""
         if self._postprocessor is not None:
             self._postprocessor.close()
 
+    def _batch_elapsed_ms(self) -> float:
+        if self._cuda_start_event is not None:
+            try:
+                import torch
+
+                finished = torch.cuda.Event(enable_timing=True)
+                finished.record()
+                finished.synchronize()
+                return float(self._cuda_start_event.elapsed_time(finished))
+            except Exception:
+                pass
+        started = self._batch_started_ns or perf_counter_ns()
+        return (perf_counter_ns() - started) / 1_000_000
+
 
 def _stage_preprocessed_inputs(
     source_paths: tuple[Path, ...],
     preprocessing_pipeline: PreprocessingPipeline,
     destination: Path,
+    preprocessing_timing_by_source: dict[Path, dict[str, object]] | None = None,
 ) -> tuple[Path, dict[Path, Path], dict[Path, PreprocessingTile], dict[Path, Path]]:
     """Prepare inputs once and keep only temporary prepared/rectified files for prediction and overlays."""
     from PIL import Image
@@ -347,7 +498,8 @@ def _stage_preprocessed_inputs(
     preprocessing_tile_by_staged_path: dict[Path, PreprocessingTile] = {}
     preview_path_by_source: dict[Path, Path] = {}
     for source_index, source_path in enumerate(source_paths):
-        prepared_images, rectified_image = preprocessing_pipeline.prepare_path_with_rectified(source_path)
+        staging_started = perf_counter_ns()
+        prepared_images, rectified_image, timing = preprocessing_pipeline.prepare_path_with_timing(source_path)
         preview_path = (preview_directory / f"{source_index:06d}.png").resolve()
         Image.fromarray(rectified_image, "RGB").save(preview_path)
         preview_path_by_source[source_path] = preview_path
@@ -358,6 +510,11 @@ def _stage_preprocessed_inputs(
             Image.fromarray(prepared.image_rgb, "RGB").save(staged_path)
             source_path_by_staged_path[staged_path] = source_path
             preprocessing_tile_by_staged_path[staged_path] = prepared.tile
+        if preprocessing_timing_by_source is not None:
+            timing["staging_io_ms"] = (perf_counter_ns() - staging_started) / 1_000_000 - float(
+                timing["preprocess_compute_ms"]
+            )
+            preprocessing_timing_by_source[source_path] = timing
     return prepared_directory, source_path_by_staged_path, preprocessing_tile_by_staged_path, preview_path_by_source
 
 
@@ -430,6 +587,7 @@ def run(run_directory: Path, input_path: Path) -> int:
         pixel_threshold,
         inspection_region_metadata(inspection_region),
         expected_score_semantic=expected_score_semantic,
+        decision_revision_id=active_revision.revision_path.stem if active_revision is not None else "calibrated",
         inspection_processor=inspection_processor,
         preprocessing_pipeline=preprocessing_pipeline,
     )
@@ -469,6 +627,7 @@ def run(run_directory: Path, input_path: Path) -> int:
         from anomalib.data import PredictDataset
 
         dataset = PredictDataset(input_path, transform=inspection_processor)
+        prediction_writer.start_prediction_timing()
         components["engine"].predict(
             model=components["model"],
             dataloaders=_create_prediction_loader(dataset, str(components["device"])),
@@ -479,18 +638,26 @@ def run(run_directory: Path, input_path: Path) -> int:
         from anomalib.data import PredictDataset
 
         with TemporaryDirectory(prefix="aigaikan-preprocessing-v2-") as temporary_directory:
+            preprocessing_timing_by_source: dict[Path, dict[str, object]] = {}
             (
                 prepared_directory,
                 source_path_by_staged_path,
                 preprocessing_tile_by_staged_path,
                 preview_path_by_source,
-            ) = _stage_preprocessed_inputs(source_paths, preprocessing_pipeline, Path(temporary_directory))
+            ) = _stage_preprocessed_inputs(
+                source_paths,
+                preprocessing_pipeline,
+                Path(temporary_directory),
+                preprocessing_timing_by_source,
+            )
             collector.configure_preprocessed_inputs(
                 source_path_by_staged_path,
                 preprocessing_tile_by_staged_path,
                 preview_path_by_source,
+                preprocessing_timing_by_source,
             )
             dataset = PredictDataset(prepared_directory)
+            prediction_writer.start_prediction_timing()
             components["engine"].predict(
                 model=components["model"],
                 dataloaders=_create_prediction_loader(dataset, str(components["device"])),
@@ -499,6 +666,21 @@ def run(run_directory: Path, input_path: Path) -> int:
             )
     collector.finalize()
     ResultParser().export_predictions_csv(output_directory / "predictions.csv", collector.predictions)
+    timing_values = [
+        float(prediction.timing_metadata["inference_total_ms"])
+        for prediction in collector.predictions
+        if prediction.timing_metadata.get("inference_total_ms") is not None
+    ]
+    timing_summary = timing_percentiles(timing_values) if timing_values else {}
+    manifest_path = output_directory / "inference_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["timing"] = {
+        "timing_record_version": 1,
+        "per_image": [prediction.timing_metadata for prediction in collector.predictions],
+        "summary": timing_summary,
+        "batch_mode": "explicit_loader_batch_wall_and_amortized_per_image",
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
     emit({"type": "completed", "result_dir": str(output_directory)})
     return 0
 
@@ -520,6 +702,33 @@ def main() -> int:
             }
         )
         return 1
+
+
+def _optional_timing(value: object) -> float | None:
+    if value is None:
+        return None
+    result = float(value)
+    return result if result >= 0 else None
+
+
+def _timing_size(value: object, source_path: Path | None, fallback: tuple[int, int] = (0, 0)) -> tuple[int, int]:
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        return int(value[0]), int(value[1])
+    if source_path is not None:
+        try:
+            from PIL import Image
+
+            with Image.open(source_path) as image:
+                return image.size
+        except OSError:
+            pass
+    return fallback
+
+
+def _prediction_batch_size(output: Any) -> int:
+    batch = output.output if hasattr(output, "output") else output
+    paths = batch.get("image_path") if isinstance(batch, dict) else getattr(batch, "image_path", None)
+    return len(paths) if isinstance(paths, (list, tuple)) else 1
 
 
 if __name__ == "__main__":

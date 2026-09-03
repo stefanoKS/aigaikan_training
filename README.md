@@ -167,7 +167,61 @@ AUROC and F1 are supplementary ranking metrics. An escaped NG is always treated 
 
 ## Model export
 
-Export is blocked for every default model until it reaches `TORCH_EXPORT_VALIDATED`; the interface does not treat an unverified export as deployable. Once a model passes that evidence gate, export uses the manifest-verified canonical checkpoint rather than the newest file in a folder and packages its own `canonical_checkpoint.ckpt` with a relative manifest reference. OpenVINO exports must include both the `.xml` graph and `.bin` weights file. The package includes configuration, environment report, dataset/calibration/final-test/run manifests, `inspection_region.json`, result report, validation sidecars, and `deployment_manifest.json` hashes. Deployment validation requires exact decision parity and format-specific image-score parity (Torch: `0.0001`; ONNX/OpenVINO: `0.001`) against stored final-test predictions, using the same fixed ROI and reconstructed valid-map v3 scoring as the application. This is Anomalib deployment evidence only; it is not compatibility evidence for the separate AIGAIKAN runtime or defect-detection evidence when genuine NG test data is absent.
+Export is blocked for every default model until it reaches `TORCH_EXPORT_VALIDATED`; the interface does not treat an unverified export as deployable. **No default model is currently Torch-export validated.** PatchCore, PaDiM, and both Dinomaly profiles are training-validated only; AnomalyDINO, SuperADD, EfficientAD, and SuperSimpleNet remain experimental. The blocker is missing demonstrated real Anomalib export, reload, map, score, and decision-parity evidence for the exact model/configuration. No registry flag is changed by this repository work.
+
+Once a model passes that separate evidence gate, a Torch package uses the manifest-verified canonical checkpoint rather than the newest file in a folder and packages `canonical_checkpoint.ckpt`, `deployment_manifest.json`, `decision_policy.json`, `preprocessing_plan.json`, `inspection_region.json`, `preprocessing.json`, `environment.json`, `config.json`, the Torch artifact, validation report, reference runners, and golden preprocessing vectors. Every referenced artifact has a SHA-256 recorded in the manifest. Contract version 3 adds the sidecar decision policy; version 2 manifests can be read for migration/audit but fail closed for production reference inference because they have no explicit decision policy.
+
+`decision_policy.json` is authoritative for the image decision. It is independent from Anomalib's embedded thresholds and uses the unchanged rule `score >= threshold -> NG`. Thresholds are finite but are not restricted to $[0,1]$ because SuperADD distance scores may legitimately exceed one:
+
+```json
+{
+	"decision_policy_version": 1,
+	"threshold": 1.7,
+	"comparator": ">=",
+	"above_or_equal_label": "NG",
+	"below_label": "OK",
+	"score_semantic": "superadd_native_top_quantile_score_v1",
+	"source": "operator_override",
+	"base_calibrated_threshold": 0.7,
+	"revision_id": "threshold-003",
+	"operator_note": "line trial",
+	"model_sha256": "...",
+	"preprocessing_plan_sha256": "..."
+}
+```
+
+The Results page keeps calibrated and active deployment thresholds separate from the proposed operator value. Preview uses persisted validation/final-test scores only, reports OK-to-NG and NG-to-OK changes plus measurable false-reject/recall values, and warns when an operator threshold lies beyond calibration observations. Saving creates and atomically activates an immutable `threshold-NNN` revision with the operator note; it preserves continuous maps and heatmaps. A pixel threshold remains independent and changes only binary masks and contour overlays. The Inference page calls its post-result copy filter **NG image copy filter**; it never changes the deployment policy or prediction labels.
+
+The metadata-driven in-memory reference runner accepts raw RGB arrays without temporary PNG staging, verifies package checksums, applies saved ROI -> image profile -> padding/tiling -> model transform order, resolves the same semantic-safe decision score as training/inference/export validation, and keeps pixel masks independent:
+
+```powershell
+python scripts\deployment_reference_inference.py --package path\to\deployment --input frame.png --output result.json --device cpu
+```
+
+`result.json` contains the score, score semantic/source, decision, and versioned timing record. Run the batch-one benchmark separately; it excludes artifact saving from model latency and reports P50/P95/P99/maximum/throughput after 10 warm-ups and 100 measured frames by default:
+
+```powershell
+python scripts\benchmark_deployment_reference.py --package path\to\deployment --input frames --output benchmark.json
+```
+
+Example timing payload:
+
+```json
+{
+	"timing_record_version": 1,
+	"preprocess_compute_ms": 1.42,
+	"model_forward_ms": 4.83,
+	"application_postprocess_ms": 0.31,
+	"inference_total_ms": 5.14,
+	"artifact_io_ms": 2.02,
+	"end_to_end_ms": 7.16,
+	"batch_size": 1,
+	"tile_count": 1,
+	"warmup_status": "not_warmed"
+}
+```
+
+The existing temporary-PNG trainer inference path remains available for compatibility and records `staging_io_ms` separately. It reports batch wall time and amortized per-image time; true batch-one timing is recorded only when a real batch contains one image. CUDA reference timing uses synchronized CUDA events when a CUDA runner is selected. This is Anomalib deployment evidence only; it is not compatibility evidence for the separate AIGAIKAN runtime or defect-detection evidence when genuine NG test data is absent.
 
 ## Reevaluation without retraining
 

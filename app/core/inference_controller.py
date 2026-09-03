@@ -84,26 +84,7 @@ class InferenceController(QObject):
                     int(message.payload.get("total", 0)),
                 )
             elif message.type == "prediction":
-                self.prediction_emitted.emit(
-                    PredictionResult(
-                        source_path=str(message.payload.get("source_path", "")),
-                        predicted_label=str(message.payload.get("predicted_label", "")),
-                        ground_truth_label=str(message.payload.get("ground_truth_label", "Unknown")),
-                        anomaly_score=float(message.payload.get("anomaly_score", 0.0)),
-                        threshold=float(message.payload.get("threshold", 0.0)),
-                        original_image=str(message.payload.get("original_image", "")),
-                        anomaly_map=str(message.payload.get("anomaly_map", "")),
-                        overlay_image=str(message.payload.get("overlay_image", "")),
-                        binary_mask=str(message.payload.get("binary_mask", "")),
-                        raw_image_score=_optional_float(message.payload.get("raw_image_score")),
-                        raw_score_semantic=str(message.payload.get("raw_score_semantic", "")),
-                        raw_anomaly_map=str(message.payload.get("raw_anomaly_map", "")),
-                        postprocessed_image_score=_optional_float(message.payload.get("postprocessed_image_score")),
-                        postprocessed_score_semantic=str(message.payload.get("postprocessed_score_semantic", "")),
-                        postprocessed_anomaly_map=str(message.payload.get("postprocessed_anomaly_map", "")),
-                        prediction_contract_version=int(message.payload.get("prediction_contract_version", 0)),
-                    )
-                )
+                self.prediction_emitted.emit(PredictionResult.from_dict(message.payload))
             elif message.type == "completed":
                 self.completed.emit(str(message.payload.get("result_dir", "")))
             elif message.type == "error":

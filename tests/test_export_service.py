@@ -210,6 +210,7 @@ def test_export_model_uses_configured_formats_native_preprocessing_and_names(tmp
     assert (report.package_directory / "inspection_region.json").is_file()
     assert (report.package_directory / "preprocessing.json").is_file()
     assert (report.package_directory / "reference_runner" / "run_preprocessing_reference.py").is_file()
+    assert (report.package_directory / "reference_runner" / "deployment_reference_inference.py").is_file()
     assert (report.package_directory / "reference_runner" / "golden_vectors.json").is_file()
     assert (report.package_directory / "canonical_checkpoint.ckpt").read_text(encoding="utf-8") == "checkpoint"
     assert (report.package_directory / "active_threshold_revision.json").is_file()
@@ -232,11 +233,17 @@ def test_export_model_uses_configured_formats_native_preprocessing_and_names(tmp
     assert deployment_manifest["threshold_metadata"]["threshold_revision"] == "threshold-001"
     assert deployment_manifest["anomalib_version"] == "2.6.0"
     assert deployment_manifest["deployment_contract_version"] == DEPLOYMENT_CONTRACT_VERSION
+    assert deployment_manifest["trainer_version"]
+    assert deployment_manifest["torch_export_type"] == "torch"
+    assert deployment_manifest["runtime_versions"]["torch"]
     assert deployment_manifest["canonical_checkpoint"] == "canonical_checkpoint.ckpt"
     assert deployment_manifest["format_score_tolerances"] == FORMAT_SCORE_TOLERANCES
     assert deployment_manifest["inspection_preprocessing"]["metadata_sha256"] == inspection_region_hash(inspection_region)
     assert deployment_manifest["preprocessing_contract"]["image_preprocessing_file"] == "preprocessing.json"
     assert deployment_manifest["preprocessing_contract"]["image_preprocessing"]["schema_version"] == 1
+    assert deployment_manifest["input_contract"]["color_order"] == "RGB"
+    assert deployment_manifest["decision_policy"]["file"] == "decision_policy.json"
+    assert (report.package_directory / "decision_policy.json").is_file()
     standalone_preprocessing = json.loads((report.package_directory / "preprocessing.json").read_text(encoding="utf-8"))
     assert standalone_preprocessing["implementation"]["component"] == "app.core.image_preprocessor.ImagePreprocessor"
     runner = report.package_directory / "reference_runner" / "run_preprocessing_reference.py"
@@ -248,6 +255,37 @@ def test_export_model_uses_configured_formats_native_preprocessing_and_names(tmp
         timeout=30,
     )
     assert runner_result.returncode == 0, runner_result.stderr
+    deployment_runner = report.package_directory / "reference_runner" / "deployment_reference_inference.py"
+    deployment_runner_result = subprocess.run(
+        [sys.executable, str(deployment_runner), "--help"],
+        cwd=deployment_runner.parent,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert deployment_runner_result.returncode == 0, deployment_runner_result.stderr
+    benchmark_runner = report.package_directory / "reference_runner" / "benchmark_deployment_reference.py"
+    benchmark_runner_result = subprocess.run(
+        [sys.executable, str(benchmark_runner), "--help"],
+        cwd=benchmark_runner.parent,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert benchmark_runner_result.returncode == 0, benchmark_runner_result.stderr
+
+    revised_package = ExportService().create_deployment_policy_revision(
+        report.package_directory,
+        export_directory,
+        1.7,
+        "line override",
+    )
+    revised_policy = json.loads((revised_package / "decision_policy.json").read_text(encoding="utf-8"))
+    revised_manifest = json.loads((revised_package / "deployment_manifest.json").read_text(encoding="utf-8"))
+    assert revised_policy["threshold"] == 1.7
+    assert revised_policy["source"] == "operator_override"
+    assert revised_policy["model_sha256"] == deployment_manifest["exports"][1]["sha256"]
+    assert revised_manifest["decision_policy"]["sha256"] != deployment_manifest["decision_policy"]["sha256"]
     assert deployment_manifest["model"]["profile"]["preprocessing"] == "anomalib-native"
     assert deployment_manifest["exports"][0]["validation"]["maximum_score_delta"] == 0.0
     validation_report = json.loads(report.exported[0].validation_report.read_text(encoding="utf-8"))
@@ -407,6 +445,93 @@ def test_deployment_validation_uses_the_v3_reconstructed_map_score(tmp_path: Pat
     assert report["status"] == "PASS"
     assert getattr(received_images[0], "shape") == (*reversed(pipeline.plan.model_input_size), 3)
     assert len(received_images) == 3
+
+
+def test_deployment_validation_uses_non_tiled_native_score_not_anomaly_map(tmp_path: Path, monkeypatch) -> None:
+    class FakeTorchInferencer:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def predict(self, _image: object) -> dict[str, object]:
+            return {"pred_score": 0.3, "anomaly_map": np.full((5, 7), 0.9, dtype=np.float32)}
+
+    anomalib_deploy = ModuleType("anomalib.deploy")
+    anomalib_deploy.TorchInferencer = FakeTorchInferencer
+    monkeypatch.setitem(sys.modules, "anomalib.deploy", anomalib_deploy)
+    source_path = tmp_path / "final_test_ok.png"
+    from PIL import Image
+
+    Image.new("RGB", (7, 5), (20, 30, 40)).save(source_path)
+    pipeline = PreprocessingPipeline(InspectionRegionConfig(), PreprocessingConfig().resolve("patchcore", (7, 5)))
+    expected = PredictionResult(
+        source_path=str(source_path),
+        predicted_label="OK",
+        ground_truth_label="OK",
+        anomaly_score=0.3,
+        threshold=0.5,
+        score_semantic="anomalib_postprocessed_pred_score_v1",
+        dataset_role="final_test_ok",
+    )
+
+    report = ExportService._validate_deployment(
+        Path("model.pt"),
+        "torch",
+        [expected],
+        threshold=0.5,
+        preprocessing_pipeline=pipeline,
+        threshold_semantic="anomalib_postprocessed_pred_score_v1",
+    )
+
+    assert report["status"] == "PASS"
+
+
+def test_deployment_validation_uses_superadd_raw_native_score_and_rejects_semantic_mismatch(tmp_path: Path, monkeypatch) -> None:
+    class FakeTorchInferencer:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def predict(self, _image: object) -> dict[str, object]:
+            return {
+                "pred_score": 1.0,
+                "raw_pred_score": 1.7,
+                "anomaly_map": np.full((448, 448), 0.4, dtype=np.float32),
+            }
+
+    anomalib_deploy = ModuleType("anomalib.deploy")
+    anomalib_deploy.TorchInferencer = FakeTorchInferencer
+    monkeypatch.setitem(sys.modules, "anomalib.deploy", anomalib_deploy)
+    source_path = tmp_path / "final_test_ng.png"
+    from PIL import Image
+
+    Image.new("RGB", (3, 2), (20, 30, 40)).save(source_path)
+    pipeline = PreprocessingPipeline(InspectionRegionConfig(), PreprocessingConfig().resolve("super_add", (3, 2)))
+    expected = PredictionResult(
+        source_path=str(source_path),
+        predicted_label="NG",
+        ground_truth_label="NG",
+        anomaly_score=1.7,
+        threshold=1.5,
+        score_semantic="superadd_native_top_quantile_score_v1",
+        dataset_role="final_test_ng",
+    )
+
+    assert ExportService._validate_deployment(
+        Path("model.pt"),
+        "torch",
+        [expected],
+        threshold=1.5,
+        preprocessing_pipeline=pipeline,
+        threshold_semantic="superadd_native_top_quantile_score_v1",
+    )["status"] == "PASS"
+    with pytest.raises(ValueError, match="does not match"):
+        ExportService._validate_deployment(
+            Path("model.pt"),
+            "torch",
+            [expected],
+            threshold=1.5,
+            preprocessing_pipeline=pipeline,
+            threshold_semantic="anomalib_postprocessed_pred_score_v1",
+        )
 
 
 def test_deployment_validation_preserves_legacy_v2_map_score_semantics(tmp_path: Path, monkeypatch) -> None:

@@ -30,6 +30,7 @@ class ResultsPage(QWidget):
     """Training results UI."""
 
     threshold_revision_requested = Signal(str, float, bool, float)
+    decision_preview_requested = Signal(float)
 
     def __init__(self) -> None:
         super().__init__()
@@ -92,9 +93,12 @@ class ResultsPage(QWidget):
         export_form.addRow("", self.export_model_button)
         root.addWidget(export_group)
 
-        revision_group = QGroupBox("Decision Threshold Revision")
+        revision_group = QGroupBox("Deployment Decision Revision")
         revision_form = QFormLayout(revision_group)
         self.threshold_revision_combo = QComboBox()
+        self.calibrated_threshold_label = QLabel("Not available")
+        self.active_deployment_threshold_label = QLabel("Not available")
+        self.decision_score_semantic_label = QLabel("Not available")
         self.image_threshold_spin = QDoubleSpinBox()
         self.image_threshold_spin.setRange(-1_000_000_000.0, 1_000_000_000.0)
         self.image_threshold_spin.setDecimals(6)
@@ -104,14 +108,27 @@ class ResultsPage(QWidget):
         self.revision_pixel_threshold_spin.setRange(-1_000_000_000.0, 1_000_000_000.0)
         self.revision_pixel_threshold_spin.setDecimals(6)
         self.revision_pixel_threshold_spin.setSingleStep(0.01)
+        self.operator_note_edit = QLineEdit()
+        self.operator_note_edit.setPlaceholderText("Optional operator note")
         pixel_row = QHBoxLayout()
         pixel_row.addWidget(self.revision_pixel_mask_check)
         pixel_row.addWidget(self.revision_pixel_threshold_spin)
         pixel_row.addStretch(1)
         self.apply_threshold_revision_button = QPushButton("Apply Threshold Revision")
+        self.preview_threshold_effect_button = QPushButton("Preview Effect")
+        self.threshold_preview_label = QLabel("Preview uses persisted scores and does not run the model.")
+        self.threshold_preview_label.setObjectName("ModelSupport")
+        self.threshold_preview_label.setWordWrap(True)
+        self.apply_threshold_revision_button = QPushButton("Save and Activate Decision Revision")
         revision_form.addRow("Revision", self.threshold_revision_combo)
-        revision_form.addRow("Image Threshold", self.image_threshold_spin)
-        revision_form.addRow("Pixel Threshold", pixel_row)
+        revision_form.addRow("Calibrated NG Threshold", self.calibrated_threshold_label)
+        revision_form.addRow("Active Deployment NG Score Threshold", self.active_deployment_threshold_label)
+        revision_form.addRow("Proposed Deployment NG Score Threshold", self.image_threshold_spin)
+        revision_form.addRow("Score Semantic", self.decision_score_semantic_label)
+        revision_form.addRow("Operator Note", self.operator_note_edit)
+        revision_form.addRow("Pixel Mask Threshold", pixel_row)
+        revision_form.addRow("Preview Effect", self.preview_threshold_effect_button)
+        revision_form.addRow(self.threshold_preview_label)
         revision_form.addRow("", self.apply_threshold_revision_button)
         root.addWidget(revision_group)
 
@@ -161,7 +178,7 @@ class ResultsPage(QWidget):
         ):
             label = QLabel("Not available")
             self.metric_labels[key] = label
-            metrics_form.addRow(key, label)
+            metrics_form.addRow("Deployment NG Score Threshold" if key == "Threshold" else key, label)
         splitter.addWidget(metrics_group)
 
         right_column = QWidget()
@@ -197,6 +214,9 @@ class ResultsPage(QWidget):
         self._predictions: list[PredictionResult] = []
         self.filter_combo.currentTextChanged.connect(self._apply_prediction_filter)
         self.revision_pixel_mask_check.toggled.connect(self.revision_pixel_threshold_spin.setEnabled)
+        self.preview_threshold_effect_button.clicked.connect(
+            lambda: self.decision_preview_requested.emit(self.image_threshold_spin.value())
+        )
         self.apply_threshold_revision_button.clicked.connect(self._request_threshold_revision)
         self._set_threshold_revision_enabled(False)
 
@@ -317,6 +337,18 @@ class ResultsPage(QWidget):
         else:
             self.revision_pixel_mask_check.setChecked(False)
             self.revision_pixel_threshold_spin.setValue(0.5)
+        try:
+            calibrated = float(run.threshold_metadata.get("threshold_raw", threshold))
+            self.calibrated_threshold_label.setText(f"{calibrated:.6g}")
+        except (TypeError, ValueError):
+            self.calibrated_threshold_label.setText("Not available")
+        try:
+            self.active_deployment_threshold_label.setText(f"{float(threshold):.6g}")
+        except (TypeError, ValueError):
+            self.active_deployment_threshold_label.setText("Not available")
+        self.decision_score_semantic_label.setText(str(run.threshold_metadata.get("score_semantic", "Not available")))
+        self.operator_note_edit.clear()
+        self.threshold_preview_label.setText("Preview uses persisted scores and does not run the model.")
 
     def _set_threshold_revision_enabled(self, enabled: bool) -> None:
         self.threshold_revision_combo.setEnabled(enabled)
@@ -324,6 +356,8 @@ class ResultsPage(QWidget):
         self.revision_pixel_mask_check.setEnabled(enabled)
         self.revision_pixel_threshold_spin.setEnabled(enabled and self.revision_pixel_mask_check.isChecked())
         self.apply_threshold_revision_button.setEnabled(enabled)
+        self.preview_threshold_effect_button.setEnabled(enabled)
+        self.operator_note_edit.setEnabled(enabled)
 
     def _request_threshold_revision(self) -> None:
         self.threshold_revision_requested.emit(
@@ -358,7 +392,38 @@ class ResultsPage(QWidget):
         self.metric_labels["Pixel Mask Threshold"].setText(
             self._format_value(pixel_threshold) if pixel_threshold is not None else "Disabled"
         )
+        self.active_deployment_threshold_label.setText(self._format_value(image_threshold))
         self._apply_prediction_filter()
+
+    def operator_note(self) -> str:
+        """Return the note persisted in an operator-created deployment decision revision."""
+        return self.operator_note_edit.text().strip()
+
+    def display_decision_preview(self, preview: object) -> None:
+        """Render a persisted-score threshold preview without presenting it as model inference."""
+        calibrated = getattr(preview, "calibrated_threshold", None)
+        active = getattr(preview, "active_threshold", None)
+        proposed = getattr(preview, "proposed_threshold", None)
+        semantic = str(getattr(preview, "score_semantic", "Not available"))
+        self.calibrated_threshold_label.setText(self._format_value(calibrated))
+        self.active_deployment_threshold_label.setText(self._format_value(active))
+        self.decision_score_semantic_label.setText(semantic)
+        details = [
+            f"Existing {self._format_value(active)} -> proposed {self._format_value(proposed)}",
+            f"OK->NG changes: {getattr(preview, 'ok_to_ng_changes', 0)}",
+            f"NG->OK changes: {getattr(preview, 'ng_to_ok_changes', 0)}",
+        ]
+        false_reject = getattr(preview, "false_reject_rate", None)
+        ng_recall = getattr(preview, "ng_recall", None)
+        if false_reject is not None:
+            details.append(f"False-reject rate: {float(false_reject):.2%}")
+        if ng_recall is not None:
+            details.append(f"NG recall: {float(ng_recall):.2%}")
+        if getattr(preview, "outside_calibration_range", False):
+            details.append("Warning: proposed threshold is outside observed calibration score range.")
+        if "superadd" in semantic.casefold():
+            details.append("Warning: SuperADD scores are distance values, not probabilities.")
+        self.threshold_preview_label.setText(" | ".join(details))
 
     def displayed_predictions(self) -> list[PredictionResult]:
         """Return all predictions for the currently displayed canonical run or threshold revision."""

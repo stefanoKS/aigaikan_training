@@ -74,6 +74,8 @@ def test_threshold_revision_regenerates_labels_and_masks_without_model_inference
                     postprocessed_score_semantic="anomalib_postprocessed_pred_score_v1",
                     postprocessed_anomaly_map=artifacts.continuous_anomaly_map,
                     continuous_anomaly_map=artifacts.continuous_anomaly_map,
+                    anomaly_map=artifacts.heatmap_image,
+                    overlay_image=artifacts.overlay_image,
                 )
             ],
         ),
@@ -98,9 +100,33 @@ def test_threshold_revision_regenerates_labels_and_masks_without_model_inference
     assert result.revision_path.name == "threshold-001.json"
     assert revised.predicted_label == "OK"
     assert revised.threshold == 0.8
+    assert revised.anomaly_score == 0.7
+    assert revised.continuous_anomaly_map == artifacts.continuous_anomaly_map
+    assert revised.anomaly_map == artifacts.heatmap_image
+    assert revised.overlay_image == artifacts.overlay_image
     assert np.array_equal(np.asarray(Image.open(revised.binary_mask)), np.array([[0, 0], [0, 255]], dtype=np.uint8))
     assert active is not None and active.revision_path == result.revision_path
     assert (tmp_path / "results.json").read_bytes() == canonical_results
+
+    decision_only = service.create_revision(
+        tmp_path,
+        ImageThresholdOperatingPoint(0.75),
+        operator_note="line adjustment",
+    )
+    decision_only_prediction = ResultParser().read_predictions_csv(decision_only.predictions_path)[0]
+    preview = service.preview_decision_threshold(tmp_path, 0.65, "anomalib_postprocessed_pred_score_v1")
+    decision_payload = json.loads(decision_only.revision_path.read_text(encoding="utf-8"))
+
+    assert decision_only_prediction.anomaly_score == revised.anomaly_score
+    assert decision_only_prediction.continuous_anomaly_map == revised.continuous_anomaly_map
+    assert decision_only_prediction.anomaly_map == revised.anomaly_map
+    assert decision_only_prediction.overlay_image == revised.overlay_image
+    assert decision_only_prediction.binary_mask == revised.binary_mask
+    assert decision_only_prediction.decision_revision_id == "threshold-002"
+    assert decision_payload["source"] == "operator_override"
+    assert decision_payload["operator_note"] == "line adjustment"
+    assert preview.score_semantic == "anomalib_postprocessed_pred_score_v1"
+    assert preview.calibrated_threshold == 0.5
 
     reactivated = service.activate_revision(tmp_path, "threshold-001")
 

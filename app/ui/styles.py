@@ -159,6 +159,11 @@ QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QTextEdit, QPlainTextEdit {
 QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus, QTextEdit:focus, QPlainTextEdit:focus {
     border: 2px solid #35ddcf;
 }
+QSpinBox:disabled, QDoubleSpinBox:disabled {
+    background: #151a1c;
+    border-color: #293437;
+    color: #718083;
+}
 QComboBox::drop-down {
     border: 0;
     width: 28px;
@@ -246,6 +251,10 @@ QCheckBox {
     color: #e7eff0;
     spacing: 7px;
 }
+QRadioButton {
+    color: #e7eff0;
+    spacing: 7px;
+}
 QCheckBox::indicator {
     background: #101518;
     border: 1px solid #405a5e;
@@ -254,6 +263,17 @@ QCheckBox::indicator {
     width: 16px;
 }
 QCheckBox::indicator:checked {
+    background: #32d6c7;
+    border-color: #32d6c7;
+}
+QRadioButton::indicator {
+    background: #101518;
+    border: 1px solid #405a5e;
+    border-radius: 8px;
+    height: 16px;
+    width: 16px;
+}
+QRadioButton::indicator:checked {
     background: #32d6c7;
     border-color: #32d6c7;
 }

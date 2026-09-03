@@ -427,10 +427,12 @@ def _stage_preprocessed_masks(
         grouped.setdefault(staged_image.source_path, []).append(staged_image)
     mapping: dict[Path, Path] = {}
     for source_path, images in grouped.items():
-        matches = [mask_path for mask_path in source_masks if source_path.stem in mask_path.stem]
-        if len(matches) != 1:
+        matches = _matching_masks(source_path, source_masks)
+        if not matches:
             continue
-        prepared_masks = preprocessing_pipeline.prepare_mask_path(matches[0])
+        mask_path = _require_one_matching_mask(source_path, matches)
+        _validate_mask_dimensions(source_path, mask_path)
+        prepared_masks = preprocessing_pipeline.prepare_mask_path(mask_path)
         destination.mkdir(parents=True, exist_ok=True)
         for staged_image in images:
             tile = staged_image.preprocessing_tile
@@ -438,7 +440,7 @@ def _stage_preprocessed_masks(
                 raise ValueError("Preprocessed mask staging requires tile provenance.")
             staged_mask_path = (destination / staged_image.staged_path.name).resolve()
             Image.fromarray(prepared_masks[tile.index]).save(staged_mask_path)
-            mapping[matches[0]] = staged_mask_path
+            mapping[mask_path] = staged_mask_path
     return mapping
 
 
@@ -456,14 +458,41 @@ def _stage_matching_masks(
     ]
     mapping: dict[Path, Path] = {}
     for ng_source, staged_ng_path in staged_ng_paths.items():
-        matches = [mask_path for mask_path in source_masks if ng_source.stem in mask_path.stem]
-        if len(matches) != 1:
+        matches = _matching_masks(ng_source, source_masks)
+        if not matches:
             continue
+        mask_path = _require_one_matching_mask(ng_source, matches)
+        _validate_mask_dimensions(ng_source, mask_path)
         destination.mkdir(parents=True, exist_ok=True)
         staged_mask_path = destination / staged_ng_path.name
-        shutil.copy2(matches[0], staged_mask_path)
-        mapping[matches[0]] = staged_mask_path
+        shutil.copy2(mask_path, staged_mask_path)
+        mapping[mask_path] = staged_mask_path
     return mapping
+
+
+def _matching_masks(source_path: Path, masks: Iterable[Path]) -> list[Path]:
+    """Return exact documented mask names: ``image.ext`` or ``image_mask.ext`` only."""
+    allowed_stems = {source_path.stem.casefold(), f"{source_path.stem}_mask".casefold()}
+    return [mask for mask in masks if mask.stem.casefold() in allowed_stems]
+
+
+def _require_one_matching_mask(source_path: Path, matches: list[Path]) -> Path:
+    if len(matches) == 1:
+        return matches[0]
+    names = ", ".join(path.name for path in matches)
+    raise ValueError(
+        f"Ambiguous masks for {source_path.name}; provide exactly one of "
+        f"{source_path.name} or {source_path.stem}_mask.<extension>. Found: {names}"
+    )
+
+
+def _validate_mask_dimensions(source_path: Path, mask_path: Path) -> None:
+    with Image.open(source_path) as source, Image.open(mask_path) as mask:
+        if source.size != mask.size:
+            raise ValueError(
+                f"Mask dimensions for {mask_path.name} must match {source_path.name}: "
+                f"expected {source.size[0]}x{source.size[1]}, received {mask.size[0]}x{mask.size[1]}."
+            )
 
 
 def _staged_config(

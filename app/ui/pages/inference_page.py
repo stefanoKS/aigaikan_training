@@ -63,7 +63,15 @@ class InferencePage(QWidget):
         self.score_label = QLabel("-")
         self.prediction_label = QLabel("-")
         self.threshold_label = QLabel("-")
-        self.export_threshold_check = QCheckBox("Use custom export threshold")
+        self.calibrated_threshold_label = QLabel("-")
+        self.threshold_source_label = QLabel("-")
+        self.score_semantic_label = QLabel("-")
+        self.preprocessing_summary_label = QLabel("-")
+        self.preprocessing_summary_label.setWordWrap(True)
+        self.timing_preprocess_label = QLabel("-")
+        self.timing_inference_label = QLabel("-")
+        self.timing_end_to_end_label = QLabel("-")
+        self.export_threshold_check = QCheckBox("Use custom NG image copy filter")
         self.export_threshold_spin = QDoubleSpinBox()
         self.export_threshold_spin.setRange(-1_000_000_000.0, 1_000_000_000.0)
         self.export_threshold_spin.setDecimals(6)
@@ -82,7 +90,15 @@ class InferencePage(QWidget):
         summary_form.addRow("Anomaly Score", self.score_label)
         summary_form.addRow("Predicted Result", self.prediction_label)
         summary_form.addRow("Training Threshold", self.threshold_label)
-        summary_form.addRow("NG Export Threshold", export_threshold_row)
+        summary_form.addRow("Active Deployment NG Score Threshold", self.threshold_label)
+        summary_form.addRow("Calibrated NG Threshold", self.calibrated_threshold_label)
+        summary_form.addRow("Threshold Source / Revision", self.threshold_source_label)
+        summary_form.addRow("Decision Score Semantic", self.score_semantic_label)
+        summary_form.addRow("Saved Preprocessing", self.preprocessing_summary_label)
+        summary_form.addRow("Preprocessing Time", self.timing_preprocess_label)
+        summary_form.addRow("Inference Time", self.timing_inference_label)
+        summary_form.addRow("End-to-End Time", self.timing_end_to_end_label)
+        summary_form.addRow("NG image copy filter", export_threshold_row)
         summary_form.addRow("Status", self.status_label)
         root.addWidget(summary_group)
 
@@ -101,7 +117,7 @@ class InferencePage(QWidget):
 
         self.results_table = QTableWidget(0, 5)
         self.results_table.setHorizontalHeaderLabels(
-            ["Source", "Prediction", "Score", "Training Threshold", "Heat Map"]
+            ["Source", "Prediction", "Score", "Active Deployment NG Score Threshold", "Heat Map"]
         )
         self.results_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.results_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -138,11 +154,25 @@ class InferencePage(QWidget):
         self.export_threshold_check.toggled.connect(self._update_export_ng_controls)
         self.export_threshold_spin.valueChanged.connect(self._update_export_ng_controls)
 
-    def set_training_run(self, run_directory: Path, model_name: str, threshold: float | None = None) -> None:
+    def set_training_run(
+        self,
+        run_directory: Path,
+        model_name: str,
+        threshold: float | None = None,
+        *,
+        calibrated_threshold: float | None = None,
+        threshold_source: str = "",
+        score_semantic: str = "",
+        preprocessing_summary: str = "",
+    ) -> None:
         """Display the trained model selected for inference."""
         self.run_label.setText(run_directory.name)
         self.model_label.setText(model_name)
         self._trained_threshold = threshold
+        self.calibrated_threshold_label.setText(f"{calibrated_threshold:.6g}" if calibrated_threshold is not None else "-")
+        self.threshold_source_label.setText(threshold_source or "run manifest")
+        self.score_semantic_label.setText(score_semantic or "legacy unversioned")
+        self.preprocessing_summary_label.setText(preprocessing_summary or "Historical legacy preprocessing")
         self.export_threshold_check.setChecked(False)
         if threshold is not None:
             self.export_threshold_spin.setValue(threshold)
@@ -183,6 +213,9 @@ class InferencePage(QWidget):
         self.score_label.setText("-")
         self.prediction_label.setText("-")
         self.threshold_label.setText("-")
+        self.timing_preprocess_label.setText("-")
+        self.timing_inference_label.setText("-")
+        self.timing_end_to_end_label.setText("-")
         self._update_export_ng_controls()
         for label in self.preview_labels.values():
             label.clear()
@@ -251,6 +284,10 @@ class InferencePage(QWidget):
         self.score_label.setText(f"{prediction.anomaly_score:.6g}")
         self.prediction_label.setText(prediction.predicted_label)
         self.threshold_label.setText(f"{prediction.threshold:.6g}")
+        timing = prediction.timing_metadata
+        self.timing_preprocess_label.setText(self._timing_text(timing.get("preprocess_compute_ms")))
+        self.timing_inference_label.setText(self._timing_text(timing.get("inference_total_ms")))
+        self.timing_end_to_end_label.setText(self._timing_text(timing.get("end_to_end_ms")))
         self._set_preview("Original", prediction.original_image)
         self._set_preview("Overlay", prediction.overlay_image)
         self._set_preview("Mask", prediction.binary_mask)
@@ -269,6 +306,13 @@ class InferencePage(QWidget):
                 Qt.TransformationMode.SmoothTransformation,
             )
         )
+
+    @staticmethod
+    def _timing_text(value: object) -> str:
+        try:
+            return f"{float(value):.3f} ms"
+        except (TypeError, ValueError):
+            return "Not measured"
 
     @staticmethod
     def _multiline_source_path(source_path: str) -> str:

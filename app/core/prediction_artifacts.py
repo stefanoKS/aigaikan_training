@@ -134,6 +134,43 @@ def save_prediction_artifacts(
     )
 
 
+def save_mask_artifacts(
+    source_path: Path,
+    anomaly_map: Any,
+    output_directory: Path,
+    index: int,
+    *,
+    rectified_image: np.ndarray | None = None,
+    pixel_threshold: float | None = None,
+    valid_roi_mask: Any = None,
+) -> PredictionArtifacts:
+    """Write only a binary mask and contour when a revision changes pixel policy.
+
+    Continuous maps, heatmaps, overlays, and raw maps remain immutable when an
+    operator changes only a decision or pixel threshold.
+    """
+    if anomaly_map is None or pixel_threshold is None:
+        return PredictionArtifacts()
+    if not isfinite(pixel_threshold):
+        raise ValueError("Pixel threshold must be finite when creating a binary anomaly mask.")
+    values = _as_map_array(anomaly_map)
+    valid_mask = _valid_roi_mask(valid_roi_mask, values.shape)
+    output_directory.mkdir(parents=True, exist_ok=True)
+    binary_mask = np.logical_and(valid_mask, np.logical_and(np.isfinite(values), values >= pixel_threshold)).astype(np.uint8) * 255
+    mask_path = (output_directory / f"{index:04d}_binary_mask.png").resolve()
+    Image.fromarray(binary_mask, "L").save(mask_path)
+    original = _source_image(source_path, rectified_image)
+    contour_path = (output_directory / f"{index:04d}_contour_overlay.png").resolve()
+    _contour_overlay(original, binary_mask).save(contour_path)
+    return PredictionArtifacts(
+        binary_mask=str(mask_path),
+        contour_overlay_image=str(contour_path),
+        pixel_threshold=pixel_threshold,
+        pixel_threshold_comparator=PIXEL_THRESHOLD_COMPARATOR,
+        pixel_threshold_semantic=PIXEL_THRESHOLD_SEMANTIC,
+    )
+
+
 def _as_map_array(anomaly_map: Any) -> np.ndarray:
     values = anomaly_map.detach().cpu().numpy() if hasattr(anomaly_map, "detach") else np.asarray(anomaly_map)
     while values.ndim > 2:
@@ -158,6 +195,13 @@ def _normalize_for_display(values: np.ndarray, valid_mask: np.ndarray) -> np.nda
     """Clamp only a display copy so each rendered color has one stable meaning across a run."""
     normalized = np.clip(values.astype(np.float32), 0.0, 1.0)
     return np.where(np.logical_and(valid_mask, np.isfinite(normalized)), normalized, 0.0)
+
+
+def render_fixed_unit_interval_heatmap(anomaly_map: Any, valid_roi_mask: Any = None) -> np.ndarray:
+    """Return the standard RGBA heatmap array without changing continuous map values."""
+    values = _as_map_array(anomaly_map)
+    valid_mask = _valid_roi_mask(valid_roi_mask, values.shape)
+    return _heatmap(_normalize_for_display(values, valid_mask), valid_mask)
 
 
 def _heatmap(normalized: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:

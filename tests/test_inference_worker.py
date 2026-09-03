@@ -136,7 +136,18 @@ def test_folder_inference_streams_explicit_eight_item_batches(tmp_path: Path, mo
     assert "dataset" not in captured
     assert captured["return_predictions"] is False
     assert [message["current"] for message in messages if message["type"] == "progress"] == list(range(10))
-    assert len([message for message in messages if message["type"] == "prediction"]) == 9
+    prediction_messages = [message for message in messages if message["type"] == "prediction"]
+    assert len(prediction_messages) == 9
+    timing = prediction_messages[0]["timing_metadata"]
+    assert timing["timing_record_version"] == 1
+    assert timing["model_forward_ms"] is not None
+    assert timing["artifact_io_ms"] is not None
+    assert prediction_messages[0]["decision_revision_id"] == "calibrated"
+    inference_manifest = json.loads(
+        next((run_directory / "inference").glob("*/inference_manifest.json")).read_text(encoding="utf-8")
+    )
+    assert inference_manifest["timing"]["timing_record_version"] == 1
+    assert len(inference_manifest["timing"]["per_image"]) == 9
 
 
 def test_folder_inference_uses_anomalib_discovery_and_logs_selected_patchcore_run(tmp_path: Path, monkeypatch) -> None:

@@ -70,7 +70,7 @@ def main() -> int:
         settings_manager=settings_manager,
         project_manager=ProjectManager(settings_manager.default_projects_directory()),
     )
-    window.show()
+    window.showMaximized()
     return app.exec()
 
 

@@ -10,12 +10,14 @@ from PIL import Image
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
-from app.models.image_preprocessing import ColorMode, ImagePreprocessingConfig
+from app.models.image_preprocessing import ColorMode, ImagePreprocessingConfig, MorphologyOperation
 from app.models.inspection_region import InspectionRegionConfig
 from app.models.preprocessing_config import PreprocessingConfig
 from app.models.preprocessing_preview import PreprocessingPreviewState, PreviewSource
+from app.ui.main_window import MainWindow
 from app.ui.pages.preprocess_images_page import PreprocessImagesPage
 
 
@@ -134,4 +136,56 @@ def test_custom_preview_dimension_mismatch_never_stretches_the_saved_raw_roi(tmp
     assert page.preprocessed_preview_array is None
     assert not page.original_canvas._pixmap.isNull()
     assert "dimensions do not match" in page.status_label.text()
+    page.close()
+
+
+def test_custom_image_preprocessing_profile_is_not_mislabelled_as_grayscale_only(tmp_path: Path) -> None:
+    source = _image(tmp_path / "good.png", (20, 30, 40))
+    page = _page((source,))
+    custom_profile = ImagePreprocessingConfig(
+        profile_id="custom-v1",
+        color_mode=ColorMode.GRAYSCALE_REPLICATED_RGB,
+        gaussian_sigma=2.0,
+    )
+    page.set_context(
+        project_root=tmp_path,
+        preprocessing=PreprocessingConfig(image_preprocessing=custom_profile),
+        inspection_region=InspectionRegionConfig(),
+        model_id="patchcore",
+        project_good_paths=(source,),
+        preview_state=PreprocessingPreviewState(),
+    )
+
+    assert page.preset_combo.currentData() == "custom"
+    page.close()
+
+
+def test_narrow_layout_does_not_need_horizontal_scrolling(tmp_path: Path) -> None:
+    page = _page((_image(tmp_path / "good.png", (20, 30, 40)),))
+    scroll_area = MainWindow._create_page_scroll_area(page)
+    scroll_area.resize(560, 700)
+    scroll_area.show()
+    QApplication.processEvents()
+
+    assert page.minimumSizeHint().width() <= scroll_area.viewport().width()
+    assert scroll_area.horizontalScrollBarPolicy() is Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+    assert scroll_area.horizontalScrollBar().maximum() == 0
+
+    scroll_area.close()
+
+
+def test_inactive_numeric_controls_are_disabled_until_their_operation_is_selected(tmp_path: Path) -> None:
+    page = _page((_image(tmp_path / "good.png", (20, 30, 40)),))
+
+    assert not page.box_width_spin.isEnabled()
+    assert not page.gaussian_kernel_spin.isEnabled()
+    assert not page.disk_radius_spin.isEnabled()
+
+    page.smoothing_combo.setCurrentIndex(page.smoothing_combo.findData("gaussian_blur"))
+    page.gaussian_auto_kernel_check.setChecked(False)
+    page.morphology_combo.setCurrentIndex(page.morphology_combo.findData(MorphologyOperation.DISK_OPENING.value))
+
+    assert page.gaussian_kernel_spin.isEnabled()
+    assert page.disk_radius_spin.isEnabled()
+    assert page.disk_iterations_spin.isEnabled()
     page.close()
