@@ -9,6 +9,49 @@ from typing import Mapping
 PIXEL_OPERATING_POINT_VERSION = 1
 PIXEL_THRESHOLD_COMPARATOR = "greater_than_or_equal"
 PIXEL_THRESHOLD_SEMANTIC = "continuous_anomaly_map_gte_v1"
+IMAGE_OPERATING_POINT_VERSION = 1
+IMAGE_THRESHOLD_COMPARATOR = "greater_than_or_equal"
+IMAGE_THRESHOLD_SEMANTIC = "anomalib_postprocessed_pred_score_v1"
+
+
+@dataclass(frozen=True, slots=True)
+class ImageThresholdOperatingPoint:
+    """A versioned image decision threshold bound to one postprocessed score domain."""
+
+    threshold: float
+    score_semantic: str = IMAGE_THRESHOLD_SEMANTIC
+
+    def validate(self) -> None:
+        if not isfinite(self.threshold):
+            raise ValueError("Image threshold must be finite.")
+        if not self.score_semantic:
+            raise ValueError("Image threshold must declare its score semantic.")
+
+    def to_dict(self) -> dict[str, object]:
+        self.validate()
+        return {
+            "version": IMAGE_OPERATING_POINT_VERSION,
+            "threshold": self.threshold,
+            "comparator": IMAGE_THRESHOLD_COMPARATOR,
+            "score_semantic": self.score_semantic,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> "ImageThresholdOperatingPoint":
+        if payload.get("version") != IMAGE_OPERATING_POINT_VERSION:
+            raise ValueError("Unsupported image operating-point version.")
+        if payload.get("comparator") != IMAGE_THRESHOLD_COMPARATOR:
+            raise ValueError("Unsupported image threshold comparator.")
+        score_semantic = payload.get("score_semantic")
+        if not isinstance(score_semantic, str) or not score_semantic:
+            raise ValueError("Image threshold score semantic must be a non-empty string.")
+        try:
+            threshold = float(payload.get("threshold"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Image threshold must be finite.") from exc
+        result = cls(threshold=threshold, score_semantic=score_semantic)
+        result.validate()
+        return result
 
 
 @dataclass(frozen=True, slots=True)

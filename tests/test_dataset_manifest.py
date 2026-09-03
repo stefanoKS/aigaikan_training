@@ -13,6 +13,7 @@ from app.core.dataset_manifest import (
     stage_effective_split,
     validate_effective_split,
 )
+from app.core.prepared_data_cache import PreparedDataCache
 from app.core.preprocessing_pipeline import PreprocessingPipeline
 from app.models.dataset_config import DatasetConfig, DatasetRole
 from app.models.inspection_region import InspectionRegionConfig
@@ -171,3 +172,24 @@ def test_tiled_staging_retains_every_source_tile_provenance(tmp_path: Path) -> N
     assert set(tile.index for tile in staged.preprocessing_tile_by_staged_path.values()) == {0, 1, 2}
     assert len(staged.preprocessing_tile_by_staged_path) == len(staged.source_path_by_staged_path)
     assert all(Image.open(path).size == pipeline.plan.model_input_size for path in staged.source_path_by_staged_path)
+
+
+def test_preprocessed_staging_reuses_immutable_cache_entries_across_runs(tmp_path: Path) -> None:
+    config = _dataset_config(tmp_path)
+    for index in range(4):
+        _save_image(tmp_path / "ok_train" / f"ok_{index}.png", (index + 10, 0, 0))
+    split = build_effective_split(config, seed=42)
+    pipeline = PreprocessingPipeline(
+        InspectionRegionConfig(),
+        PreprocessingConfig().resolve("patchcore", (640, 480)),
+    )
+    cache = PreparedDataCache(tmp_path / "prepared_data_cache", pipeline)
+
+    first = stage_effective_split(split, config, tmp_path / "run-one" / "dataset_snapshot", pipeline, cache)
+    first_report = cache.report().to_dict()
+    second = stage_effective_split(split, config, tmp_path / "run-two" / "dataset_snapshot", pipeline, cache)
+    second_report = cache.report().to_dict()
+
+    assert first_report["misses"] == len(first.source_path_by_staged_path)
+    assert second_report["hits"] == len(first.source_path_by_staged_path)
+    assert all(path.is_file() for path in second.source_path_by_staged_path)

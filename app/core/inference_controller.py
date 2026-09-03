@@ -94,6 +94,14 @@ class InferenceController(QObject):
                         original_image=str(message.payload.get("original_image", "")),
                         anomaly_map=str(message.payload.get("anomaly_map", "")),
                         overlay_image=str(message.payload.get("overlay_image", "")),
+                        binary_mask=str(message.payload.get("binary_mask", "")),
+                        raw_image_score=_optional_float(message.payload.get("raw_image_score")),
+                        raw_score_semantic=str(message.payload.get("raw_score_semantic", "")),
+                        raw_anomaly_map=str(message.payload.get("raw_anomaly_map", "")),
+                        postprocessed_image_score=_optional_float(message.payload.get("postprocessed_image_score")),
+                        postprocessed_score_semantic=str(message.payload.get("postprocessed_score_semantic", "")),
+                        postprocessed_anomaly_map=str(message.payload.get("postprocessed_anomaly_map", "")),
+                        prediction_contract_version=int(message.payload.get("prediction_contract_version", 0)),
                     )
                 )
             elif message.type == "completed":
@@ -124,3 +132,10 @@ class InferenceController(QObject):
 
     def _handle_finished(self) -> None:
         self.running_changed.emit(False)
+
+
+def _optional_float(value: object) -> float | None:
+    """Parse optional worker values without treating an absent legacy field as zero."""
+    if value in (None, ""):
+        return None
+    return float(value)

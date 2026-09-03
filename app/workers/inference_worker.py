@@ -16,13 +16,21 @@ from lightning.pytorch.callbacks import BasePredictionWriter
 
 from app.core.inspection_region import InspectionRegionProcessor
 from app.core.prediction_artifacts import inspection_region_metadata, save_prediction_artifacts
-from app.core.prediction_adapter import PreprocessedPredictionAccumulator, iter_anomalib_predictions
+from app.core.prediction_adapter import (
+    ANOMALIB_POSTPROCESSED_SCORE_SEMANTIC,
+    ExplicitPredictionPostProcessor,
+    PreprocessedPredictionAccumulator,
+    iter_anomalib_predictions,
+)
+from app.core.prediction_contract import PREDICTION_CONTRACT_VERSION, RAW_SCORE_SEMANTIC
 from app.core.preprocessing_pipeline import PreprocessingPipeline
+from app.core.quality_metrics import FinalTestAcceptancePolicy, calculate_quality_metrics
 from app.core.result_parser import ResultParser
 from app.core.run_artifacts import (
     read_canonical_checkpoint,
     read_persisted_pixel_operating_point,
     read_persisted_threshold,
+    read_persisted_threshold_metadata,
     read_verified_inspection_region,
     read_verified_preprocessing_plan,
 )
@@ -30,6 +38,7 @@ from app.models.prediction_result import PredictionResult
 from app.models.preprocessing_config import PreprocessingTile
 from app.models.training_config import TrainingConfig
 from app.services.anomalib_service import AnomalibService
+from app.services.threshold_revision_service import ThresholdRevisionService
 
 INFERENCE_BATCH_SIZE = 8
 
@@ -86,6 +95,33 @@ def _create_prediction_loader(dataset: Any, device: str) -> Any:
     )
 
 
+def _final_test_quality_warning(
+    run_directory: Path,
+    config: TrainingConfig,
+    revision_predictions_path: Path | None = None,
+) -> str:
+    """Return an operator-visible warning when final-test evidence fails its acceptance policy."""
+    predictions_path = revision_predictions_path or run_directory / "results.json"
+    if not predictions_path.is_file():
+        return ""
+    predictions = (
+        ResultParser().read_predictions_csv(predictions_path)
+        if revision_predictions_path is not None
+        else ResultParser().read_training_run(predictions_path).predictions
+    )
+    if not predictions:
+        return ""
+    report = calculate_quality_metrics(
+        predictions,
+        FinalTestAcceptancePolicy(
+            maximum_false_reject_rate=config.maximum_final_test_false_reject_rate,
+            minimum_ok_test_images=config.minimum_final_test_ok_images,
+            minimum_ng_test_images=config.minimum_final_test_ng_images,
+        ),
+    )
+    return report.warning if report.status == "FAIL" else ""
+
+
 class InferenceResultCollector:
     """Convert streamed Anomalib batches into application results and JSON Lines events."""
 
@@ -97,6 +133,7 @@ class InferenceResultCollector:
         threshold: float,
         pixel_threshold: float | None,
         region_metadata: dict[str, object],
+        expected_score_semantic: str = "",
         inspection_processor: InspectionRegionProcessor | None = None,
         preprocessing_pipeline: PreprocessingPipeline | None = None,
     ) -> None:
@@ -104,6 +141,7 @@ class InferenceResultCollector:
         self._expected_paths = expected_paths
         self._visualizations_directory = visualizations_directory
         self._threshold = threshold
+        self._expected_score_semantic = expected_score_semantic
         self._pixel_threshold = pixel_threshold
         self._region_metadata = region_metadata
         self._inspection_processor = inspection_processor
@@ -142,10 +180,15 @@ class InferenceResultCollector:
                     source_path,
                     anomalib_prediction.score,
                     anomalib_prediction.anomaly_map,
-                    anomalib_prediction.score,
-                    (anomalib_prediction.score,),
+                    anomalib_prediction.postprocessed_image_score,
+                    (anomalib_prediction.postprocessed_image_score,),
                     anomalib_prediction.score_semantic,
+                    anomalib_prediction.postprocessed_image_score,
+                    ANOMALIB_POSTPROCESSED_SCORE_SEMANTIC,
                     self._rectified_image(source_path),
+                    None,
+                    anomalib_prediction.raw_image_score,
+                    anomalib_prediction.raw_anomaly_map,
                 )
             return
         if self._preprocessed_accumulator is None:
@@ -158,7 +201,12 @@ class InferenceResultCollector:
                 anomalib_prediction.native_image_score,
                 anomalib_prediction.native_tile_scores,
                 anomalib_prediction.score_semantic,
+                anomalib_prediction.postprocessed_image_score,
+                anomalib_prediction.postprocessed_score_semantic,
                 self._rectified_image(anomalib_prediction.source_path),
+                anomalib_prediction.valid_roi_mask,
+                anomalib_prediction.raw_image_score,
+                anomalib_prediction.raw_anomaly_map,
             )
 
     def finalize(self) -> None:
@@ -181,10 +229,20 @@ class InferenceResultCollector:
         native_image_score: float | None,
         native_tile_scores: tuple[float, ...],
         score_semantic: str,
+        postprocessed_image_score: float | None,
+        postprocessed_score_semantic: str,
         rectified_image: np.ndarray | None,
+        valid_roi_mask: np.ndarray | None,
+        raw_image_score: float | None,
+        raw_anomaly_map: Any,
     ) -> None:
         if source_path in self.predicted_paths:
             raise ValueError(f"Anomalib returned more than one prediction for: {source_path}")
+        if self._expected_score_semantic and score_semantic != self._expected_score_semantic:
+            raise ValueError(
+                "Prediction score semantic does not match the calibrated image threshold: "
+                f"expected {self._expected_score_semantic}, received {score_semantic}."
+            )
         self.predicted_paths.add(source_path)
         artifacts = save_prediction_artifacts(
             source_path,
@@ -193,6 +251,8 @@ class InferenceResultCollector:
             len(self.predictions),
             rectified_image=rectified_image,
             pixel_threshold=self._pixel_threshold,
+            valid_roi_mask=valid_roi_mask,
+            raw_anomaly_map=raw_anomaly_map,
         )
         prediction = PredictionResult(
             source_path=str(source_path),
@@ -206,6 +266,13 @@ class InferenceResultCollector:
             native_image_score=native_image_score,
             native_tile_scores=list(native_tile_scores),
             score_semantic=score_semantic,
+            raw_image_score=raw_image_score,
+            raw_score_semantic=RAW_SCORE_SEMANTIC if raw_image_score is not None else "",
+            raw_anomaly_map=artifacts.raw_anomaly_map,
+            postprocessed_image_score=postprocessed_image_score,
+            postprocessed_score_semantic=postprocessed_score_semantic,
+            postprocessed_anomaly_map=artifacts.continuous_anomaly_map,
+            prediction_contract_version=PREDICTION_CONTRACT_VERSION,
             continuous_anomaly_map=artifacts.continuous_anomaly_map,
             binary_mask=artifacts.binary_mask,
             contour_overlay_image=artifacts.contour_overlay_image,
@@ -237,6 +304,13 @@ class InferencePredictionWriter(BasePredictionWriter):
     def __init__(self, collector: InferenceResultCollector) -> None:
         super().__init__(write_interval="batch")
         self._collector = collector
+        self._postprocessor: ExplicitPredictionPostProcessor | None = None
+
+    def configure_postprocessor(self, model: Any) -> None:
+        """Install explicit, idempotent native postprocessing before prediction callbacks run."""
+        post_processor = getattr(model, "post_processor", None)
+        if post_processor is not None:
+            self._postprocessor = ExplicitPredictionPostProcessor(post_processor)
 
     def write_on_batch_end(
         self,
@@ -248,7 +322,13 @@ class InferencePredictionWriter(BasePredictionWriter):
         batch_idx: int,
         dataloader_idx: int,
     ) -> None:
-        self._collector.add_batch(prediction)
+        output = self._postprocessor.postprocess(prediction) if self._postprocessor is not None else prediction
+        self._collector.add_batch(output)
+
+    def on_predict_end(self, trainer: Any, pl_module: Any) -> None:
+        """Release native batch guards only after every prediction callback has completed."""
+        if self._postprocessor is not None:
+            self._postprocessor.close()
 
 
 def _stage_preprocessed_inputs(
@@ -290,13 +370,30 @@ def run(run_directory: Path, input_path: Path) -> int:
     config_path = run_directory / "config.json"
     if not config_path.is_file():
         raise FileNotFoundError(f"Training configuration was not found in {run_directory}.")
+    config = TrainingConfig.from_dict(json.loads(config_path.read_text(encoding="utf-8")))
+    active_revision = ThresholdRevisionService.read_active_revision(run_directory)
+    quality_warning = _final_test_quality_warning(
+        run_directory,
+        config,
+        active_revision.predictions_path if active_revision is not None else None,
+    )
     source_paths = _discover_images(input_path)
     total_images = len(source_paths)
     if total_images == 0:
         raise ValueError("Select an image file or a folder containing supported image files.")
     checkpoint_path = read_canonical_checkpoint(run_directory).path
-    threshold = read_persisted_threshold(run_directory)
-    pixel_operating_point = read_persisted_pixel_operating_point(run_directory)
+    threshold_metadata = read_persisted_threshold_metadata(run_directory)
+    threshold = active_revision.image_operating_point.threshold if active_revision is not None else read_persisted_threshold(run_directory)
+    expected_score_semantic = (
+        active_revision.image_operating_point.score_semantic
+        if active_revision is not None
+        else str(threshold_metadata.get("score_semantic", ""))
+    )
+    pixel_operating_point = (
+        active_revision.pixel_operating_point
+        if active_revision is not None
+        else read_persisted_pixel_operating_point(run_directory)
+    )
     pixel_threshold = pixel_operating_point.active_threshold
     inspection_region = read_verified_inspection_region(run_directory)
     preprocessing_plan = read_verified_preprocessing_plan(run_directory)
@@ -312,8 +409,11 @@ def run(run_directory: Path, input_path: Path) -> int:
                 "run_directory": str(run_directory),
                 "input_path": str(input_path),
                 "decision_threshold": threshold,
-                "decision_threshold_source": "run_manifest",
+                "decision_threshold_source": "active_threshold_revision" if active_revision is not None else "run_manifest",
+                "threshold_revision": active_revision.revision_path.stem if active_revision is not None else "legacy",
+                "decision_score_semantic": expected_score_semantic or "legacy_unversioned",
                 "pixel_threshold": pixel_threshold,
+                "final_test_quality_warning": quality_warning,
             },
             indent=2,
             ensure_ascii=False,
@@ -322,7 +422,6 @@ def run(run_directory: Path, input_path: Path) -> int:
     )
     visualizations_directory = output_directory / "visualizations"
     visualizations_directory.mkdir()
-    config = TrainingConfig.from_dict(json.loads(config_path.read_text(encoding="utf-8")))
     collector = InferenceResultCollector(
         total_images,
         set(source_paths),
@@ -330,6 +429,7 @@ def run(run_directory: Path, input_path: Path) -> int:
         threshold,
         pixel_threshold,
         inspection_region_metadata(inspection_region),
+        expected_score_semantic=expected_score_semantic,
         inspection_processor=inspection_processor,
         preprocessing_pipeline=preprocessing_pipeline,
     )
@@ -340,6 +440,15 @@ def run(run_directory: Path, input_path: Path) -> int:
         if preprocessing_plan is not None
         else service.create_inference_components(config, output_directory, callbacks=[prediction_writer])
     )
+    if quality_warning:
+        emit(
+            {
+                "type": "log",
+                "level": "warning",
+                "message": f"Final-test acceptance warning: {quality_warning}",
+            }
+        )
+    prediction_writer.configure_postprocessor(components["model"])
     device_note = str(components["device_note"])
     if device_note:
         emit({"type": "log", "level": "warning", "message": device_note})

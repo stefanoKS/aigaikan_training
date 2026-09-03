@@ -22,6 +22,13 @@ class PredictionResult:
     native_image_score: float | None = None
     native_tile_scores: list[float] = field(default_factory=list)
     score_semantic: str = ""
+    raw_image_score: float | None = None
+    raw_score_semantic: str = ""
+    raw_anomaly_map: str = ""
+    postprocessed_image_score: float | None = None
+    postprocessed_score_semantic: str = ""
+    postprocessed_anomaly_map: str = ""
+    prediction_contract_version: int = 0
     continuous_anomaly_map: str = ""
     binary_mask: str = ""
     contour_overlay_image: str = ""

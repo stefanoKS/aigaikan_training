@@ -5,7 +5,7 @@ import pytest
 from app.core.model_registry import ModelRegistry, ModelSupportLevel
 
 
-def test_registry_preserves_production_models_and_registers_supported_adapters() -> None:
+def test_registry_uses_evidence_based_model_lifecycle_levels() -> None:
     registry = ModelRegistry()
 
     assert [definition.key for definition in registry.all()] == [
@@ -27,13 +27,12 @@ def test_registry_preserves_production_models_and_registers_supported_adapters()
         "EfficientAd",
         "Supersimplenet",
     }
-    assert [definition.key for definition in registry.production_models()] == [
-        "patchcore",
-        "padim",
-        "dinomaly_dinov2",
-        "dinomaly_dinov3",
-    ]
-    assert all(not registry.get(key).supports_export for key in ("anomaly_dino", "super_add", "efficient_ad", "supersimplenet"))
+    assert registry.production_models() == []
+    assert all(not definition.supports_export for definition in registry.all())
+    assert all(
+        registry.get(key).support_level is ModelSupportLevel.TRAINING_VALIDATED
+        for key in ("patchcore", "padim", "dinomaly_dinov2", "dinomaly_dinov3")
+    )
 
 
 def test_dinomaly_variants_have_distinct_encoder_identities_and_share_stock_implementation() -> None:
@@ -47,7 +46,7 @@ def test_dinomaly_variants_have_distinct_encoder_identities_and_share_stock_impl
     assert dinov3.anomalib_class_name == "Dinomaly"
     assert dinov2.official_anomalib_implementation
     assert dinov3.official_anomalib_implementation
-    assert dinov3.support_level is ModelSupportLevel.PRODUCTION_VALIDATED
+    assert dinov3.support_level is ModelSupportLevel.TRAINING_VALIDATED
     assert dinov2.encoder_family == "DINOv2"
     assert dinov3.encoder_family == "DINOv3"
     with pytest.raises(ValueError, match="Unsupported Anomalib model"):

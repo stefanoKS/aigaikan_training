@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PIL import Image
 from PySide6.QtWidgets import QApplication
 
 from app.models.training_run import TrainingRun
@@ -77,7 +79,11 @@ def test_results_surface_continuous_maps_and_independent_pixel_mask_thresholds()
                 "pixel_operating_point": {
                     "enabled": True,
                     "threshold": 3.5,
-                }
+                },
+                "final_test_score_ranges": {
+                    "decision": {"postprocessed": {"count": 2, "minimum": 0.1, "maximum": 0.2}},
+                    "raw": {"raw": {"count": 2, "minimum": 2.0, "maximum": 4.0}},
+                },
             },
             predictions=[
                 PredictionResult(
@@ -97,8 +103,51 @@ def test_results_surface_continuous_maps_and_independent_pixel_mask_thresholds()
 
     assert application is not None
     assert page.metric_labels["Pixel Mask Threshold"].text() == "3.5 (map >= threshold)"
+    assert page.metric_labels["Decision Score Ranges"].text() == "postprocessed: 0.1 to 0.2 (n=2)"
+    assert page.metric_labels["Raw Score Ranges"].text() == "raw: 2 to 4 (n=2)"
     assert page.gallery_table.horizontalHeaderItem(3).text() == "Continuous Map"
     assert page.gallery_table.item(0, 3).text() == "map.npz"
     assert page.gallery_table.item(0, 4).text() == "mask.png"
     assert page.gallery_table.item(0, 5).text() == "contours.png"
     assert page.gallery_table.item(0, 6).text() == "3.5 (map >= threshold)"
+
+
+def test_results_gallery_renders_existing_artifacts_as_thumbnails(tmp_path) -> None:
+    application = QApplication.instance() or QApplication([])
+    source = tmp_path / "source.png"
+    Image.new("RGB", (24, 12), (20, 30, 40)).save(source)
+    page = ResultsPage()
+    page.set_training_run(
+        TrainingRun(
+            run_name="previews",
+            run_dir="",
+            model_name="PatchCore",
+            device="cpu",
+            predictions=[
+                PredictionResult(
+                    source_path=str(source),
+                    original_image=str(source),
+                    predicted_label="OK",
+                    ground_truth_label="OK",
+                    anomaly_score=0.1,
+                    threshold=0.5,
+                )
+            ],
+        )
+    )
+
+    item = page.gallery_table.item(0, 0)
+    assert application is not None
+    assert not item.icon().isNull()
+    assert item.toolTip() == str(Path(source))
+
+
+def test_results_page_adds_a_newly_created_threshold_revision_to_the_selector() -> None:
+    application = QApplication.instance() or QApplication([])
+    page = ResultsPage()
+
+    page.display_threshold_revision("threshold-001", 0.8, None, [])
+
+    assert page.active_threshold_revision_id == "threshold-001"
+    assert page.threshold_revision_combo.currentData() == "threshold-001"
+    assert application is not None

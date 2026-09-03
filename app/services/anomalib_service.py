@@ -185,8 +185,9 @@ class AnomalibService:
         if device == "gpu":
             self._configure_gpu_precision()
 
+        fit_dataset = self._normal_validation_dataset(dataset) if calibration_mode and definition.key == "super_add" else dataset
         datamodule = self.create_datamodule(
-            dataset,
+            fit_dataset,
             config,
             calibration_mode=calibration_mode,
             inspection_region=inspection_region,
@@ -221,6 +222,14 @@ class AnomalibService:
             "device": device,
             "device_note": self._device_note(config.device, device),
         }
+
+    @staticmethod
+    def _normal_validation_dataset(dataset: DatasetConfig) -> DatasetConfig:
+        """Remove abnormal validation inputs before SuperADD fits its native normal-only postprocessor."""
+        normal_only = DatasetConfig.from_dict(dataset.to_dict())
+        normal_only.folders[DatasetRole.NG_TEST].path = ""
+        normal_only.folders[DatasetRole.MASKS].path = ""
+        return normal_only
 
     def create_datamodule(
         self,

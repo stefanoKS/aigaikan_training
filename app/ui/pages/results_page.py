@@ -6,9 +6,12 @@ from app.models.training_run import TrainingRun
 from app.models.prediction_result import PredictionResult
 from app.services.export_service import ModelExportFormat
 
+from PySide6.QtCore import QSize, Qt, Signal
+from PySide6.QtGui import QIcon, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -25,6 +28,8 @@ from PySide6.QtWidgets import (
 
 class ResultsPage(QWidget):
     """Training results UI."""
+
+    threshold_revision_requested = Signal(str, float, bool, float)
 
     def __init__(self) -> None:
         super().__init__()
@@ -87,6 +92,29 @@ class ResultsPage(QWidget):
         export_form.addRow("", self.export_model_button)
         root.addWidget(export_group)
 
+        revision_group = QGroupBox("Decision Threshold Revision")
+        revision_form = QFormLayout(revision_group)
+        self.threshold_revision_combo = QComboBox()
+        self.image_threshold_spin = QDoubleSpinBox()
+        self.image_threshold_spin.setRange(-1_000_000_000.0, 1_000_000_000.0)
+        self.image_threshold_spin.setDecimals(6)
+        self.image_threshold_spin.setSingleStep(0.01)
+        self.revision_pixel_mask_check = QCheckBox("Generate pixel mask")
+        self.revision_pixel_threshold_spin = QDoubleSpinBox()
+        self.revision_pixel_threshold_spin.setRange(-1_000_000_000.0, 1_000_000_000.0)
+        self.revision_pixel_threshold_spin.setDecimals(6)
+        self.revision_pixel_threshold_spin.setSingleStep(0.01)
+        pixel_row = QHBoxLayout()
+        pixel_row.addWidget(self.revision_pixel_mask_check)
+        pixel_row.addWidget(self.revision_pixel_threshold_spin)
+        pixel_row.addStretch(1)
+        self.apply_threshold_revision_button = QPushButton("Apply Threshold Revision")
+        revision_form.addRow("Revision", self.threshold_revision_combo)
+        revision_form.addRow("Image Threshold", self.image_threshold_spin)
+        revision_form.addRow("Pixel Threshold", pixel_row)
+        revision_form.addRow("", self.apply_threshold_revision_button)
+        root.addWidget(revision_group)
+
         splitter = QSplitter()
         metrics_group = QGroupBox("Metrics")
         metrics_form = QFormLayout(metrics_group)
@@ -121,6 +149,8 @@ class ResultsPage(QWidget):
             "Threshold Method",
             "Threshold Revision",
             "Pixel Mask Threshold",
+            "Decision Score Ranges",
+            "Raw Score Ranges",
             "Calibration Images",
             "Calibration False Reject Target",
             "Calibration False Reject Observed",
@@ -154,14 +184,21 @@ class ResultsPage(QWidget):
                 "Source Path",
             ]
         )
+        self.gallery_table.setIconSize(QSize(112, 72))
+        for column_index in (0, 1, 2, 4, 5):
+            self.gallery_table.setColumnWidth(column_index, 128)
         right_layout.addWidget(self.metrics_table, stretch=1)
         right_layout.addWidget(self.gallery_table, stretch=2)
         splitter.addWidget(right_column)
         root.addWidget(splitter, stretch=1)
         self.current_run_directory: Path | None = None
         self.current_run: TrainingRun | None = None
+        self.active_threshold_revision_id = ""
         self._predictions: list[PredictionResult] = []
         self.filter_combo.currentTextChanged.connect(self._apply_prediction_filter)
+        self.revision_pixel_mask_check.toggled.connect(self.revision_pixel_threshold_spin.setEnabled)
+        self.apply_threshold_revision_button.clicked.connect(self._request_threshold_revision)
+        self._set_threshold_revision_enabled(False)
 
     def set_metrics(self, metrics: dict[str, str]) -> None:
         """Populate the metrics table."""
@@ -175,8 +212,10 @@ class ResultsPage(QWidget):
         """Clear the previous project's completed-run summary."""
         self.current_run_directory = None
         self.current_run = None
+        self.active_threshold_revision_id = ""
         self._predictions = []
         self.export_model_button.setEnabled(False)
+        self._set_threshold_revision_enabled(False)
         self.metrics_table.setRowCount(0)
         self.gallery_table.setRowCount(0)
         self.no_ng_warning_label.setVisible(False)
@@ -186,10 +225,13 @@ class ResultsPage(QWidget):
     def set_training_run(self, run: TrainingRun) -> None:
         """Populate the completed-run metadata and metrics."""
         self.current_run = run
+        self.active_threshold_revision_id = ""
         self._predictions = list(run.predictions)
         run_directory = Path(run.run_dir)
         self.current_run_directory = run_directory if run_directory.is_dir() else None
         self.export_model_button.setEnabled(self.current_run_directory is not None)
+        self._populate_threshold_revisions(run)
+        self._set_threshold_revision_enabled(self.current_run_directory is not None)
         metric_values = {name: self._format_value(value) for name, value in run.metrics.items()}
         no_ng_evidence = (
             run.metrics.get("Defect Detection Evidence") == "NOT MEASURED" or run.quality_status == "NOT VERIFIED"
@@ -216,6 +258,8 @@ class ResultsPage(QWidget):
                 run.threshold_metadata.get("threshold_revision", run.metrics.get("Threshold Revision", "Not available"))
             ),
             "Pixel Mask Threshold": self._pixel_mask_threshold_text(run.threshold_metadata),
+            "Decision Score Ranges": self._score_range_text(run.threshold_metadata, "decision"),
+            "Raw Score Ranges": self._score_range_text(run.threshold_metadata, "raw"),
             "Calibration Images": self._format_value(run.metrics.get("Calibration Image Count")),
             "Calibration False Reject Target": self._format_value(
                 run.metrics.get("Calibration Target False Reject Rate")
@@ -247,6 +291,79 @@ class ResultsPage(QWidget):
             label.setText(summary.get(key, "Not available"))
         self._apply_prediction_filter()
 
+    def _populate_threshold_revisions(self, run: TrainingRun) -> None:
+        """List persisted revisions and initialize controls from the active saved operating point."""
+        self.threshold_revision_combo.blockSignals(True)
+        self.threshold_revision_combo.clear()
+        self.threshold_revision_combo.addItem("Create new revision", "")
+        active_revision = str(run.threshold_metadata.get("threshold_revision", ""))
+        if self.current_run_directory is not None:
+            for path in sorted((self.current_run_directory / "threshold_revisions").glob("threshold-*.json")):
+                self.threshold_revision_combo.addItem(path.stem, path.stem)
+                if path.stem == active_revision:
+                    self.threshold_revision_combo.setCurrentIndex(self.threshold_revision_combo.count() - 1)
+        self.threshold_revision_combo.blockSignals(False)
+        threshold = run.threshold_metadata.get("threshold_value")
+        if threshold is None and run.predictions:
+            threshold = run.predictions[0].threshold
+        try:
+            self.image_threshold_spin.setValue(float(threshold))
+        except (TypeError, ValueError):
+            self.image_threshold_spin.setValue(0.5)
+        operating_point = run.threshold_metadata.get("pixel_operating_point")
+        if isinstance(operating_point, dict) and operating_point.get("enabled"):
+            self.revision_pixel_mask_check.setChecked(True)
+            self.revision_pixel_threshold_spin.setValue(float(operating_point.get("threshold", 0.5)))
+        else:
+            self.revision_pixel_mask_check.setChecked(False)
+            self.revision_pixel_threshold_spin.setValue(0.5)
+
+    def _set_threshold_revision_enabled(self, enabled: bool) -> None:
+        self.threshold_revision_combo.setEnabled(enabled)
+        self.image_threshold_spin.setEnabled(enabled)
+        self.revision_pixel_mask_check.setEnabled(enabled)
+        self.revision_pixel_threshold_spin.setEnabled(enabled and self.revision_pixel_mask_check.isChecked())
+        self.apply_threshold_revision_button.setEnabled(enabled)
+
+    def _request_threshold_revision(self) -> None:
+        self.threshold_revision_requested.emit(
+            str(self.threshold_revision_combo.currentData() or ""),
+            self.image_threshold_spin.value(),
+            self.revision_pixel_mask_check.isChecked(),
+            self.revision_pixel_threshold_spin.value(),
+        )
+
+    def display_threshold_revision(
+        self,
+        revision_id: str,
+        image_threshold: float,
+        pixel_threshold: float | None,
+        predictions: list[PredictionResult],
+    ) -> None:
+        """Show regenerated revision predictions while retaining the canonical training run."""
+        self.active_threshold_revision_id = revision_id
+        self._predictions = list(predictions)
+        revision_index = self.threshold_revision_combo.findData(revision_id)
+        if revision_index < 0:
+            self.threshold_revision_combo.addItem(revision_id, revision_id)
+            revision_index = self.threshold_revision_combo.count() - 1
+        if revision_index >= 0:
+            self.threshold_revision_combo.setCurrentIndex(revision_index)
+        self.image_threshold_spin.setValue(image_threshold)
+        self.revision_pixel_mask_check.setChecked(pixel_threshold is not None)
+        if pixel_threshold is not None:
+            self.revision_pixel_threshold_spin.setValue(pixel_threshold)
+        self.metric_labels["Threshold Revision"].setText(revision_id)
+        self.metric_labels["Threshold"].setText(self._format_value(image_threshold))
+        self.metric_labels["Pixel Mask Threshold"].setText(
+            self._format_value(pixel_threshold) if pixel_threshold is not None else "Disabled"
+        )
+        self._apply_prediction_filter()
+
+    def displayed_predictions(self) -> list[PredictionResult]:
+        """Return all predictions for the currently displayed canonical run or threshold revision."""
+        return list(self._predictions)
+
     def filtered_predictions(self) -> list[PredictionResult]:
         """Return the rows currently selected by the Results filter."""
         selected_filter = str(self.filter_combo.currentData())
@@ -263,10 +380,14 @@ class ResultsPage(QWidget):
         predictions = self.filtered_predictions()
         self.gallery_table.setRowCount(len(predictions))
         for row_index, prediction in enumerate(predictions):
-            values = (
+            image_values = (
                 prediction.original_image or prediction.source_path,
                 prediction.anomaly_map,
                 prediction.overlay_image,
+            )
+            for column_index, path in enumerate(image_values):
+                self.gallery_table.setItem(row_index, column_index, self._thumbnail_item(path))
+            values = (
                 prediction.continuous_anomaly_map,
                 prediction.binary_mask,
                 prediction.contour_overlay_image,
@@ -276,8 +397,26 @@ class ResultsPage(QWidget):
                 f"{prediction.anomaly_score:.6g}",
                 prediction.source_path,
             )
-            for column_index, value in enumerate(values):
-                self.gallery_table.setItem(row_index, column_index, QTableWidgetItem(value))
+            for column_index, value in enumerate(values, start=3):
+                if column_index in {4, 5}:
+                    self.gallery_table.setItem(row_index, column_index, self._thumbnail_item(value))
+                else:
+                    self.gallery_table.setItem(row_index, column_index, QTableWidgetItem(value))
+            self.gallery_table.setRowHeight(row_index, 80)
+
+    @staticmethod
+    def _thumbnail_item(path_value: str) -> QTableWidgetItem:
+        """Render an existing image as a fixed-size preview while retaining a readable fallback."""
+        item = QTableWidgetItem()
+        path = Path(path_value)
+        thumbnail = QPixmap(str(path)) if path.is_file() else QPixmap()
+        if thumbnail.isNull():
+            item.setText(path_value)
+            return item
+        item.setIcon(QIcon(thumbnail.scaled(112, 72, Qt.KeepAspectRatio, Qt.SmoothTransformation)))
+        item.setToolTip(str(path))
+        item.setData(Qt.ItemDataRole.UserRole, str(path))
+        return item
 
     def set_default_export_directory(self, directory: Path) -> None:
         """Set the active project's root as the default model export destination."""
@@ -321,6 +460,27 @@ class ResultsPage(QWidget):
             return f"{float(threshold):.6g} (map >= threshold)"
         except (TypeError, ValueError):
             return "Invalid"
+
+    @staticmethod
+    def _score_range_text(threshold_metadata: dict[str, object], score_kind: str) -> str:
+        diagnostics = threshold_metadata.get("final_test_score_ranges")
+        if not isinstance(diagnostics, dict):
+            return "Not recorded"
+        ranges = diagnostics.get(score_kind)
+        if not isinstance(ranges, dict) or not ranges:
+            return "Not recorded"
+        values: list[str] = []
+        for semantic, summary in sorted(ranges.items()):
+            if not isinstance(semantic, str) or not isinstance(summary, dict):
+                return "Invalid"
+            try:
+                values.append(
+                    f"{semantic}: {float(summary['minimum']):.6g} to {float(summary['maximum']):.6g} "
+                    f"(n={int(summary['count'])})"
+                )
+            except (KeyError, TypeError, ValueError):
+                return "Invalid"
+        return "; ".join(values)
 
     @staticmethod
     def _format_pixel_threshold(prediction: PredictionResult) -> str:

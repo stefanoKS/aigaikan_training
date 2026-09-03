@@ -13,9 +13,13 @@ from PIL import Image
 from app.models.dataset_config import DatasetRole, FolderImportMode
 from app.models.preprocessing_config import LEGACY_PREPROCESSING_CONTRACT_VERSION, PaddingPolicy, PreprocessingConfig
 from app.core.preprocessing_contract import read_preprocessing_config
+from app.core.threshold_contract import ImageThresholdOperatingPoint, PixelThresholdOperatingPoint
+from app.services.threshold_revision_service import ThresholdRevisionResult
 from app.core.project_manager import ProjectManager
 from app.core.settings_manager import SettingsManager
 from app.models.project_config import ProjectConfig
+from app.models.training_run import TrainingRun
+from app.models.prediction_result import PredictionResult
 from app.ui.main_window import MainWindow
 from app.ui.styles import APP_STYLE
 
@@ -232,4 +236,57 @@ def test_model_controls_only_allow_verified_runtime_settings() -> None:
     application.processEvents()
     assert window.config_page.batch_size_spin.value() == 1
     assert not window.config_page.batch_size_spin.isEnabled()
+    window.close()
+
+
+def test_results_json_export_view_uses_displayed_threshold_revision(tmp_path: Path, monkeypatch) -> None:
+    application = QApplication.instance() or QApplication([])
+    window = MainWindow(SettingsManager(), ProjectManager(tmp_path / "projects"))
+    run_directory = tmp_path / "run"
+    run_directory.mkdir()
+    revision_path = run_directory / "threshold_revisions" / "threshold-001.json"
+    revision_path.parent.mkdir()
+    predictions_path = revision_path.with_name("threshold-001_predictions.csv")
+    predictions_path.write_text("image_path\n", encoding="utf-8")
+    revision = ThresholdRevisionResult(
+        revision_path,
+        predictions_path,
+        ImageThresholdOperatingPoint(0.8),
+        PixelThresholdOperatingPoint(enabled=True, threshold=0.85),
+    )
+    run = TrainingRun(
+        run_name="run",
+        run_dir=str(run_directory),
+        model_name="PatchCore",
+        device="cpu",
+        threshold_metadata={"threshold_value": 0.5, "threshold_revision": "evaluation-001"},
+        predictions=[
+            PredictionResult(
+                source_path="canonical.png",
+                predicted_label="NG",
+                ground_truth_label="OK",
+                anomaly_score=0.7,
+                threshold=0.5,
+            )
+        ],
+    )
+    revised_prediction = PredictionResult(
+        source_path="revision.png",
+        predicted_label="OK",
+        ground_truth_label="OK",
+        anomaly_score=0.7,
+        threshold=0.8,
+    )
+    window.results_page.set_training_run(run)
+    window.results_page.display_threshold_revision("threshold-001", 0.8, 0.85, [revised_prediction])
+    monkeypatch.setattr(window.threshold_revision_service, "read_active_revision", lambda _path: revision)
+
+    exported = window._displayed_results_export_run(run)
+
+    assert exported is not run
+    assert exported.predictions == [revised_prediction]
+    assert exported.threshold_metadata["threshold_value"] == 0.8
+    assert exported.threshold_metadata["threshold_revision"] == "threshold-001"
+    assert run.predictions[0].source_path == "canonical.png"
+    assert application is not None
     window.close()

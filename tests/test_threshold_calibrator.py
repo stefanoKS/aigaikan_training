@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from math import nextafter
 
+import pytest
+
 from app.core.threshold_calibrator import (
     CalibrationSample,
     ThresholdCalibrationConfig,
@@ -49,6 +51,17 @@ def test_recall_priority_minimizes_false_rejects_after_meeting_the_ng_recall_tar
     assert result.threshold_value == 0.9
     assert result.ng_recall == 0.5
     assert result.observed_calibration_false_reject_rate == 0.0
+
+
+def test_auto_honors_the_minimum_required_ng_recall_before_optimizing_f1() -> None:
+    result = ThresholdCalibrator().calibrate(
+        _samples((0.1, "OK"), (0.2, "OK"), (0.15, "NG"), (0.9, "NG")),
+        ThresholdCalibrationConfig(ThresholdMethod.AUTO, minimum_required_ng_recall=0.5),
+    )
+
+    assert result.threshold_method == "labeled_recall_priority"
+    assert result.threshold_value == 0.9
+    assert result.ng_recall == 0.5
 
 
 def test_normal_only_conformal_uses_deterministic_finite_sample_order_statistic() -> None:
@@ -105,6 +118,19 @@ def test_normal_only_max_is_explicitly_a_conservative_fallback() -> None:
         ThresholdCalibrationConfig(ThresholdMethod.NORMAL_ONLY_MAX),
     )
 
-    assert result.threshold_value == 0.4
+    assert result.threshold_raw == 0.4
+    assert result.threshold_value == nextafter(0.4, float("inf"))
+    assert result.observed_calibration_false_reject_rate == 0.0
     assert result.threshold_method == "normal_only_max"
     assert "without known abnormal samples" in result.warning
+
+
+def test_calibration_rejects_scores_from_different_semantic_domains() -> None:
+    with pytest.raises(ValueError, match="one declared score semantic"):
+        ThresholdCalibrator().calibrate(
+            [
+                CalibrationSample(0.1, "OK", "postprocessed-v1"),
+                CalibrationSample(0.8, "NG", "raw-v1"),
+            ],
+            ThresholdCalibrationConfig(ThresholdMethod.LABELED_F1),
+        )

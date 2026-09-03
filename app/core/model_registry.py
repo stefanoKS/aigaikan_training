@@ -23,9 +23,9 @@ class ModelExecutionMode(StrEnum):
 class ModelSupportLevel(StrEnum):
     """Validation status of a selectable model."""
 
-    SUPPORTED = "supported"
-    PRODUCTION_VALIDATED = "production-validated"
     EXPERIMENTAL = "experimental"
+    TRAINING_VALIDATED = "training-validated"
+    TORCH_EXPORT_VALIDATED = "torch-export-validated"
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,7 +61,9 @@ class ModelRegistry:
             "Patchcore",
             algorithm="PatchCore",
             model_variant="patchcore",
-            support_level=ModelSupportLevel.PRODUCTION_VALIDATED,
+            requirement="Training path is validated. Export remains unavailable until train/export/reload parity is recorded.",
+            supports_export=False,
+            support_level=ModelSupportLevel.TRAINING_VALIDATED,
         ),
         ModelDefinition(
             "padim",
@@ -69,7 +71,9 @@ class ModelRegistry:
             "Padim",
             algorithm="PaDiM",
             model_variant="padim",
-            support_level=ModelSupportLevel.PRODUCTION_VALIDATED,
+            requirement="Training path is validated. Export remains unavailable until train/export/reload parity is recorded.",
+            supports_export=False,
+            support_level=ModelSupportLevel.TRAINING_VALIDATED,
         ),
         ModelDefinition(
             "dinomaly_dinov2",
@@ -78,7 +82,9 @@ class ModelRegistry:
             algorithm="Dinomaly",
             model_variant="dinomaly_dinov2",
             encoder_family="DINOv2",
-            support_level=ModelSupportLevel.PRODUCTION_VALIDATED,
+            requirement="Training path is validated. Export remains unavailable until train/export/reload parity is recorded.",
+            supports_export=False,
+            support_level=ModelSupportLevel.TRAINING_VALIDATED,
         ),
         ModelDefinition(
             "dinomaly_dinov3",
@@ -87,8 +93,12 @@ class ModelRegistry:
             algorithm="Dinomaly",
             model_variant="dinomaly_dinov3",
             encoder_family="DINOv3",
-            requirement="Stock Anomalib 2.6.0 Dinomaly with a DINOv3 timm encoder.",
-            support_level=ModelSupportLevel.PRODUCTION_VALIDATED,
+            requirement=(
+                "Stock Anomalib 2.6.0 Dinomaly with a DINOv3 timm encoder. "
+                "Export remains unavailable until train/export/reload parity is recorded."
+            ),
+            supports_export=False,
+            support_level=ModelSupportLevel.TRAINING_VALIDATED,
         ),
         ModelDefinition(
             "anomaly_dino",
@@ -99,7 +109,7 @@ class ModelRegistry:
             encoder_family="DINOv2",
             requirement="Export formats remain unavailable until deployment parity validation is completed.",
             supports_export=False,
-            support_level=ModelSupportLevel.SUPPORTED,
+            support_level=ModelSupportLevel.EXPERIMENTAL,
         ),
         ModelDefinition(
             "super_add",
@@ -110,7 +120,7 @@ class ModelRegistry:
             encoder_family="DINOv3",
             requirement="Export formats remain unavailable until deployment parity validation is completed.",
             supports_export=False,
-            support_level=ModelSupportLevel.SUPPORTED,
+            support_level=ModelSupportLevel.EXPERIMENTAL,
         ),
         ModelDefinition(
             "efficient_ad",
@@ -120,7 +130,7 @@ class ModelRegistry:
             model_variant="efficient_ad",
             requirement="Requires Anomalib's ImageNette reference data. Export formats remain unavailable pending parity validation.",
             supports_export=False,
-            support_level=ModelSupportLevel.SUPPORTED,
+            support_level=ModelSupportLevel.EXPERIMENTAL,
         ),
         ModelDefinition(
             "supersimplenet",
@@ -130,7 +140,7 @@ class ModelRegistry:
             model_variant="supersimplenet",
             requirement="Export formats remain unavailable until deployment parity validation is completed.",
             supports_export=False,
-            support_level=ModelSupportLevel.SUPPORTED,
+            support_level=ModelSupportLevel.EXPERIMENTAL,
         ),
     )
 
@@ -152,11 +162,11 @@ class ModelRegistry:
         return [definition for definition in self._MODEL_DEFINITIONS if definition.supports_image_folder]
 
     def production_models(self) -> list[ModelDefinition]:
-        """Return the models that completed the production validation contract."""
+        """Return models with demonstrated portable Torch deployment parity."""
         return [
             definition
             for definition in self.image_folder_models()
-            if definition.support_level is ModelSupportLevel.PRODUCTION_VALIDATED
+            if definition.support_level is ModelSupportLevel.TORCH_EXPORT_VALIDATED
         ]
 
     def official_anomalib_models(self) -> list[ModelDefinition]:

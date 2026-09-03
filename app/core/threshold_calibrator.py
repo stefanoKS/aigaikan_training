@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from enum import StrEnum
 from math import ceil, isfinite, nextafter
 from typing import Iterable
+
+from app.core.prediction_contract import DECISION_COMPARATOR, POSTPROCESSED_SCORE_SEMANTIC
 
 
 class ThresholdMethod(StrEnum):
@@ -25,6 +27,7 @@ class CalibrationSample:
 
     score: float
     label: str
+    score_semantic: str = POSTPROCESSED_SCORE_SEMANTIC
 
     @property
     def is_normal(self) -> bool:
@@ -69,6 +72,15 @@ class ThresholdCalibrationResult:
     ng_recall: float | None
     precision: float | None
     f1: float | None
+    score_semantic: str = POSTPROCESSED_SCORE_SEMANTIC
+    decision_comparator: str = DECISION_COMPARATOR
+    true_positive_count: int | None = None
+    false_positive_count: int | None = None
+    true_negative_count: int | None = None
+    false_negative_count: int | None = None
+    specificity: float | None = None
+    false_accept_rate: float | None = None
+    false_reject_rate: float | None = None
     normal_score_quantiles: dict[str, float] = field(default_factory=dict)
     abnormal_score_quantiles: dict[str, float] = field(default_factory=dict)
     normal_score_iqr: float | None = None
@@ -93,24 +105,31 @@ class ThresholdCalibrator:
         config.validate()
         values = tuple(samples)
         self._validate_samples(values)
+        score_semantic = values[0].score_semantic
         if config.method is ThresholdMethod.AUTO:
             if any(sample.is_abnormal for sample in values):
-                return self._labeled_f1(values)
-            return self._normal_only_conformal(values, config.target_normal_false_reject_rate)
-        if config.method is ThresholdMethod.LABELED_F1:
-            return self._labeled_f1(values)
-        if config.method is ThresholdMethod.LABELED_RECALL_PRIORITY:
-            return self._labeled_recall_priority(values, config.minimum_required_ng_recall)
-        if config.method is ThresholdMethod.NORMAL_ONLY_CONFORMAL:
-            return self._normal_only_conformal(values, config.target_normal_false_reject_rate)
-        if config.method is ThresholdMethod.NORMAL_ONLY_MAX:
-            return self._normal_only_max(values)
-        if config.method is ThresholdMethod.SYNTHETIC_ANOMALY:
+                if config.minimum_required_ng_recall is not None:
+                    result = self._labeled_recall_priority(values, config.minimum_required_ng_recall)
+                else:
+                    result = self._labeled_f1(values)
+            else:
+                result = self._normal_only_conformal(values, config.target_normal_false_reject_rate)
+        elif config.method is ThresholdMethod.LABELED_F1:
+            result = self._labeled_f1(values)
+        elif config.method is ThresholdMethod.LABELED_RECALL_PRIORITY:
+            result = self._labeled_recall_priority(values, config.minimum_required_ng_recall)
+        elif config.method is ThresholdMethod.NORMAL_ONLY_CONFORMAL:
+            result = self._normal_only_conformal(values, config.target_normal_false_reject_rate)
+        elif config.method is ThresholdMethod.NORMAL_ONLY_MAX:
+            result = self._normal_only_max(values)
+        elif config.method is ThresholdMethod.SYNTHETIC_ANOMALY:
             raise ValueError(
                 "Synthetic anomaly calibration is experimental and requires a dedicated synthetic-data generator, "
                 "which is not available in this build."
             )
-        raise ValueError(f"Unsupported threshold calibration method: {config.method}")
+        else:
+            raise ValueError(f"Unsupported threshold calibration method: {config.method}")
+        return replace(result, score_semantic=score_semantic)
 
     @staticmethod
     def _validate_samples(samples: tuple[CalibrationSample, ...]) -> None:
@@ -118,15 +137,16 @@ class ThresholdCalibrator:
             raise ValueError("Threshold calibration requires at least one validation score.")
         if any(not isfinite(sample.score) for sample in samples):
             raise ValueError("Threshold calibration scores must all be finite.")
+        semantics = {sample.score_semantic for sample in samples}
+        if not semantics or "" in semantics or len(semantics) != 1:
+            raise ValueError("Threshold calibration scores must all use one declared score semantic.")
         invalid_labels = sorted({sample.label for sample in samples if not (sample.is_normal or sample.is_abnormal)})
         if invalid_labels:
             raise ValueError(f"Calibration labels must be OK or NG, received: {', '.join(invalid_labels)}")
 
     def _labeled_f1(self, samples: tuple[CalibrationSample, ...]) -> ThresholdCalibrationResult:
         normal_scores, abnormal_scores = self._labeled_scores(samples)
-        candidates = [self._labeled_metrics(normal_scores, abnormal_scores, threshold) for threshold in sorted(set(
-            [*normal_scores, *abnormal_scores]
-        ))]
+        candidates = self._labeled_candidates(normal_scores, abnormal_scores)
         selected = max(candidates, key=lambda candidate: (candidate["f1"], candidate["precision"], candidate["recall"], -candidate["threshold"]))
         return self._labeled_result(ThresholdMethod.LABELED_F1, normal_scores, abnormal_scores, selected)
 
@@ -136,17 +156,26 @@ class ThresholdCalibrator:
         minimum_required_ng_recall: float | None,
     ) -> ThresholdCalibrationResult:
         normal_scores, abnormal_scores = self._labeled_scores(samples)
-        candidates = [self._labeled_metrics(normal_scores, abnormal_scores, threshold) for threshold in sorted(set(
-            [*normal_scores, *abnormal_scores]
-        ))]
+        candidates = self._labeled_candidates(normal_scores, abnormal_scores)
         eligible_candidates = (
             [candidate for candidate in candidates if candidate["recall"] >= minimum_required_ng_recall]
             if minimum_required_ng_recall is not None
             else candidates
         )
         if not eligible_candidates:
-            raise ValueError(
-                f"No threshold reaches the required NG recall of {minimum_required_ng_recall:.6g}."
+            fallback = max(
+                candidates,
+                key=lambda candidate: (candidate["recall"], candidate["precision"], -candidate["false_reject_count"]),
+            )
+            return self._labeled_result(
+                ThresholdMethod.LABELED_RECALL_PRIORITY,
+                normal_scores,
+                abnormal_scores,
+                fallback,
+                warning=(
+                    f"No threshold reaches the required NG recall of {minimum_required_ng_recall:.6g}; "
+                    "selected the highest-recall calibration operating point instead."
+                ),
             )
         selected = min(
             eligible_candidates,
@@ -157,6 +186,13 @@ class ThresholdCalibrator:
             ),
         )
         return self._labeled_result(ThresholdMethod.LABELED_RECALL_PRIORITY, normal_scores, abnormal_scores, selected)
+
+    @staticmethod
+    def _labeled_candidates(normal_scores: list[float], abnormal_scores: list[float]) -> list[dict[str, float | int]]:
+        """Evaluate all distinct score boundaries for the documented ``score >= threshold`` rule."""
+        scores = sorted(set([*normal_scores, *abnormal_scores]))
+        thresholds = [*scores, nextafter(scores[-1], float("inf"))]
+        return [ThresholdCalibrator._labeled_metrics(normal_scores, abnormal_scores, threshold) for threshold in thresholds]
 
     @staticmethod
     def _labeled_scores(samples: tuple[CalibrationSample, ...]) -> tuple[list[float], list[float]]:
@@ -170,16 +206,25 @@ class ThresholdCalibrator:
     def _labeled_metrics(normal_scores: list[float], abnormal_scores: list[float], threshold: float) -> dict[str, float | int]:
         true_positive = sum(score >= threshold for score in abnormal_scores)
         false_reject = sum(score >= threshold for score in normal_scores)
+        false_accept = len(abnormal_scores) - true_positive
+        true_negative = len(normal_scores) - false_reject
         predicted_ng = true_positive + false_reject
         recall = true_positive / len(abnormal_scores)
         precision = true_positive / predicted_ng if predicted_ng else 0.0
         f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
         return {
             "threshold": threshold,
+            "true_positive_count": true_positive,
+            "false_positive_count": false_reject,
+            "true_negative_count": true_negative,
+            "false_negative_count": false_accept,
             "recall": recall,
             "precision": precision,
             "f1": f1,
             "false_reject_count": false_reject,
+            "false_reject_rate": false_reject / len(normal_scores),
+            "false_accept_rate": false_accept / len(abnormal_scores),
+            "specificity": true_negative / len(normal_scores),
         }
 
     @staticmethod
@@ -188,6 +233,7 @@ class ThresholdCalibrator:
         normal_scores: list[float],
         abnormal_scores: list[float],
         selected: dict[str, float | int],
+        warning: str = "",
     ) -> ThresholdCalibrationResult:
         threshold = float(selected["threshold"])
         return ThresholdCalibrationResult(
@@ -203,10 +249,18 @@ class ThresholdCalibrator:
             ng_recall=float(selected["recall"]),
             precision=float(selected["precision"]),
             f1=float(selected["f1"]),
+            true_positive_count=int(selected["true_positive_count"]),
+            false_positive_count=int(selected["false_positive_count"]),
+            true_negative_count=int(selected["true_negative_count"]),
+            false_negative_count=int(selected["false_negative_count"]),
+            specificity=float(selected["specificity"]),
+            false_accept_rate=float(selected["false_accept_rate"]),
+            false_reject_rate=float(selected["false_reject_rate"]),
             normal_score_quantiles=_score_quantiles(normal_scores),
             abnormal_score_quantiles=_score_quantiles(abnormal_scores),
             normal_score_iqr=_score_iqr(normal_scores),
             abnormal_score_iqr=_score_iqr(abnormal_scores),
+            warning=warning,
         )
 
     @staticmethod
@@ -247,17 +301,20 @@ class ThresholdCalibrator:
     @staticmethod
     def _normal_only_max(samples: tuple[CalibrationSample, ...]) -> ThresholdCalibrationResult:
         normal_scores = ThresholdCalibrator._normal_scores(samples)
-        threshold = max(normal_scores)
+        raw_threshold = max(normal_scores)
+        deployed_threshold = nextafter(raw_threshold, float("inf"))
         return ThresholdCalibrationResult(
             threshold_method=ThresholdMethod.NORMAL_ONLY_MAX.value,
-            threshold_value=threshold,
-            threshold_raw=threshold,
-            threshold_deployed=threshold,
+            threshold_value=deployed_threshold,
+            threshold_raw=raw_threshold,
+            threshold_deployed=deployed_threshold,
             calibration_sample_count=len(normal_scores),
             normal_calibration_sample_count=len(normal_scores),
             abnormal_calibration_sample_count=0,
             target_false_reject_rate=None,
-            observed_calibration_false_reject_rate=sum(score >= threshold for score in normal_scores) / len(normal_scores),
+            observed_calibration_false_reject_rate=(
+                sum(score >= deployed_threshold for score in normal_scores) / len(normal_scores)
+            ),
             ng_recall=None,
             precision=None,
             f1=None,

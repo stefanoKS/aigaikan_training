@@ -60,3 +60,38 @@ def test_inference_page_filters_ng_export_after_inference_without_changing_predi
     assert page.ng_predictions_for_export()[0].source_path == source_path
     assert page.export_ng_images_button.isEnabled()
     assert page.results_table.item(0, 1).text() == "OK"
+
+
+def test_inference_page_shows_original_overlay_and_binary_mask_previews(tmp_path: Path) -> None:
+    application = QApplication.instance() or QApplication([])
+    original_path = tmp_path / "original.png"
+    overlay_path = tmp_path / "overlay.png"
+    mask_path = tmp_path / "mask.png"
+    from PIL import Image
+
+    Image.new("RGB", (16, 12), (20, 30, 40)).save(original_path)
+    Image.new("RGB", (16, 12), (200, 50, 20)).save(overlay_path)
+    Image.new("L", (16, 12), 255).save(mask_path)
+    page = InferencePage()
+    page.resize(900, 700)
+    page.show()
+    page.append_prediction(
+        PredictionResult(
+            source_path=str(original_path),
+            predicted_label="NG",
+            ground_truth_label="Unknown",
+            anomaly_score=0.9,
+            threshold=0.5,
+            original_image=str(original_path),
+            overlay_image=str(overlay_path),
+            binary_mask=str(mask_path),
+        )
+    )
+    application.processEvents()
+
+    assert tuple(page.preview_labels) == ("Original", "Overlay", "Mask")
+    assert not page.preview_labels["Original"].pixmap().isNull()
+    assert not page.preview_labels["Overlay"].pixmap().isNull()
+    assert not page.preview_labels["Mask"].pixmap().isNull()
+
+    page.close()

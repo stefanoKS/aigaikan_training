@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 import sys
 from types import ModuleType
@@ -12,13 +13,14 @@ import pytest
 
 from app.core.dataset_manifest import sha256_file
 from app.core.inspection_region import InspectionRegionProcessor, inspection_region_hash, write_inspection_region
+from app.core.model_registry import ModelRegistry, ModelSupportLevel
 from app.core.preprocessing_pipeline import PreprocessingPipeline
 from app.models.inspection_region import InspectionRegionConfig
-from app.core.run_artifacts import CanonicalCheckpoint, write_run_manifest
+from app.core.run_artifacts import CanonicalCheckpoint, read_canonical_checkpoint, write_run_manifest
 from app.core.result_parser import ResultParser
 from app.models.prediction_result import PredictionResult
 from app.models.training_config import TrainingConfig
-from app.models.preprocessing_config import LEGACY_PREPROCESSING_CONTRACT_VERSION, PreprocessingConfig
+from app.models.preprocessing_config import LEGACY_PREPROCESSING_CONTRACT_VERSION, PreprocessingConfig, TilingConfig
 from app.models.training_run import TrainingRun
 from app.services.export_service import DEPLOYMENT_CONTRACT_VERSION, FORMAT_SCORE_TOLERANCES, ExportService, ModelExportFormat
 
@@ -101,6 +103,57 @@ def test_export_model_uses_configured_formats_native_preprocessing_and_names(tmp
             ],
         ),
     )
+    revision_directory = run_directory / "threshold_revisions"
+    revision_directory.mkdir()
+    revision_predictions = revision_directory / "threshold-001_predictions.csv"
+    ResultParser().export_predictions_csv(
+        revision_predictions,
+        [
+            PredictionResult(
+                source_path="final_test.png",
+                predicted_label="NG",
+                ground_truth_label="OK",
+                anomaly_score=0.1,
+                threshold=0.05,
+                dataset_role="final_test_ok",
+                score_semantic="anomalib_postprocessed_pred_score_v1",
+            )
+        ],
+    )
+    revision_path = revision_directory / "threshold-001.json"
+    revision_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "revision_id": "threshold-001",
+                "image_operating_point": {
+                    "version": 1,
+                    "threshold": 0.05,
+                    "comparator": "greater_than_or_equal",
+                    "score_semantic": "anomalib_postprocessed_pred_score_v1",
+                },
+                "pixel_operating_point": {
+                    "version": 1,
+                    "enabled": False,
+                    "threshold": None,
+                    "comparator": "greater_than_or_equal",
+                    "semantic": "continuous_anomaly_map_gte_v1",
+                },
+                "predictions_file": revision_predictions.name,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_directory / "active_threshold_revision.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "revision_file": revision_path.name,
+                "revision_sha256": sha256_file(revision_path),
+            }
+        ),
+        encoding="utf-8",
+    )
     (run_directory / "environment.json").write_text("{}", encoding="utf-8")
     (run_directory / "dataset_manifest.json").write_text("{}", encoding="utf-8")
     (run_directory / "calibration_manifest.json").write_text("{}", encoding="utf-8")
@@ -110,6 +163,12 @@ def test_export_model_uses_configured_formats_native_preprocessing_and_names(tmp
     export_directory = tmp_path / "exports"
     received_thresholds: list[float] = []
     received_tolerances: list[tuple[str, float]] = []
+    verified_definition = replace(
+        ModelRegistry().get("patchcore"),
+        supports_export=True,
+        support_level=ModelSupportLevel.TORCH_EXPORT_VALIDATED,
+    )
+    verified_registry = type("VerifiedRegistry", (), {"get": lambda _self, _model_name: verified_definition})()
 
     def deployment_validator(
         _path: Path,
@@ -132,6 +191,7 @@ def test_export_model_uses_configured_formats_native_preprocessing_and_names(tmp
     report = ExportService(
         FakeAnomalibService(engine),
         deployment_validator=deployment_validator,
+        model_registry=verified_registry,
     ).export_model(
         run_directory,
         export_directory,
@@ -147,28 +207,34 @@ def test_export_model_uses_configured_formats_native_preprocessing_and_names(tmp
     assert (report.package_directory / "calibration_manifest.json").is_file()
     assert (report.package_directory / "final_test_manifest.json").is_file()
     assert (report.package_directory / "inspection_region.json").is_file()
+    assert (report.package_directory / "canonical_checkpoint.ckpt").read_text(encoding="utf-8") == "checkpoint"
+    assert (report.package_directory / "active_threshold_revision.json").is_file()
+    assert (report.package_directory / "threshold_revisions" / "threshold-001.json").is_file()
+    assert (report.package_directory / "threshold_revisions" / "threshold-001_predictions.csv").is_file()
+    assert read_canonical_checkpoint(report.package_directory).path == report.package_directory / "canonical_checkpoint.ckpt"
     assert [result.exported_path.name for result in report.exported] == [
         "patchcore_2026_08_31_12_00_00_openvino.xml",
         "patchcore_2026_08_31_12_00_00_torch.pt",
     ]
     assert [call["input_size"] for call in engine.calls] == [None, None]
     assert [call["ckpt_path"] for call in engine.calls] == [checkpoint.resolve(), checkpoint.resolve()]
-    assert received_thresholds == [0.5, 0.5]
+    assert received_thresholds == [0.05, 0.05]
     assert received_tolerances == [
         ("openvino", FORMAT_SCORE_TOLERANCES["openvino"]),
         ("torch", FORMAT_SCORE_TOLERANCES["torch"]),
     ]
     deployment_manifest = json.loads((report.package_directory / "deployment_manifest.json").read_text(encoding="utf-8"))
     assert deployment_manifest["threshold_metadata"]["threshold_method"] == "normal_only_conformal"
-    assert deployment_manifest["threshold_metadata"]["threshold_revision"] == "revision-001"
+    assert deployment_manifest["threshold_metadata"]["threshold_revision"] == "threshold-001"
     assert deployment_manifest["anomalib_version"] == "2.6.0"
     assert deployment_manifest["deployment_contract_version"] == DEPLOYMENT_CONTRACT_VERSION
+    assert deployment_manifest["canonical_checkpoint"] == "canonical_checkpoint.ckpt"
     assert deployment_manifest["format_score_tolerances"] == FORMAT_SCORE_TOLERANCES
     assert deployment_manifest["inspection_preprocessing"]["metadata_sha256"] == inspection_region_hash(inspection_region)
     assert deployment_manifest["model"]["profile"]["preprocessing"] == "anomalib-native"
     assert deployment_manifest["exports"][0]["validation"]["maximum_score_delta"] == 0.0
     validation_report = json.loads(report.exported[0].validation_report.read_text(encoding="utf-8"))
-    assert validation_report["decision_threshold"] == 0.5
+    assert validation_report["decision_threshold"] == 0.05
     assert validation_report["deployment_contract_version"] == DEPLOYMENT_CONTRACT_VERSION
     assert validation_report["threshold_metadata"]["calibration_manifest_sha256"] == "b" * 64
 
@@ -281,7 +347,7 @@ def test_deployment_validation_rejects_excessive_score_difference(monkeypatch) -
         )
 
 
-def test_deployment_validation_preserves_the_v3_native_image_score(tmp_path: Path, monkeypatch) -> None:
+def test_deployment_validation_uses_the_v3_reconstructed_map_score(tmp_path: Path, monkeypatch) -> None:
     received_images: list[object] = []
 
     class FakeTorchInferencer:
@@ -290,10 +356,8 @@ def test_deployment_validation_preserves_the_v3_native_image_score(tmp_path: Pat
 
         def predict(self, image: object) -> dict[str, object]:
             received_images.append(image)
-            anomaly_map = np.zeros((192, 640), dtype=np.float32)
-            anomaly_map[176, 638] = 0.7
-            anomaly_map[191, 639] = 1.0
-            return {"pred_score": 1.0, "anomaly_map": anomaly_map}
+            anomaly_map = np.full((192, 336), 0.9, dtype=np.float32)
+            return {"pred_score": 0.1, "anomaly_map": anomaly_map}
 
     anomalib_deploy = ModuleType("anomalib.deploy")
     anomalib_deploy.TorchInferencer = FakeTorchInferencer
@@ -304,14 +368,14 @@ def test_deployment_validation_preserves_the_v3_native_image_score(tmp_path: Pat
     Image.new("RGB", (639, 177), (20, 30, 40)).save(source_path)
     pipeline = PreprocessingPipeline(
         InspectionRegionConfig(),
-        PreprocessingConfig().resolve("patchcore", (639, 177)),
+        PreprocessingConfig(tiling=TilingConfig(enabled=True)).resolve("dinomaly_dinov3", (639, 177)),
     )
     expected = PredictionResult(
         source_path=str(source_path),
         predicted_label="NG",
         ground_truth_label="OK",
-        anomaly_score=1.0,
-        threshold=0.6,
+        anomaly_score=0.9,
+        threshold=0.8,
         dataset_role="final_test_ok",
     )
 
@@ -319,13 +383,13 @@ def test_deployment_validation_preserves_the_v3_native_image_score(tmp_path: Pat
         Path("model.pt"),
         "torch",
         [expected],
-        threshold=0.6,
+        threshold=0.8,
         preprocessing_pipeline=pipeline,
     )
 
     assert report["status"] == "PASS"
-    assert len(received_images) == 1
     assert getattr(received_images[0], "shape") == (*reversed(pipeline.plan.model_input_size), 3)
+    assert len(received_images) == 3
 
 
 def test_deployment_validation_preserves_legacy_v2_map_score_semantics(tmp_path: Path, monkeypatch) -> None:

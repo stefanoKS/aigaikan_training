@@ -13,6 +13,7 @@ from pathlib import Path
 from PIL import Image
 
 from app.core.preprocessing_pipeline import PreprocessingPipeline
+from app.core.prepared_data_cache import PreparedDataCache
 from app.models.dataset_config import DatasetConfig, DatasetRole, SUPPORTED_IMAGE_EXTENSIONS
 from app.models.preprocessing_config import PreprocessingTile
 
@@ -217,11 +218,14 @@ def stage_effective_split(
     config: DatasetConfig,
     destination: Path,
     preprocessing_pipeline: PreprocessingPipeline | None = None,
+    prepared_data_cache: PreparedDataCache | None = None,
 ) -> StagedDataset:
     """Stage a disjoint split into model-ready folders without altering source data."""
     destination.mkdir(parents=True, exist_ok=False)
     if preprocessing_pipeline is not None:
-        return _stage_preprocessed_split(split, config, destination, preprocessing_pipeline)
+        return _stage_preprocessed_split(split, config, destination, preprocessing_pipeline, prepared_data_cache)
+    if prepared_data_cache is not None:
+        raise ValueError("Prepared-data caching requires a resolved preprocessing pipeline.")
     mappings: dict[str, dict[Path, Path]] = {}
     for role, paths in split.roles().items():
         mappings[role] = _stage_images(paths, destination / role)
@@ -262,9 +266,10 @@ def _stage_preprocessed_split(
     config: DatasetConfig,
     destination: Path,
     preprocessing_pipeline: PreprocessingPipeline,
+    prepared_data_cache: PreparedDataCache | None,
 ) -> StagedDataset:
     staged_roles = {
-        role: _stage_preprocessed_images(paths, destination / role, preprocessing_pipeline)
+        role: _stage_preprocessed_images(paths, destination / role, preprocessing_pipeline, prepared_data_cache)
         for role, paths in split.roles().items()
     }
     mask_directory = config.folders[DatasetRole.MASKS].resolved_path()
@@ -383,15 +388,24 @@ def _stage_preprocessed_images(
     paths: Iterable[Path],
     destination: Path,
     preprocessing_pipeline: PreprocessingPipeline,
+    prepared_data_cache: PreparedDataCache | None,
 ) -> tuple[_StagedImage, ...]:
     destination.mkdir(parents=True, exist_ok=True)
     staged: list[_StagedImage] = []
     for source_index, source_path in enumerate(paths):
         source_path = source_path.resolve()
-        for prepared in preprocessing_pipeline.prepare_path(source_path):
-            staged_path = (destination / f"{source_index:06d}_tile{prepared.tile.index:02d}_{source_path.stem}.png").resolve()
-            Image.fromarray(prepared.image_rgb, "RGB").save(staged_path)
-            staged.append(_StagedImage(source_path, staged_path, prepared.tile))
+        if prepared_data_cache is None:
+            prepared_tiles = preprocessing_pipeline.prepare_path(source_path)
+            for prepared in prepared_tiles:
+                staged_path = (destination / f"{source_index:06d}_tile{prepared.tile.index:02d}_{source_path.stem}.png").resolve()
+                Image.fromarray(prepared.image_rgb, "RGB").save(staged_path)
+                staged.append(_StagedImage(source_path, staged_path, prepared.tile))
+            continue
+        cached_tiles = prepared_data_cache.materialize(source_path)
+        for tile, cached_path in zip(preprocessing_pipeline.plan.tiles, cached_tiles, strict=True):
+            staged_path = (destination / f"{source_index:06d}_tile{tile.index:02d}_{source_path.stem}.png").resolve()
+            shutil.copy2(cached_path, staged_path)
+            staged.append(_StagedImage(source_path, staged_path, tile))
     return tuple(staged)
 
 

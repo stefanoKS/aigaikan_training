@@ -48,6 +48,25 @@ def test_canonical_checkpoint_is_engine_selected_and_hash_verified(tmp_path: Pat
     assert read_canonical_checkpoint(tmp_path) == canonical
 
 
+def test_canonical_checkpoint_can_use_a_run_relative_path_for_relocated_packages(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "canonical_checkpoint.ckpt"
+    checkpoint.write_bytes(b"portable model")
+    canonical = resolve_canonical_checkpoint(FakeEngine(checkpoint))
+    write_run_manifest(
+        tmp_path / "run_manifest.json",
+        canonical_checkpoint=canonical,
+        dataset_manifest_sha256="a" * 64,
+        split_counts={"final_test": {"ok": 1, "ng": 1}},
+        threshold=0.5,
+    )
+    manifest_path = tmp_path / "run_manifest.json"
+    manifest = __import__("json").loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["canonical_checkpoint"]["path"] = "canonical_checkpoint.ckpt"
+    manifest_path.write_text(__import__("json").dumps(manifest), encoding="utf-8")
+
+    assert read_canonical_checkpoint(tmp_path) == canonical
+
+
 def test_missing_engine_checkpoint_is_not_replaced_by_a_timestamp_search() -> None:
     with pytest.raises(RuntimeError, match="canonical final checkpoint"):
         resolve_canonical_checkpoint(FakeEngine(None))

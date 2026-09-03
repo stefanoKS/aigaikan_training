@@ -2,7 +2,7 @@
 
 ## Application purpose
 
-Anomalib Trainer is a Windows desktop application for creating reproducible anomaly-detection training runs from inspection images. It supports exactly four stock Anomalib 2.6.0 configurations: PatchCore, PaDiM, Dinomaly-DINOv2, and Dinomaly-DINOv3. Production validation requires a real train, evaluation, Torch export, reload, and score-parity pass for each configuration; unit tests alone are not production evidence.
+Anomalib Trainer is a Windows desktop application for creating reproducible anomaly-detection training runs from inspection images. PatchCore, PaDiM, Dinomaly-DINOv2, and Dinomaly-DINOv3 have validated training paths; AnomalyDINO, SuperADD, EfficientAD, and SuperSimpleNet are explicitly experimental. No model is currently declared portable-export validated. Promotion requires a real train, evaluation, Torch export, reload, and score-parity pass for that exact configuration; unit tests alone are not production evidence.
 
 ## Screenshots
 
@@ -93,14 +93,20 @@ The project and every run persist canonical `inspection_region.json` metadata. R
 1. Select the OK folders and, when available, genuine NG folders from the Dataset page.
 2. Optionally select the NG mask folder.
 3. Validate the dataset from the Dataset page.
-4. Choose PatchCore, PaDiM, `dinomaly_dinov2`, or `dinomaly_dinov3` on the Training Configuration page.
+4. Choose a model with a lifecycle status appropriate for the work. Training-validated models are preferred; experimental models require local acceptance evidence.
 5. Start training from the Training page.
 
 The supported profiles are fixed and use Anomalib-native preprocessing: PatchCore uses `wide_resnet50_2`, `layer2`/`layer3`, coreset ratio `0.1`, nine neighbors, batch size 8, and one epoch; PaDiM uses `resnet18` with `layer1`/`layer2`/`layer3` and one epoch; Dinomaly-DINOv2 uses `vit_base_patch14_reg4_dinov2`; and Dinomaly-DINOv3 uses `vit_base_patch16_dinov3.lvd1689m`. Both Dinomaly profiles use decoder depth 8, bottleneck dropout 0.2, context recentering disabled, and an automatic budget of $\max(5000, \lceil \text{training images} / \text{batch size} \rceil)$ optimizer steps unless an explicit advanced override is saved. Dinomaly-DINOv3 uses Anomalib's `448x448` resize with a `384x384` center crop, because its $16$-pixel patch grid requires dimensions divisible by $16$. The application does not impose a global image-size preprocessor override.
 
 Threshold calibration always uses held-out calibration predictions, never final-test predictions. Automatic calibration uses labeled F1 when genuine held-out OK and NG samples exist; otherwise it uses normal-only conformal calibration at the selected normal false-reject target (default $0.5\%$). Normal-only calibration establishes an operating point, not universal defect detection. The legacy maximum-score method is explicitly marked as conservative; synthetic anomaly calibration is unavailable until a dedicated generator can provide honest provenance.
 
+Every prediction records its raw model score separately from its Anomalib-postprocessed score and map. Calibration and operational image thresholds apply only to the declared postprocessed score semantic and use `score >= threshold`. Raw scores are preserved for provenance and are not clamped into the postprocessed $[0, 1]$ domain.
+
+For preprocessing contract v3, overlapping external tiles are feather-blended and the image decision score is calculated from the reconstructed valid-ROI map. Legacy v2 keeps its original maximum-overlap reconstruction behavior. SuperADD does not allow external tiling: its native patching and top-$0.1\%$ mean score aggregation are retained. Its native normalization and percentile thresholds are fitted from held-out OK validation images only; the application still performs its own post-fit calibration on all held-out evidence.
+
 Every completed run records `dataset_manifest.json`, `calibration_manifest.json`, `final_test_manifest.json`, `config.json`, `environment.json`, `inspection_region.json`, `run_manifest.json`, `results.json`, final-test `predictions.csv`, and an immutable `evaluation_revisions` record. The run manifest identifies the Anomalib-selected checkpoint by path and SHA-256 hash and stores threshold method, value, revision, calibration manifest hash, sample counts, operating target, observed false-reject rate, score-distribution evidence, and fixed-ROI provenance. Inference and export reject runs whose canonical checkpoint, threshold, or inspection ROI metadata is missing, mismatched, or changed.
+
+Before staging a run snapshot, deterministic model-ready image tiles are cached under the project `prepared_data_cache` directory. Each immutable entry is keyed by source SHA-256 and the resolved preprocessing-plan SHA-256, and records tile checksums and expected RGB dimensions. Invalid or corrupt entries are discarded and rebuilt before use; each run records cache hit, miss, and rebuild counts in its metrics and manifest. Run snapshots remain independent copied files for reproducibility. Delete `prepared_data_cache` while no training job is active to reclaim its storage; it will be rebuilt on the next run.
 
 ## Reading the results
 
@@ -109,6 +115,8 @@ The Results page shows:
 - final-test predictions with source path, dataset role, ground truth, prediction, score, threshold, and correctness
 - factory quality metrics including NG tested/detected/missed, NG detection rate, escape rate, false-reject count/rate, and the complete OK/NG confusion matrix when genuine NG test data exists
 - threshold method, revision, calibration counts, normal false-reject target/observation, and observed score quantiles
+- an active, immutable image/pixel threshold revision. Creating a revision regenerates labels, masks, contours, and visual artifacts from saved postprocessed continuous maps without running a model. Original `results.json` and final-test artifacts remain unchanged. `active_threshold_revision.json` selects a checksummed revision; the revision CSV and artifact directory are stored under `threshold_revisions`.
+- anomaly maps rendered with a fixed unit-interval color transform. The continuous map is retained unchanged, valid-ROI masks are saved with it, and padded or invalid pixels remain transparent in heatmaps and unchanged in overlays.
 - `NOT VERIFIED` and the prominent warning `NO GENUINE NG TEST DATA. DEFECT-DETECTION PERFORMANCE HAS NOT BEEN VERIFIED.` when no genuine NG final-test data exists. NG detection, escape, AUROC, precision, recall, and F1 are then `NOT MEASURED`.
 - filterable result rows plus CSV/JSON export, result-folder access, and multi-run comparison. Direct quality comparisons require identical complete source split manifests and inspection ROI hashes.
 
@@ -116,7 +124,7 @@ AUROC and F1 are supplementary ranking metrics. An escaped NG is always treated 
 
 ## Model export
 
-The Results page defaults to Torch `.pt` through **Export for AIGAIKAN**; ONNX and OpenVINO remain optional advanced formats. Export uses the run-manifest checkpoint rather than the newest file in a folder, verifies its SHA-256 hash first, and checks that every produced artifact is nonempty. OpenVINO exports must include both the `.xml` graph and `.bin` weights file. Every export creates a named deployment folder containing the validated artifact, final-test predictions, configuration, environment report, dataset/calibration/final-test/run manifests, `inspection_region.json`, result report, validation sidecars, and `deployment_manifest.json` hashes. Deployment metadata records the ROI version, type, sidecar, hash, source resolution, and rectified dimensions. The versioned deployment contract preserves exact threshold metadata and requires exact decision parity plus format-specific image-score parity (Torch: `0.0001`; ONNX/OpenVINO: `0.001`) against stored final-test predictions after the identical fixed ROI processor. This validates Anomalib deployment parity, not compatibility in the target AIGAIKAN runtime or defect-detection performance when genuine NG test data is absent.
+Export is blocked for every default model until it reaches `TORCH_EXPORT_VALIDATED`; the interface does not treat an unverified export as deployable. Once a model passes that evidence gate, export uses the manifest-verified canonical checkpoint rather than the newest file in a folder and packages its own `canonical_checkpoint.ckpt` with a relative manifest reference. OpenVINO exports must include both the `.xml` graph and `.bin` weights file. The package includes configuration, environment report, dataset/calibration/final-test/run manifests, `inspection_region.json`, result report, validation sidecars, and `deployment_manifest.json` hashes. Deployment validation requires exact decision parity and format-specific image-score parity (Torch: `0.0001`; ONNX/OpenVINO: `0.001`) against stored final-test predictions, using the same fixed ROI and reconstructed valid-map v3 scoring as the application. This is Anomalib deployment evidence only; it is not compatibility evidence for the separate AIGAIKAN runtime or defect-detection evidence when genuine NG test data is absent.
 
 ## Reevaluation without retraining
 
@@ -180,4 +188,4 @@ Then copy the built `release\` artifacts to the target PC.
 
 ## Model support policy
 
-The production surface is intentionally restricted to the four configurations listed above. Adding another model requires a separate validation contract covering training, evaluation, export, reload, numerical score parity, and documentation before it can become selectable.
+Lifecycle status is evidence-based. Training-validated models have automated training-path coverage; experimental models have not met that bar. `TORCH_EXPORT_VALIDATED` requires real train/export/reload numerical and decision-parity evidence, and is the only status permitted to export. No default definition currently has that status.

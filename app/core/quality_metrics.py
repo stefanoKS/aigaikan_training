@@ -89,13 +89,27 @@ def calculate_quality_metrics(
     }
     status = "WARNING"
     warning = ""
+    no_ng_warning = "NO GENUINE NG TEST DATA. DEFECT-DETECTION PERFORMANCE HAS NOT BEEN VERIFIED."
     if not actual_ng:
-        status = "NOT VERIFIED"
-        warning = "NO GENUINE NG TEST DATA. DEFECT-DETECTION PERFORMANCE HAS NOT BEEN VERIFIED."
         metrics["Defect Detection Evidence"] = "NOT MEASURED"
-    elif escaped_ng:
+    if escaped_ng:
         status = "FAIL"
         warning = "Escaped NG final-test images exceed the zero-escape requirement."
+    elif (
+        acceptance_policy is not None
+        and actual_ok
+        and false_reject / len(actual_ok) > acceptance_policy.maximum_false_reject_rate
+    ):
+        status = "FAIL"
+        warning = (
+            f"False reject rate {false_reject / len(actual_ok):.6g} exceeds the configured maximum "
+            f"{acceptance_policy.maximum_false_reject_rate:.6g}."
+        )
+        if not actual_ng:
+            warning = f"{warning} {no_ng_warning}"
+    elif not actual_ng:
+        status = "NOT VERIFIED"
+        warning = no_ng_warning
     elif acceptance_policy is None:
         warning = "Final-test acceptance policy is not configured; false-reject acceptability is not established."
     elif len(actual_ok) < acceptance_policy.minimum_ok_test_images or len(actual_ng) < acceptance_policy.minimum_ng_test_images:
@@ -105,12 +119,6 @@ def calculate_quality_metrics(
         if len(actual_ng) < acceptance_policy.minimum_ng_test_images:
             evidence_gaps.append(f"NG {len(actual_ng)}/{acceptance_policy.minimum_ng_test_images}")
         warning = f"Final-test evidence is insufficient for acceptance: {', '.join(evidence_gaps)}."
-    elif false_reject / len(actual_ok) > acceptance_policy.maximum_false_reject_rate:
-        status = "FAIL"
-        warning = (
-            f"False reject rate {false_reject / len(actual_ok):.6g} exceeds the configured maximum "
-            f"{acceptance_policy.maximum_false_reject_rate:.6g}."
-        )
     else:
         status = "PASS"
     return QualityReport(metrics=metrics, status=status, warning=warning)

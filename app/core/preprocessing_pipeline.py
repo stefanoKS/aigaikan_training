@@ -13,7 +13,13 @@ from PIL import Image
 
 from app.core.inspection_region import InspectionRegionProcessor
 from app.models.inspection_region import InspectionRegionConfig
-from app.models.preprocessing_config import PreprocessingConfig, PreprocessingTile, ResolvedPreprocessingPlan, ScoreAggregation
+from app.models.preprocessing_config import (
+    LEGACY_PREPROCESSING_CONTRACT_VERSION,
+    PreprocessingConfig,
+    PreprocessingTile,
+    ResolvedPreprocessingPlan,
+    ScoreAggregation,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,13 +161,15 @@ class PreprocessingPipeline:
         return self._aggregate_values(values)
 
     def reconstruct_anomaly_maps(self, anomaly_maps: Iterable[Any]) -> ReconstructedAnomalyMap:
-        """Reassemble one map per tile into complete rectified ROI coordinates."""
+        """Reassemble tile maps into source coordinates with seam-resistant v3 overlap blending."""
         values = tuple(anomaly_maps)
         if len(values) != len(self.plan.tiles):
             raise ValueError("Tile anomaly-map count does not match the preprocessing plan.")
         rectified_width, rectified_height = self.plan.rectified_size
         reconstructed = np.full((rectified_height, rectified_width), np.nan, dtype=np.float32)
         coverage = np.zeros((rectified_height, rectified_width), dtype=bool)
+        weighted_sum = np.zeros((rectified_height, rectified_width), dtype=np.float64)
+        weight_sum = np.zeros((rectified_height, rectified_width), dtype=np.float64)
         for tile, anomaly_map in zip(self.plan.tiles, values, strict=True):
             tile_map = self._map_at_model_resolution(anomaly_map, tile)
             padded_width, padded_height = tile.padded_size
@@ -170,14 +178,33 @@ class PreprocessingPipeline:
                 tile_map = cv2.resize(tile_map, (padded_width, padded_height), interpolation=cv2.INTER_LINEAR)
             x, y, width, height = tile.rectified_box
             valid_map = tile_map[:height, :width]
+            if not np.isfinite(valid_map).all():
+                raise ValueError("Tile anomaly map contains non-finite valid pixels.")
             destination = reconstructed[y : y + height, x : x + width]
             destination_coverage = coverage[y : y + height, x : x + width]
-            destination[~destination_coverage] = valid_map[~destination_coverage]
-            destination[destination_coverage] = np.maximum(destination[destination_coverage], valid_map[destination_coverage])
+            if self.plan.preprocessing_contract_version == LEGACY_PREPROCESSING_CONTRACT_VERSION:
+                destination[~destination_coverage] = valid_map[~destination_coverage]
+                destination[destination_coverage] = np.maximum(destination[destination_coverage], valid_map[destination_coverage])
+            else:
+                weights = self._tile_blend_weights(tile)
+                weighted_sum[y : y + height, x : x + width] += valid_map * weights
+                weight_sum[y : y + height, x : x + width] += weights
             destination_coverage[:] = True
         if not coverage.all():
             raise ValueError("Tile reconstruction does not cover every rectified ROI pixel.")
+        if self.plan.preprocessing_contract_version != LEGACY_PREPROCESSING_CONTRACT_VERSION:
+            if (weight_sum[coverage] <= 0).any():
+                raise ValueError("Tile reconstruction produced an uncovered blend region.")
+            reconstructed[coverage] = (weighted_sum[coverage] / weight_sum[coverage]).astype(np.float32)
         return ReconstructedAnomalyMap(anomaly_map=reconstructed, valid_mask=coverage)
+
+    @staticmethod
+    def _tile_blend_weights(tile: PreprocessingTile) -> np.ndarray:
+        """Use a deterministic center-weighted feather so tile joins have no ownership discontinuity."""
+        _x, _y, width, height = tile.rectified_box
+        horizontal = 1.0 - np.abs(((np.arange(width, dtype=np.float64) + 0.5) / width) * 2.0 - 1.0)
+        vertical = 1.0 - np.abs(((np.arange(height, dtype=np.float64) + 0.5) / height) * 2.0 - 1.0)
+        return np.outer(vertical, horizontal)
 
     def score_from_reconstructed_map(self, reconstructed: ReconstructedAnomalyMap) -> float:
         """Aggregate the deduplicated reconstructed map for source-image decisions."""

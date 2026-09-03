@@ -35,6 +35,7 @@ from app.core.model_registry import ModelExecutionMode, ModelRegistry
 from app.core.preprocessing_contract import preprocessing_hash
 from app.core.run_comparison import compare_training_runs
 from app.core.threshold_calibrator import ThresholdMethod
+from app.core.threshold_contract import ImageThresholdOperatingPoint, PixelThresholdOperatingPoint
 from app.core.project_manager import ProjectManager
 from app.core.result_parser import ResultParser
 from app.core.inspection_region import inspection_region_hash
@@ -61,6 +62,7 @@ from app.models.training_config import DeviceMode, TrainingConfig
 from app.models.training_run import TrainingRun
 from app.models.prediction_result import PredictionResult
 from app.services.export_service import ExportService
+from app.services.threshold_revision_service import ThresholdRevisionService
 from app.ui.pages.config_page import ConfigPage
 from app.ui.pages.dataset_page import DatasetPage
 from app.ui.pages.home_page import HomePage
@@ -98,6 +100,7 @@ class MainWindow(QMainWindow):
         self.inference_controller = InferenceController(self)
         self.result_parser = ResultParser()
         self.export_service = ExportService()
+        self.threshold_revision_service = ThresholdRevisionService()
         self.current_project: ProjectConfig | None = None
         self._run_metrics: dict[str, str] = {}
         self._inference_run_directory: Path | None = None
@@ -276,6 +279,7 @@ class MainWindow(QMainWindow):
         self.results_page.export_json_button.clicked.connect(self._export_results_json)
         self.results_page.open_folder_button.clicked.connect(self._open_results_folder)
         self.results_page.compare_button.clicked.connect(self._compare_results)
+        self.results_page.threshold_revision_requested.connect(self._apply_threshold_revision)
 
         self.training_page.start_button.clicked.connect(self._start_training)
         self.training_page.cancel_button.clicked.connect(self.training_controller.cancel)
@@ -401,6 +405,45 @@ class MainWindow(QMainWindow):
             )
             self.results_page.set_training_run(self.results_page.current_run)
 
+    def _apply_threshold_revision(
+        self,
+        existing_revision_id: str,
+        image_threshold: float,
+        pixel_mask_enabled: bool,
+        pixel_threshold: float,
+    ) -> None:
+        """Create or select an immutable decision revision and display its regenerated predictions."""
+        run_directory = self.results_page.current_run_directory
+        current_run = self.results_page.current_run
+        if run_directory is None or current_run is None:
+            QMessageBox.information(self, "No Training Run", "Complete or load a training run before changing decisions.")
+            return
+        try:
+            if existing_revision_id:
+                revision = self.threshold_revision_service.activate_revision(run_directory, existing_revision_id)
+            else:
+                score_semantic = str(
+                    current_run.threshold_metadata.get(
+                        "score_semantic",
+                        "anomalib_postprocessed_pred_score_v1",
+                    )
+                )
+                revision = self.threshold_revision_service.create_revision(
+                    run_directory,
+                    ImageThresholdOperatingPoint(image_threshold, score_semantic),
+                    PixelThresholdOperatingPoint(pixel_mask_enabled, pixel_threshold),
+                )
+            revised_predictions = self.result_parser.read_predictions_csv(revision.predictions_path)
+        except (OSError, ValueError, TypeError) as exc:
+            QMessageBox.warning(self, "Threshold Revision Failed", str(exc))
+            return
+        self.results_page.display_threshold_revision(
+            revision.revision_path.stem,
+            revision.image_operating_point.threshold,
+            revision.pixel_operating_point.active_threshold,
+            revised_predictions,
+        )
+
     def _export_results_csv(self) -> None:
         run = self.results_page.current_run
         if run is None:
@@ -427,7 +470,41 @@ class MainWindow(QMainWindow):
             "JSON Files (*.json)",
         )
         if selected:
-            self.result_parser.write_training_run(Path(selected), run)
+            try:
+                self.result_parser.write_training_run(Path(selected), self._displayed_results_export_run(run))
+            except (OSError, ValueError, TypeError) as exc:
+                QMessageBox.warning(self, "Could Not Export Results", str(exc))
+
+    def _displayed_results_export_run(self, run: TrainingRun) -> TrainingRun:
+        """Return a detached export view when the Results page displays a selected threshold revision."""
+        revision_id = self.results_page.active_threshold_revision_id
+        if not revision_id:
+            return run
+        run_directory = self.results_page.current_run_directory
+        if run_directory is None:
+            raise ValueError("The active threshold revision has no completed run directory.")
+        revision = self.threshold_revision_service.read_active_revision(run_directory)
+        if revision is None or revision.revision_path.stem != revision_id:
+            raise ValueError("The displayed threshold revision is not the active immutable revision.")
+        metadata = dict(run.threshold_metadata)
+        image_operating_point = revision.image_operating_point.to_dict()
+        metadata.update(
+            {
+                "threshold_value": image_operating_point["threshold"],
+                "threshold_raw": image_operating_point["threshold"],
+                "threshold_deployed": image_operating_point["threshold"],
+                "score_semantic": image_operating_point["score_semantic"],
+                "decision_comparator": image_operating_point["comparator"],
+                "pixel_operating_point": revision.pixel_operating_point.to_dict(),
+                "threshold_revision": revision_id,
+            }
+        )
+        return replace(
+            run,
+            predictions=self.results_page.displayed_predictions(),
+            threshold_metadata=metadata,
+            evaluation_revision_id=revision_id,
+        )
 
     def _open_results_folder(self) -> None:
         directory = self.results_page.current_run_directory
@@ -1108,6 +1185,7 @@ class MainWindow(QMainWindow):
                     and run.preprocessing_hash == expected_preprocessing_hash
                 ):
                     self.results_page.set_training_run(run)
+                    self._display_active_threshold_revision(summary_path.parent)
                     return
             except (OSError, ValueError, TypeError):
                 continue
@@ -1162,7 +1240,12 @@ class MainWindow(QMainWindow):
             return False
         try:
             read_canonical_checkpoint(run_directory)
-            decision_threshold = read_persisted_threshold(run_directory)
+            active_revision = self.threshold_revision_service.read_active_revision(run_directory)
+            decision_threshold = (
+                active_revision.image_operating_point.threshold
+                if active_revision is not None
+                else read_persisted_threshold(run_directory)
+            )
             run_inspection_region = read_verified_inspection_region(run_directory)
             run_preprocessing_plan = read_verified_preprocessing_plan(run_directory)
             if self.current_project is not None and inspection_region_hash(run_inspection_region) != inspection_region_hash(
@@ -1190,6 +1273,18 @@ class MainWindow(QMainWindow):
         self.inference_page.set_training_run(run_directory, model_name, decision_threshold)
         self.inference_page.set_status(preprocessing_status)
         return True
+
+    def _display_active_threshold_revision(self, run_directory: Path) -> None:
+        """Restore regenerated results for the active revision without altering canonical results."""
+        revision = self.threshold_revision_service.read_active_revision(run_directory)
+        if revision is None:
+            return
+        self.results_page.display_threshold_revision(
+            revision.revision_path.stem,
+            revision.image_operating_point.threshold,
+            revision.pixel_operating_point.active_threshold,
+            self.result_parser.read_predictions_csv(revision.predictions_path),
+        )
 
     def _choose_inference_image(self) -> None:
         selected, _ = QFileDialog.getOpenFileName(

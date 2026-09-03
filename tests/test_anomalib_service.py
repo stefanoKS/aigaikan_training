@@ -375,6 +375,47 @@ def test_calibration_datamodule_never_splits_the_final_test_subset(tmp_path: Pat
     assert datamodule.kwargs["val_split_mode"] == "same_as_test"
 
 
+def test_superadd_fit_validation_uses_only_held_out_normal_images(tmp_path: Path, monkeypatch) -> None:
+    class FakeFolder:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+    class FakeEngine:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+    class FakeSuperADD:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+    anomalib_data = ModuleType("anomalib.data")
+    anomalib_engine = ModuleType("anomalib.engine")
+    anomalib_models = ModuleType("anomalib.models")
+    anomalib_data.Folder = FakeFolder
+    anomalib_engine.Engine = FakeEngine
+    anomalib_models.SuperADD = FakeSuperADD
+    monkeypatch.setitem(sys.modules, "anomalib.data", anomalib_data)
+    monkeypatch.setitem(sys.modules, "anomalib.engine", anomalib_engine)
+    monkeypatch.setitem(sys.modules, "anomalib.models", anomalib_models)
+    for name in ("ok_train", "validation_ok", "validation_ng", "masks"):
+        (tmp_path / name).mkdir()
+    dataset = DatasetConfig()
+    dataset.folders[DatasetRole.OK_TRAIN].path = str(tmp_path / "ok_train")
+    dataset.folders[DatasetRole.OK_TEST].path = str(tmp_path / "validation_ok")
+    dataset.folders[DatasetRole.NG_TEST].path = str(tmp_path / "validation_ng")
+    dataset.folders[DatasetRole.MASKS].path = str(tmp_path / "masks")
+
+    components = AnomalibService().create_components(
+        dataset,
+        TrainingConfig(model_name="super_add", device=DeviceMode.CPU),
+        calibration_mode=True,
+    )
+
+    assert components["datamodule"].kwargs["normal_test_dir"] == (tmp_path / "validation_ok").resolve()
+    assert components["datamodule"].kwargs["abnormal_dir"] is None
+    assert components["datamodule"].kwargs["mask_dir"] is None
+
+
 def test_enabled_inspection_roi_is_applied_to_every_datamodule_stage(tmp_path: Path, monkeypatch) -> None:
     class FakeFolder:
         def __init__(self, **kwargs) -> None:

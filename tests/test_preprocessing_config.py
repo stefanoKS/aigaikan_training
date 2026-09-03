@@ -87,6 +87,11 @@ def test_super_add_v3_padding_uses_the_dynamic_roi_and_its_verified_minimum_canv
     assert plan.resolved_padding == (0, 0, 9, 251)
 
 
+def test_super_add_rejects_external_tiling_to_preserve_native_patching() -> None:
+    with pytest.raises(ValueError, match="native internal patching"):
+        PreprocessingConfig(tiling=TilingConfig(enabled=True)).resolve("super_add", (640, 448))
+
+
 @pytest.mark.parametrize("contract_version", [LEGACY_PREPROCESSING_CONTRACT_VERSION, 3])
 def test_efficient_ad_padding_uses_its_verified_minimum_encoder_canvas(contract_version: int) -> None:
     plan = PreprocessingConfig(preprocessing_contract_version=contract_version).resolve("efficient_ad", (640, 192))
@@ -182,7 +187,7 @@ def test_tiled_pipeline_reconstructs_every_valid_reference_pixel() -> None:
     assert reconstructed.anomaly_map.shape == (177, 639)
     assert reconstructed.valid_mask.all()
     assert reconstructed.anomaly_map[20, 10] == 1
-    assert reconstructed.anomaly_map[20, 200] == 2
+    assert 1 < reconstructed.anomaly_map[20, 200] < 2
     assert reconstructed.anomaly_map[20, 500] == 3
 
 

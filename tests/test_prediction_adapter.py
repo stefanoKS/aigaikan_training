@@ -10,7 +10,10 @@ import pytest
 from app.core.prediction_adapter import (
     ANOMALIB_POSTPROCESSED_SCORE_SEMANTIC,
     LEGACY_VALID_MAP_SCORE_SEMANTIC,
+    PostprocessedPredictionBatch,
     PreprocessedPredictionAccumulator,
+    RECONSTRUCTED_VALID_MAP_SCORE_SEMANTIC,
+    SUPERADD_NATIVE_IMAGE_SCORE_SEMANTIC,
     iter_anomalib_predictions,
     iter_preprocessed_predictions,
 )
@@ -63,6 +66,37 @@ def test_preprocessing_v3_adapter_preserves_the_native_full_image_score(tmp_path
     assert predictions[0].anomaly_map.shape == (177, 639)
 
 
+def test_superadd_v3_adapter_uses_raw_top_quantile_score_without_losing_native_postprocessing(tmp_path) -> None:
+    source_path = (tmp_path / "source.png").resolve()
+    staged_path = (tmp_path / "staged.png").resolve()
+    pipeline = PreprocessingPipeline(
+        InspectionRegionConfig(),
+        PreprocessingConfig().resolve("super_add", (639, 177)),
+    )
+    postprocessed_map = np.full((448, 640), 0.4, dtype=np.float32)
+    raw_map = np.full((448, 640), 0.6, dtype=np.float32)
+    output = PostprocessedPredictionBatch(
+        {"image_path": [str(staged_path)], "pred_score": [1.0], "anomaly_map": [postprocessed_map]},
+        (0.6,),
+        (raw_map,),
+    )
+
+    prediction = next(
+        iter_preprocessed_predictions(
+            output,
+            {staged_path: source_path},
+            {staged_path: pipeline.plan.tiles[0]},
+            pipeline,
+        )
+    )
+
+    assert prediction.score == pytest.approx(0.6)
+    assert prediction.score_semantic == SUPERADD_NATIVE_IMAGE_SCORE_SEMANTIC
+    assert prediction.native_image_score == pytest.approx(1.0)
+    assert prediction.postprocessed_image_score == pytest.approx(1.0)
+    assert prediction.postprocessed_score_semantic == ANOMALIB_POSTPROCESSED_SCORE_SEMANTIC
+
+
 def test_preprocessing_v2_adapter_preserves_legacy_valid_map_score_semantics(tmp_path) -> None:
     source_path = (tmp_path / "source.png").resolve()
     staged_path = (tmp_path / "staged.png").resolve()
@@ -113,11 +147,12 @@ def test_preprocessing_v2_adapter_reconstructs_tiled_source_predictions(tmp_path
     )
 
     assert len(predictions) == 1
-    assert predictions[0].score == 0.3
+    assert predictions[0].score == pytest.approx(3.0)
     assert predictions[0].native_tile_scores == (0.1, 0.2, 0.3)
     assert predictions[0].anomaly_map[20, 10] == 1
-    assert predictions[0].anomaly_map[20, 200] == 2
+    assert 1 < predictions[0].anomaly_map[20, 200] < 2
     assert predictions[0].anomaly_map[20, 500] == 3
+    assert predictions[0].score_semantic == RECONSTRUCTED_VALID_MAP_SCORE_SEMANTIC
 
 
 def test_preprocessed_prediction_accumulator_streams_a_source_after_its_last_tile(tmp_path) -> None:
@@ -152,5 +187,5 @@ def test_preprocessed_prediction_accumulator_streams_a_source_after_its_last_til
 
     assert len(streamed) == 1
     assert streamed[0].source_path == source_path
-    assert streamed[0].score == pytest.approx(0.3)
+    assert streamed[0].score == pytest.approx(3.0)
     accumulator.finalize()

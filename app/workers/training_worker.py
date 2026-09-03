@@ -19,12 +19,15 @@ from app.core.dataset_validator import DatasetValidator
 from app.core.inspection_region import InspectionRegionProcessor, inspection_region_hash, validate_inspection_region_sources, write_inspection_region
 from app.core.model_registry import ModelExecutionMode
 from app.core.prediction_artifacts import PredictionArtifacts, inspection_region_metadata, save_prediction_artifacts
-from app.core.prediction_adapter import iter_anomalib_predictions, iter_preprocessed_predictions
+from app.core.prediction_adapter import explicitly_postprocessed_predict, iter_anomalib_predictions, iter_preprocessed_predictions
+from app.core.prediction_contract import PREDICTION_CONTRACT_VERSION, RAW_SCORE_SEMANTIC
+from app.core.prepared_data_cache import PreparedDataCache
 from app.core.preprocessing_contract import preprocessing_hash, resolved_preprocessing_hash, write_resolved_preprocessing_plan
 from app.core.preprocessing_pipeline import PreprocessingPipeline, resolve_preprocessing_plan
 from app.core.project_manager import ProjectManager
 from app.core.quality_metrics import FinalTestAcceptancePolicy, calculate_quality_metrics
 from app.core.result_parser import ResultParser
+from app.core.score_diagnostics import summarize_prediction_score_ranges
 from app.core.run_artifacts import resolve_canonical_checkpoint, write_evaluation_revision, write_run_manifest
 from app.core.threshold_calibrator import CalibrationSample, ThresholdCalibrationConfig, ThresholdCalibrator
 from app.models.prediction_result import PredictionResult
@@ -168,7 +171,7 @@ def calibration_samples_from_predictions(
                 label = "NG"
             else:
                 raise ValueError(f"Calibration prediction path has an unexpected staged role: {prediction.staged_paths[0]}")
-            samples.append(CalibrationSample(score=prediction.score, label=label))
+            samples.append(CalibrationSample(score=prediction.score, label=label, score_semantic=prediction.score_semantic))
         return samples
     for prediction in iter_anomalib_predictions(output):
         if prediction.image_path not in source_path_by_staged_path:
@@ -180,7 +183,7 @@ def calibration_samples_from_predictions(
             label = "NG"
         else:
             raise ValueError(f"Calibration prediction path has an unexpected staged role: {prediction.image_path}")
-        samples.append(CalibrationSample(score=prediction.score, label=label))
+        samples.append(CalibrationSample(score=prediction.score, label=label, score_semantic=prediction.score_semantic))
     return samples
 
 
@@ -220,6 +223,8 @@ def _final_test_predictions(
                 len(predictions),
                 preprocessing_pipeline=preprocessing_pipeline,
                 pixel_threshold=pixel_threshold,
+                valid_roi_mask=prediction.valid_roi_mask,
+                raw_anomaly_map=prediction.raw_anomaly_map,
             )
             predictions.append(
                 PredictionResult(
@@ -233,6 +238,13 @@ def _final_test_predictions(
                     native_image_score=prediction.native_image_score,
                     native_tile_scores=list(prediction.native_tile_scores),
                     score_semantic=prediction.score_semantic,
+                    raw_image_score=prediction.raw_image_score,
+                    raw_score_semantic=RAW_SCORE_SEMANTIC if prediction.raw_image_score is not None else "",
+                    raw_anomaly_map=artifacts.raw_anomaly_map,
+                    postprocessed_image_score=prediction.postprocessed_image_score,
+                    postprocessed_score_semantic=prediction.postprocessed_score_semantic,
+                    postprocessed_anomaly_map=artifacts.continuous_anomaly_map,
+                    prediction_contract_version=PREDICTION_CONTRACT_VERSION,
                     continuous_anomaly_map=artifacts.continuous_anomaly_map,
                     anomaly_map=artifacts.heatmap_image,
                     overlay_image=artifacts.overlay_image,
@@ -265,6 +277,7 @@ def _final_test_predictions(
             len(predictions),
             inspection_region=inspection_region,
             pixel_threshold=pixel_threshold,
+            raw_anomaly_map=anomalib_prediction.raw_anomaly_map,
         )
         predictions.append(
             PredictionResult(
@@ -278,6 +291,13 @@ def _final_test_predictions(
                 native_image_score=anomalib_prediction.score,
                 native_tile_scores=[anomalib_prediction.score],
                 score_semantic=anomalib_prediction.score_semantic,
+                raw_image_score=anomalib_prediction.raw_image_score,
+                raw_score_semantic=RAW_SCORE_SEMANTIC if anomalib_prediction.raw_image_score is not None else "",
+                raw_anomaly_map=artifacts.raw_anomaly_map,
+                postprocessed_image_score=anomalib_prediction.score,
+                postprocessed_score_semantic=anomalib_prediction.score_semantic,
+                postprocessed_anomaly_map=artifacts.continuous_anomaly_map,
+                prediction_contract_version=PREDICTION_CONTRACT_VERSION,
                 continuous_anomaly_map=artifacts.continuous_anomaly_map,
                 anomaly_map=artifacts.heatmap_image,
                 overlay_image=artifacts.overlay_image,
@@ -302,6 +322,8 @@ def _prediction_artifacts(
     preprocessing_pipeline: PreprocessingPipeline | None = None,
     inspection_region: InspectionRegionConfig | None = None,
     pixel_threshold: float | None = None,
+    valid_roi_mask: Any = None,
+    raw_anomaly_map: Any = None,
 ) -> PredictionArtifacts:
     """Persist artifacts in the map coordinate system used for the prediction."""
     if artifact_directory is None:
@@ -318,6 +340,8 @@ def _prediction_artifacts(
         index,
         rectified_image=rectified_image,
         pixel_threshold=pixel_threshold,
+        valid_roi_mask=valid_roi_mask,
+        raw_anomaly_map=raw_anomaly_map,
     )
 
 
@@ -413,6 +437,7 @@ def run(project_file: Path) -> int:
             (path for paths in effective_split.roles().values() for path in paths),
         )
         preprocessing_pipeline = PreprocessingPipeline(project.inspection_region, preprocessing_plan)
+        prepared_data_cache = PreparedDataCache(project.root_path / "prepared_data_cache", preprocessing_pipeline)
         preprocessing_plan_hash = resolved_preprocessing_hash(preprocessing_plan)
         project_preprocessing_hash = preprocessing_hash(project.preprocessing)
         write_resolved_preprocessing_plan(run_dir / "preprocessing_plan.json", preprocessing_plan)
@@ -443,6 +468,19 @@ def run(project_file: Path) -> int:
             project.dataset,
             run_dir / "dataset_snapshot",
             preprocessing_pipeline,
+            prepared_data_cache,
+        )
+        cache_report = prepared_data_cache.report().to_dict()
+        emit(
+            {
+                "type": "log",
+                "level": "info",
+                "message": (
+                    "Prepared-data cache: "
+                    f"{cache_report['hits']} hits, {cache_report['misses']} misses, "
+                    f"{cache_report['rebuilt_entries']} rebuilt."
+                ),
+            }
         )
         environment = collect_environment_info(Path(project.project_path), project.training.random_seed)
         (run_dir / "environment.json").write_text(json.dumps(environment, indent=2), encoding="utf-8")
@@ -495,9 +533,20 @@ def run(project_file: Path) -> int:
                 "message": f"Using Anomalib canonical checkpoint: {canonical_checkpoint.path.name}",
             }
         )
-        calibration_predictions_output = components["engine"].predict(
+        calibration_predictions_output = explicitly_postprocessed_predict(
+            components["engine"],
             model=components["model"],
-            datamodule=components["datamodule"],
+            datamodule=(
+                service.create_datamodule(
+                    staged_dataset.training_config,
+                    project.training,
+                    calibration_mode=True,
+                    inspection_region=project.inspection_region,
+                    preprocessing_plan=preprocessing_plan,
+                )
+                if definition.key == "super_add"
+                else components["datamodule"]
+            ),
             return_predictions=True,
             ckpt_path=str(canonical_checkpoint.path),
         )
@@ -550,7 +599,8 @@ def run(project_file: Path) -> int:
         )
         _reset_gpu_peak_memory(str(components["device"]))
         emit({"type": "stage", "name": STAGES[6]})
-        final_predictions_output = components["engine"].predict(
+        final_predictions_output = explicitly_postprocessed_predict(
+            components["engine"],
             model=components["model"],
             datamodule=final_test_datamodule,
             return_predictions=True,
@@ -572,6 +622,8 @@ def run(project_file: Path) -> int:
             raise RuntimeError(
                 f"Final-test prediction count mismatch: expected {expected_prediction_count}, received {len(predictions)}."
             )
+        score_range_diagnostics = summarize_prediction_score_ranges(predictions)
+        threshold_metadata["final_test_score_ranges"] = score_range_diagnostics
         mean_inference_latency_ms = evaluation_duration * 1000 / len(predictions)
         peak_gpu_memory_mb = _peak_gpu_memory_mb(str(components["device"]))
         run_metrics: dict[str, float | str | None] = {
@@ -628,6 +680,11 @@ def run(project_file: Path) -> int:
         run_metrics["Preprocessing Model Input"] = f"{preprocessing_plan.model_input_size[0]}x{preprocessing_plan.model_input_size[1]}"
         run_metrics["Preprocessing Tile Count"] = len(preprocessing_plan.tiles)
         run_metrics["Score Aggregation"] = preprocessing_plan.score_aggregation.value
+        run_metrics["Decision Score Semantics"] = ", ".join(score_range_diagnostics["decision"])
+        run_metrics["Raw Score Semantics"] = ", ".join(score_range_diagnostics["raw"]) or "Not recorded"
+        run_metrics["Prepared Data Cache Hits"] = cache_report["hits"]
+        run_metrics["Prepared Data Cache Misses"] = cache_report["misses"]
+        run_metrics["Prepared Data Cache Rebuilt Entries"] = cache_report["rebuilt_entries"]
         result_parser.write_training_run(
             run_dir / "results.json",
             TrainingRun(
@@ -707,6 +764,7 @@ def run(project_file: Path) -> int:
                     "score_aggregation": preprocessing_plan.score_aggregation.value,
                     "tiled": preprocessing_plan.tiled,
                 },
+                "prepared_data_cache": cache_report,
                 "quality_status": quality_report.status,
                 "evaluation_method": effective_split.evaluation_method,
             },

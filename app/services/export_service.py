@@ -13,7 +13,7 @@ import shutil
 from typing import Any, Iterable
 
 from app.core.dataset_manifest import sha256_file
-from app.core.model_registry import ModelRegistry
+from app.core.model_registry import ModelRegistry, ModelSupportLevel
 from app.core.result_parser import ResultParser
 from app.core.inspection_region import InspectionRegionProcessor, inspection_region_hash
 from app.core.preprocessing_contract import resolved_preprocessing_hash
@@ -28,8 +28,9 @@ from app.models.prediction_result import PredictionResult
 from app.models.preprocessing_config import LEGACY_PREPROCESSING_CONTRACT_VERSION
 from app.models.training_config import TrainingConfig
 from app.services.anomalib_service import AnomalibService, REQUIRED_ANOMALIB_VERSION
+from app.services.threshold_revision_service import ThresholdRevisionResult, ThresholdRevisionService
 
-DEPLOYMENT_CONTRACT_VERSION = 1
+DEPLOYMENT_CONTRACT_VERSION = 2
 FORMAT_SCORE_TOLERANCES: dict[str, float] = {
     "torch": 1e-4,
     "onnx": 1e-3,
@@ -74,8 +75,10 @@ class ExportService:
         anomalib_service: AnomalibService | None = None,
         deployment_validator: Callable[[Path, str, list[PredictionResult], float, float], dict[str, object]] | None = None,
         score_tolerances: Mapping[str, float] | None = None,
+        model_registry: ModelRegistry | None = None,
     ) -> None:
         self.anomalib_service = anomalib_service or AnomalibService()
+        self.model_registry = model_registry or ModelRegistry()
         self._has_custom_deployment_validator = deployment_validator is not None
         self._deployment_validator = deployment_validator or self._validate_deployment
         self.score_tolerances = dict(FORMAT_SCORE_TOLERANCES)
@@ -100,13 +103,17 @@ class ExportService:
             raise ValueError("Select at least one model export format.")
 
         config = self._load_training_config(run_directory)
-        definition = ModelRegistry().get(config.model_name)
-        if not definition.supports_export:
+        definition = self.model_registry.get(config.model_name)
+        if not definition.supports_export or definition.support_level is not ModelSupportLevel.TORCH_EXPORT_VALIDATED:
             raise ValueError(
                 f"{definition.display_name} export is unavailable until an Anomalib export/reload/parity smoke test passes."
             )
         checkpoint_path = read_canonical_checkpoint(run_directory).path
-        threshold_metadata = read_persisted_threshold_metadata(run_directory)
+        active_revision = ThresholdRevisionService.read_active_revision(run_directory)
+        threshold_metadata = self._effective_threshold_metadata(
+            read_persisted_threshold_metadata(run_directory),
+            active_revision,
+        )
         inspection_region = read_verified_inspection_region(run_directory)
         preprocessing_plan = read_verified_preprocessing_plan(run_directory)
         preprocessing_pipeline = (
@@ -114,11 +121,19 @@ class ExportService:
         )
         inspection_processor = InspectionRegionProcessor(inspection_region) if preprocessing_pipeline is None else None
         decision_threshold = float(threshold_metadata["threshold_value"])
-        final_test_predictions = self._load_final_test_predictions(run_directory)
+        final_test_predictions = self._load_final_test_predictions(
+            run_directory,
+            active_revision.predictions_path if active_revision is not None else None,
+        )
         export_directory = export_directory.expanduser().resolve()
         package_directory = export_directory / self.package_directory_name(config.model_name, run_directory.name)
         package_directory.mkdir(parents=True, exist_ok=True)
-        included_artifacts = self._copy_run_artifacts(run_directory, package_directory)
+        packaged_checkpoint_path, included_artifacts = self._copy_run_artifacts(
+            run_directory,
+            package_directory,
+            checkpoint_path,
+            active_revision,
+        )
         components = (
             self.anomalib_service.create_inference_components(config, package_directory, preprocessing_plan)
             if preprocessing_plan is not None
@@ -171,7 +186,7 @@ class ExportService:
 
         self._write_package_manifest(
             package_directory,
-            canonical_checkpoint_path=checkpoint_path,
+            canonical_checkpoint_path=packaged_checkpoint_path,
             config=config,
             final_test_predictions=final_test_predictions,
             exported=exported,
@@ -209,7 +224,12 @@ class ExportService:
         return f"{ExportService._slugify(model_name)}_{ExportService._slugify(run_name)}_deployment"
 
     @staticmethod
-    def _copy_run_artifacts(run_directory: Path, package_directory: Path) -> dict[str, str]:
+    def _copy_run_artifacts(
+        run_directory: Path,
+        package_directory: Path,
+        canonical_checkpoint_path: Path,
+        active_revision: ThresholdRevisionResult | None = None,
+    ) -> tuple[Path, dict[str, str]]:
         """Copy all immutable records required to audit deployment decisions."""
         required_names = (
             "config.json",
@@ -231,7 +251,33 @@ class ExportService:
             target_path = package_directory / name
             shutil.copy2(source_path, target_path)
             copied[name] = sha256_file(target_path)
-        return copied
+        packaged_checkpoint_path = package_directory / "canonical_checkpoint.ckpt"
+        shutil.copy2(canonical_checkpoint_path, packaged_checkpoint_path)
+        copied[packaged_checkpoint_path.name] = sha256_file(packaged_checkpoint_path)
+
+        run_manifest_path = package_directory / "run_manifest.json"
+        run_manifest = json.loads(run_manifest_path.read_text(encoding="utf-8"))
+        checkpoint = run_manifest.get("canonical_checkpoint")
+        if not isinstance(checkpoint, dict):
+            raise ValueError("Copied run manifest does not contain a canonical checkpoint record.")
+        checkpoint["path"] = packaged_checkpoint_path.name
+        checkpoint["sha256"] = copied[packaged_checkpoint_path.name]
+        run_manifest_path.write_text(json.dumps(run_manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+        copied[run_manifest_path.name] = sha256_file(run_manifest_path)
+        if active_revision is not None:
+            revision_directory = package_directory / "threshold_revisions"
+            revision_directory.mkdir(exist_ok=True)
+            for source_path in (
+                run_directory / "active_threshold_revision.json",
+                active_revision.revision_path,
+                active_revision.predictions_path,
+            ):
+                relative_path = source_path.relative_to(run_directory)
+                target_path = package_directory / relative_path
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source_path, target_path)
+                copied[relative_path.as_posix()] = sha256_file(target_path)
+        return packaged_checkpoint_path, copied
 
     @staticmethod
     def _write_package_manifest(
@@ -256,7 +302,7 @@ class ExportService:
                 "id": config.model_name,
                 "profile": config.model_profile(),
             },
-            "canonical_checkpoint": str(canonical_checkpoint_path),
+            "canonical_checkpoint": canonical_checkpoint_path.name,
             "canonical_checkpoint_sha256": sha256_file(canonical_checkpoint_path),
             "final_test_prediction_count": len(final_test_predictions),
             "threshold_metadata": threshold_metadata,
@@ -281,11 +327,19 @@ class ExportService:
         return manifest_path
 
     @staticmethod
-    def _load_final_test_predictions(run_directory: Path) -> list[PredictionResult]:
-        results_path = run_directory / "results.json"
+    def _load_final_test_predictions(
+        run_directory: Path,
+        revision_predictions_path: Path | None = None,
+    ) -> list[PredictionResult]:
+        results_path = revision_predictions_path or run_directory / "results.json"
         if not results_path.is_file():
             raise FileNotFoundError(f"Final-test results not found: {results_path}")
-        predictions = ResultParser().read_training_run(results_path).predictions
+        parser = ResultParser()
+        predictions = (
+            parser.read_predictions_csv(results_path)
+            if revision_predictions_path is not None
+            else parser.read_training_run(results_path).predictions
+        )
         final_test_predictions = [
             prediction
             for prediction in predictions
@@ -294,6 +348,29 @@ class ExportService:
         if not final_test_predictions:
             raise ValueError("The run has no persisted final-test predictions for deployment parity validation.")
         return final_test_predictions
+
+    @staticmethod
+    def _effective_threshold_metadata(
+        threshold_metadata: Mapping[str, object],
+        active_revision: ThresholdRevisionResult | None,
+    ) -> dict[str, object]:
+        """Use an active immutable revision as the deployment decision contract when selected."""
+        effective = dict(threshold_metadata)
+        if active_revision is None:
+            return effective
+        image_operating_point = active_revision.image_operating_point.to_dict()
+        effective.update(
+            {
+                "threshold_value": image_operating_point["threshold"],
+                "threshold_raw": image_operating_point["threshold"],
+                "threshold_deployed": image_operating_point["threshold"],
+                "score_semantic": image_operating_point["score_semantic"],
+                "decision_comparator": image_operating_point["comparator"],
+                "pixel_operating_point": active_revision.pixel_operating_point.to_dict(),
+                "threshold_revision": active_revision.revision_path.stem,
+            }
+        )
+        return effective
 
     @staticmethod
     def _write_validation_report(
@@ -349,25 +426,12 @@ class ExportService:
                     inferencer.predict(prepared.image_rgb)
                     for prepared in preprocessing_pipeline.prepare_path(Path(expected.source_path))
                 ]
-                if (
-                    preprocessing_pipeline.plan.preprocessing_contract_version
-                    == LEGACY_PREPROCESSING_CONTRACT_VERSION
-                ):
-                    deployed_maps = [
-                        ExportService._deployment_anomaly_map(prediction)
-                        for prediction in deployed_predictions
-                    ]
-                    reconstructed = preprocessing_pipeline.reconstruct_anomaly_maps(deployed_maps)
-                    score = preprocessing_pipeline.score_from_reconstructed_map(reconstructed)
-                else:
-                    native_tile_scores = [
-                        ExportService._deployment_score(prediction) for prediction in deployed_predictions
-                    ]
-                    score = (
-                        native_tile_scores[0]
-                        if len(native_tile_scores) == 1
-                        else preprocessing_pipeline.aggregate_tile_scores(native_tile_scores)
-                    )
+                deployed_maps = [
+                    ExportService._deployment_anomaly_map(prediction)
+                    for prediction in deployed_predictions
+                ]
+                reconstructed = preprocessing_pipeline.reconstruct_anomaly_maps(deployed_maps)
+                score = preprocessing_pipeline.score_from_reconstructed_map(reconstructed)
             else:
                 deployment_input: str | Any = expected.source_path
                 if inspection_processor is not None:

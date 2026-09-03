@@ -13,13 +13,17 @@ import numpy as np
 import pytest
 
 from app.core.prediction_artifacts import PredictionArtifacts
+from app.core.prediction_adapter import PostprocessedPredictionBatch, SUPERADD_NATIVE_IMAGE_SCORE_SEMANTIC
 from app.core.preprocessing_contract import resolved_preprocessing_hash, write_resolved_preprocessing_plan
+from app.core.result_parser import ResultParser
 from app.core.run_artifacts import CanonicalCheckpoint, write_run_manifest
 from app.core.threshold_contract import PixelThresholdOperatingPoint
 from app.core.inspection_region import inspection_region_hash, write_inspection_region
 from app.models.inspection_region import InspectionRegionConfig
+from app.models.prediction_result import PredictionResult
 from app.models.preprocessing_config import LEGACY_PREPROCESSING_CONTRACT_VERSION, PreprocessingConfig
 from app.models.training_config import TrainingConfig
+from app.models.training_run import TrainingRun
 from app.workers import inference_worker
 
 
@@ -160,6 +164,146 @@ def test_folder_inference_uses_anomalib_discovery_and_logs_selected_patchcore_ru
     assert len([message for message in messages if message["type"] == "prediction"]) == 2
 
 
+def test_folder_inference_uses_the_active_threshold_revision(tmp_path: Path, monkeypatch) -> None:
+    run_directory = tmp_path / "run"
+    _write_run(run_directory)
+    revision_directory = run_directory / "threshold_revisions"
+    revision_directory.mkdir()
+    predictions_path = revision_directory / "threshold-001_predictions.csv"
+    predictions_path.write_text("image_path\n", encoding="utf-8")
+    revision_path = revision_directory / "threshold-001.json"
+    revision_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "revision_id": "threshold-001",
+                "image_operating_point": {
+                    "version": 1,
+                    "threshold": 0.05,
+                    "comparator": "greater_than_or_equal",
+                    "score_semantic": "anomalib_postprocessed_pred_score_v1",
+                },
+                "pixel_operating_point": {
+                    "version": 1,
+                    "enabled": False,
+                    "threshold": None,
+                    "comparator": "greater_than_or_equal",
+                    "semantic": "continuous_anomaly_map_gte_v1",
+                },
+                "predictions_file": predictions_path.name,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_directory / "active_threshold_revision.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "revision_file": revision_path.name,
+                "revision_sha256": hashlib.sha256(revision_path.read_bytes()).hexdigest(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    input_path = tmp_path / "input.png"
+    from PIL import Image
+
+    Image.new("RGB", (8, 8)).save(input_path)
+    messages: list[dict[str, object]] = []
+    monkeypatch.setattr(inference_worker, "AnomalibService", _fake_service([input_path]))
+    monkeypatch.setattr(inference_worker, "save_prediction_artifacts", lambda *_args, **_kwargs: PredictionArtifacts())
+    monkeypatch.setattr(inference_worker, "emit", messages.append)
+
+    assert inference_worker.run(run_directory, input_path) == 0
+
+    prediction = next(message for message in messages if message["type"] == "prediction")
+    assert prediction["threshold"] == 0.05
+    assert prediction["predicted_label"] == "NG"
+
+
+def test_folder_inference_uses_active_revision_quality_evidence(tmp_path: Path, monkeypatch) -> None:
+    run_directory = tmp_path / "run"
+    _write_run(run_directory)
+    ResultParser().write_training_run(
+        run_directory / "results.json",
+        TrainingRun(
+            run_name="run",
+            run_dir=str(run_directory),
+            model_name="PatchCore",
+            device="cpu",
+            predictions=[
+                PredictionResult(
+                    source_path="canonical_ok.png",
+                    predicted_label="NG",
+                    ground_truth_label="OK",
+                    anomaly_score=0.8,
+                    threshold=0.5,
+                )
+            ],
+        ),
+    )
+    revision_directory = run_directory / "threshold_revisions"
+    revision_directory.mkdir()
+    predictions_path = revision_directory / "threshold-001_predictions.csv"
+    ResultParser().export_predictions_csv(
+        predictions_path,
+        [
+            PredictionResult(
+                source_path="revision_ok.png",
+                predicted_label="OK",
+                ground_truth_label="OK",
+                anomaly_score=0.1,
+                threshold=0.5,
+            )
+        ],
+    )
+    revision_path = revision_directory / "threshold-001.json"
+    revision_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "revision_id": "threshold-001",
+                "image_operating_point": {
+                    "version": 1,
+                    "threshold": 0.5,
+                    "comparator": "greater_than_or_equal",
+                    "score_semantic": "anomalib_postprocessed_pred_score_v1",
+                },
+                "pixel_operating_point": {
+                    "version": 1,
+                    "enabled": False,
+                    "threshold": None,
+                    "comparator": "greater_than_or_equal",
+                    "semantic": "continuous_anomaly_map_gte_v1",
+                },
+                "predictions_file": predictions_path.name,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_directory / "active_threshold_revision.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "revision_file": revision_path.name,
+                "revision_sha256": hashlib.sha256(revision_path.read_bytes()).hexdigest(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    input_path = tmp_path / "input.png"
+    from PIL import Image
+
+    Image.new("RGB", (8, 8)).save(input_path)
+    messages: list[dict[str, object]] = []
+    monkeypatch.setattr(inference_worker, "AnomalibService", _fake_service([input_path]))
+    monkeypatch.setattr(inference_worker, "save_prediction_artifacts", lambda *_args, **_kwargs: PredictionArtifacts())
+    monkeypatch.setattr(inference_worker, "emit", messages.append)
+
+    assert inference_worker.run(run_directory, input_path) == 0
+    assert any(message["type"] == "prediction" for message in messages)
+
+
 def test_folder_inference_fails_when_anomalib_skips_a_discovered_image(tmp_path: Path, monkeypatch) -> None:
     run_directory = tmp_path / "run"
     _write_run(run_directory)
@@ -177,6 +321,45 @@ def test_folder_inference_fails_when_anomalib_skips_a_discovered_image(tmp_path:
 
     with pytest.raises(ValueError, match="produced 1 predictions for 2 input images"):
         inference_worker.run(run_directory, input_directory)
+
+
+def test_folder_inference_warns_for_a_run_that_fails_final_test_false_reject_policy(tmp_path: Path, monkeypatch) -> None:
+    run_directory = tmp_path / "run"
+    _write_run(run_directory)
+    ResultParser().write_training_run(
+        run_directory / "results.json",
+        TrainingRun(
+            run_name="run",
+            run_dir=str(run_directory),
+            model_name="PatchCore",
+            device="cpu",
+            predictions=[
+                PredictionResult(
+                    source_path="known_ok.png",
+                    predicted_label="NG",
+                    ground_truth_label="OK",
+                    anomaly_score=0.8,
+                    threshold=0.5,
+                )
+            ],
+        ),
+    )
+    input_path = tmp_path / "input.png"
+    from PIL import Image
+
+    Image.new("RGB", (8, 8)).save(input_path)
+    messages: list[dict[str, object]] = []
+    monkeypatch.setattr(inference_worker, "AnomalibService", _fake_service([input_path]))
+    monkeypatch.setattr(inference_worker, "save_prediction_artifacts", lambda *_args, **_kwargs: PredictionArtifacts())
+    monkeypatch.setattr(inference_worker, "emit", messages.append)
+
+    assert inference_worker.run(run_directory, input_path) == 0
+    assert any(
+        message["type"] == "log"
+        and message["level"] == "warning"
+        and "False reject rate 1 exceeds the configured maximum" in message["message"]
+        for message in messages
+    )
 
 
 def test_inference_rejects_roi_metadata_hash_mismatch(tmp_path: Path, monkeypatch) -> None:
@@ -352,3 +535,90 @@ def test_preprocessing_v2_inference_uses_prepared_geometry_and_reconstructed_sou
     )
     assert inference_manifest["decision_threshold"] == pytest.approx(0.5)
     assert inference_manifest["decision_threshold_source"] == "run_manifest"
+
+
+def test_superadd_folder_inference_uses_native_raw_score_not_saturated_postprocessing(tmp_path: Path, monkeypatch) -> None:
+    run_directory = tmp_path / "run"
+    _write_run(run_directory)
+    plan = PreprocessingConfig().resolve("super_add", (639, 177))
+    write_resolved_preprocessing_plan(run_directory / "preprocessing_plan.json", plan)
+    (run_directory / "config.json").write_text(
+        json.dumps(TrainingConfig(model_name="super_add").to_dict()),
+        encoding="utf-8",
+    )
+    manifest_path = run_directory / "run_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["threshold"] = 0.65
+    manifest["threshold_metadata"] = {
+        "threshold_value": 0.65,
+        "threshold_raw": 0.65,
+        "threshold_deployed": 0.65,
+        "score_semantic": SUPERADD_NATIVE_IMAGE_SCORE_SEMANTIC,
+        "decision_comparator": "greater_than_or_equal",
+    }
+    manifest["preprocessing_contract"] = {
+        "preprocessing_contract_version": 3,
+        "metadata_file": "preprocessing_plan.json",
+        "metadata_sha256": resolved_preprocessing_hash(plan),
+        "project_policy_sha256": "a" * 64,
+        "model_id": "super_add",
+        "model_input_size": [640, 448],
+        "score_aggregation": "max",
+        "tiled": False,
+    }
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    source_path = tmp_path / "source.png"
+    from PIL import Image
+
+    Image.new("RGB", (639, 177), (10, 20, 30)).save(source_path)
+
+    class FakePredictDataset:
+        def __init__(self, path: Path) -> None:
+            self.path = Path(path)
+
+        @property
+        def collate_fn(self):
+            return lambda items: items
+
+    class FakeEngine:
+        def __init__(self, callbacks: list[object]) -> None:
+            self._callbacks = callbacks
+
+        def predict(self, **kwargs: object) -> None:
+            prepared_path = next(kwargs["dataloaders"].dataset.path.rglob("*.png"))
+            postprocessed_map = np.full((448, 640), 0.4, dtype=np.float32)
+            raw_map = np.full((448, 640), 0.6, dtype=np.float32)
+            output = PostprocessedPredictionBatch(
+                {"image_path": [str(prepared_path)], "pred_score": [1.0], "anomaly_map": [postprocessed_map]},
+                (0.6,),
+                (raw_map,),
+            )
+            for callback in self._callbacks:
+                callback.write_on_batch_end(None, None, output, None, None, 0, 0)
+
+    class FakeService:
+        def create_inference_components(self, _config, _output_directory, received_plan, callbacks=None):
+            assert received_plan == plan
+            return {
+                "model": object(),
+                "engine": FakeEngine(callbacks or []),
+                "definition": SimpleNamespace(display_name="SuperADD"),
+                "device": "cpu",
+                "device_note": "",
+            }
+
+    anomalib_data = ModuleType("anomalib.data")
+    anomalib_data.PredictDataset = FakePredictDataset
+    monkeypatch.setitem(sys.modules, "anomalib.data", anomalib_data)
+    monkeypatch.setattr(inference_worker, "AnomalibService", FakeService)
+    monkeypatch.setattr(inference_worker, "_discover_images", lambda _path: (source_path.resolve(),))
+    messages: list[dict[str, object]] = []
+    monkeypatch.setattr(inference_worker, "emit", messages.append)
+
+    assert inference_worker.run(run_directory, source_path) == 0
+
+    prediction = next(message for message in messages if message["type"] == "prediction")
+    assert prediction["anomaly_score"] == pytest.approx(0.6)
+    assert prediction["score_semantic"] == SUPERADD_NATIVE_IMAGE_SCORE_SEMANTIC
+    assert prediction["postprocessed_image_score"] == pytest.approx(1.0)
+    assert prediction["predicted_label"] == "OK"

@@ -189,7 +189,8 @@ def read_canonical_checkpoint(run_directory: Path) -> CanonicalCheckpoint:
     """Read and verify the persisted canonical checkpoint before downstream work."""
     payload = read_run_manifest(run_directory)
     checkpoint = payload.get("canonical_checkpoint", {})
-    checkpoint_path = Path(str(checkpoint.get("path", ""))).expanduser().resolve()
+    persisted_path = Path(str(checkpoint.get("path", ""))).expanduser()
+    checkpoint_path = (persisted_path if persisted_path.is_absolute() else run_directory / persisted_path).resolve()
     expected_hash = str(checkpoint.get("sha256", ""))
     if not checkpoint_path.is_file() or not expected_hash:
         raise ValueError("Run manifest does not contain a valid canonical checkpoint.")
@@ -262,6 +263,12 @@ def _validated_threshold_metadata(metadata: Mapping[str, object], expected_thres
     payload["threshold_value"] = threshold
     payload["threshold_raw"] = raw_threshold
     payload["threshold_deployed"] = deployed_threshold
+    score_semantic = payload.get("score_semantic")
+    if score_semantic is not None and (not isinstance(score_semantic, str) or not score_semantic):
+        raise ValueError("Threshold metadata score_semantic must be a non-empty string when provided.")
+    comparator = payload.get("decision_comparator")
+    if comparator is not None and comparator != "greater_than_or_equal":
+        raise ValueError("Threshold metadata has an unsupported image decision comparator.")
     return payload
 
 

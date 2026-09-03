@@ -115,7 +115,7 @@ class InferencePage(QWidget):
         preview_group = QGroupBox("Selected Prediction")
         preview_layout = QHBoxLayout(preview_group)
         self.preview_labels: dict[str, QLabel] = {}
-        for title in ("Original", "Heat Map", "Overlay"):
+        for title in ("Original", "Overlay", "Mask"):
             column = QVBoxLayout()
             column.addWidget(QLabel(title))
             preview = QLabel("No image")
@@ -252,8 +252,8 @@ class InferencePage(QWidget):
         self.prediction_label.setText(prediction.predicted_label)
         self.threshold_label.setText(f"{prediction.threshold:.6g}")
         self._set_preview("Original", prediction.original_image)
-        self._set_preview("Heat Map", prediction.anomaly_map)
         self._set_preview("Overlay", prediction.overlay_image)
+        self._set_preview("Mask", prediction.binary_mask)
 
     def _set_preview(self, title: str, image_path: str) -> None:
         label = self.preview_labels[title]

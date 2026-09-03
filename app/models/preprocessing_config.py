@@ -175,6 +175,8 @@ class PreprocessingConfig:
         if width < 2 or height < 2:
             raise ValueError("Rectified ROI dimensions must both be at least two pixels.")
         profile = _model_profile(model_id)
+        if self.tiling.enabled and profile.model_id == "super_add":
+            raise ValueError("External preprocessing tiling is not supported for SuperADD; use its native internal patching.")
         if self.preprocessing_contract_version == LEGACY_PREPROCESSING_CONTRACT_VERSION:
             if self.tiling.enabled:
                 return _resolve_legacy_tiled_plan(self, profile, width, height)

@@ -11,10 +11,12 @@ from typing import Any
 from app.core.dataset_manifest import build_dataset_manifest, write_dataset_manifest
 from app.core.inspection_region import InspectionRegionProcessor, validate_inspection_region_sources
 from app.core.prediction_artifacts import PredictionArtifacts, inspection_region_metadata, save_prediction_artifacts
-from app.core.prediction_adapter import iter_anomalib_predictions, iter_preprocessed_predictions
+from app.core.prediction_adapter import explicitly_postprocessed_predict, iter_anomalib_predictions, iter_preprocessed_predictions
+from app.core.prediction_contract import PREDICTION_CONTRACT_VERSION, RAW_SCORE_SEMANTIC
 from app.core.preprocessing_pipeline import PreprocessingPipeline
 from app.core.quality_metrics import FinalTestAcceptancePolicy, QualityReport, calculate_quality_metrics
 from app.core.result_parser import ResultParser
+from app.core.score_diagnostics import summarize_prediction_score_ranges
 from app.core.run_artifacts import (
     CanonicalCheckpoint,
     read_canonical_checkpoint,
@@ -106,7 +108,8 @@ class EvaluationRevisionService:
                 inspection_region=inspection_region,
             )
             calibration_samples = self._calibration_samples(
-                components["engine"].predict(
+                explicitly_postprocessed_predict(
+                    components["engine"],
                     model=components["model"],
                     datamodule=calibration_datamodule,
                     return_predictions=True,
@@ -123,7 +126,10 @@ class EvaluationRevisionService:
                     preprocessing_pipeline,
                 )
             calibration_samples = self._calibration_samples_from_scores(
-                ((prediction.source_path, prediction.score) for prediction in calibration_predictions),
+                (
+                    (prediction.source_path, prediction.score, prediction.score_semantic)
+                    for prediction in calibration_predictions
+                ),
                 normal_directory=resolved.calibration_ok,
                 abnormal_directory=resolved.calibration_ng,
             )
@@ -142,7 +148,8 @@ class EvaluationRevisionService:
                 inspection_region=inspection_region,
             )
             final_predictions = self._final_predictions(
-                components["engine"].predict(
+                explicitly_postprocessed_predict(
+                    components["engine"],
                     model=components["model"],
                     datamodule=final_test_datamodule,
                     return_predictions=True,
@@ -187,6 +194,7 @@ class EvaluationRevisionService:
             }
         )
         threshold_metadata = calibration_result.to_dict()
+        threshold_metadata["final_test_score_ranges"] = summarize_prediction_score_ranges(final_predictions)
         threshold_metadata["calibration_manifest_sha256"] = calibration_manifest["manifest_sha256"]
         revision_path = write_evaluation_revision(
             run_directory,
@@ -265,7 +273,10 @@ class EvaluationRevisionService:
         abnormal_directory: Path | None,
     ) -> list[CalibrationSample]:
         return EvaluationRevisionService._calibration_samples_from_scores(
-            ((prediction.image_path, prediction.score) for prediction in iter_anomalib_predictions(output)),
+            (
+                (prediction.image_path, prediction.score, prediction.score_semantic)
+                for prediction in iter_anomalib_predictions(output)
+            ),
             normal_directory=normal_directory,
             abnormal_directory=abnormal_directory,
         )
@@ -280,12 +291,19 @@ class EvaluationRevisionService:
         labels = {path: "OK" for path in EvaluationRevisionService._images(normal_directory)}
         labels.update({path: "NG" for path in EvaluationRevisionService._images(abnormal_directory)})
         samples: list[CalibrationSample] = []
-        for prediction_path, score in predictions:
+        for prediction in predictions:
+            prediction_path, score, *semantic = prediction
             try:
                 label = labels[prediction_path]
             except KeyError as exc:
                 raise ValueError(f"Calibration prediction path is outside the selected revision folders: {prediction_path}") from exc
-            samples.append(CalibrationSample(score=score, label=label))
+            samples.append(
+                CalibrationSample(
+                    score=score,
+                    label=label,
+                    score_semantic=str(semantic[0]) if semantic else "anomalib_postprocessed_pred_score_v1",
+                )
+            )
         if len(samples) != len(labels):
             raise RuntimeError(f"Calibration prediction count mismatch: expected {len(labels)}, received {len(samples)}.")
         return samples
@@ -317,6 +335,7 @@ class EvaluationRevisionService:
                 len(results),
                 inspection_region=inspection_region,
                 pixel_threshold=pixel_threshold,
+                raw_anomaly_map=prediction.raw_anomaly_map,
             )
             results.append(
                 PredictionResult(
@@ -330,6 +349,13 @@ class EvaluationRevisionService:
                     native_image_score=prediction.score,
                     native_tile_scores=[prediction.score],
                     score_semantic=prediction.score_semantic,
+                    raw_image_score=prediction.raw_image_score,
+                    raw_score_semantic=RAW_SCORE_SEMANTIC if prediction.raw_image_score is not None else "",
+                    raw_anomaly_map=artifacts.raw_anomaly_map,
+                    postprocessed_image_score=prediction.postprocessed_image_score,
+                    postprocessed_score_semantic=prediction.postprocessed_score_semantic,
+                    postprocessed_anomaly_map=artifacts.continuous_anomaly_map,
+                    prediction_contract_version=PREDICTION_CONTRACT_VERSION,
                     continuous_anomaly_map=artifacts.continuous_anomaly_map,
                     anomaly_map=artifacts.heatmap_image,
                     overlay_image=artifacts.overlay_image,
@@ -374,6 +400,8 @@ class EvaluationRevisionService:
                 len(results),
                 preprocessing_pipeline=preprocessing_pipeline,
                 pixel_threshold=pixel_threshold,
+                valid_roi_mask=prediction.valid_roi_mask,
+                raw_anomaly_map=prediction.raw_anomaly_map,
             )
             results.append(
                 PredictionResult(
@@ -387,6 +415,13 @@ class EvaluationRevisionService:
                     native_image_score=prediction.native_image_score,
                     native_tile_scores=list(prediction.native_tile_scores),
                     score_semantic=prediction.score_semantic,
+                    raw_image_score=prediction.raw_image_score,
+                    raw_score_semantic=RAW_SCORE_SEMANTIC if prediction.raw_image_score is not None else "",
+                    raw_anomaly_map=artifacts.raw_anomaly_map,
+                    postprocessed_image_score=prediction.score,
+                    postprocessed_score_semantic=prediction.score_semantic,
+                    postprocessed_anomaly_map=artifacts.continuous_anomaly_map,
+                    prediction_contract_version=PREDICTION_CONTRACT_VERSION,
                     continuous_anomaly_map=artifacts.continuous_anomaly_map,
                     anomaly_map=artifacts.heatmap_image,
                     overlay_image=artifacts.overlay_image,
@@ -413,6 +448,8 @@ class EvaluationRevisionService:
         inspection_region=None,
         preprocessing_pipeline: PreprocessingPipeline | None = None,
         pixel_threshold: float | None = None,
+        valid_roi_mask: Any = None,
+        raw_anomaly_map: Any = None,
     ) -> PredictionArtifacts:
         if artifact_directory is None:
             return PredictionArtifacts()
@@ -428,6 +465,8 @@ class EvaluationRevisionService:
             index,
             rectified_image=rectified_image,
             pixel_threshold=pixel_threshold,
+            valid_roi_mask=valid_roi_mask,
+            raw_anomaly_map=raw_anomaly_map,
         )
 
     @staticmethod
@@ -500,7 +539,8 @@ class EvaluationRevisionService:
                     Image.fromarray(prepared.image_rgb, "RGB").save(staged_path)
                     source_path_by_staged_path[staged_path] = source_path
                     preprocessing_tile_by_staged_path[staged_path] = prepared.tile
-            output = components["engine"].predict(
+            output = explicitly_postprocessed_predict(
+                components["engine"],
                 model=components["model"],
                 dataset=PredictDataset(prepared_directory),
                 return_predictions=True,

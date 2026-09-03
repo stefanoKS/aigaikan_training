@@ -54,6 +54,20 @@ def test_normal_only_final_test_does_not_report_defect_detection_performance() -
     assert "NO GENUINE NG TEST DATA" in report.warning
 
 
+def test_normal_only_final_test_fails_when_false_rejects_exceed_the_policy() -> None:
+    policy = FinalTestAcceptancePolicy(
+        maximum_false_reject_rate=0.005,
+        minimum_ok_test_images=10,
+        minimum_ng_test_images=10,
+    )
+
+    report = calculate_quality_metrics([_prediction("OK", "NG", 0.8)], policy)
+
+    assert report.status == "FAIL"
+    assert "False reject rate 1 exceeds the configured maximum" in report.warning
+    assert "NO GENUINE NG TEST DATA" in report.warning
+
+
 def test_clean_final_test_requires_an_explicit_false_reject_acceptance_policy() -> None:
     predictions = [
         *[_prediction("OK", "OK", 0.1) for _ in range(10)],
