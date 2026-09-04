@@ -469,6 +469,7 @@ class ExportService:
                 "score_semantic": decision_policy.score_semantic,
                 "source": decision_policy.source,
                 "revision_id": decision_policy.revision_id,
+                "operator_note": decision_policy.operator_note,
             },
             "input_contract": {
                 "color_order": "RGB",

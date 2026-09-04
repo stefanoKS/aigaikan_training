@@ -1,8 +1,9 @@
 """Inference page."""
 
+from math import floor, isfinite, log10
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QSignalBlocker, Qt, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -14,6 +15,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
@@ -29,6 +31,9 @@ from app.models.prediction_result import PredictionResult
 
 class InferencePage(QWidget):
     """Inference UI."""
+
+    decision_revision_save_requested = Signal(float, str)
+    ui_text_changed = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -76,6 +81,8 @@ class InferencePage(QWidget):
         self.timing_batch_wall_label = QLabel("-")
         self.timing_amortized_label = QLabel("-")
         self.timing_batch_one_label = QLabel("-")
+        self.displayed_decision_label = QLabel("-")
+        self.displayed_threshold_label = QLabel("-")
         self.export_threshold_check = QCheckBox("Use custom NG image copy filter")
         self.export_threshold_spin = QDoubleSpinBox()
         self.export_threshold_spin.setRange(-1_000_000_000.0, 1_000_000_000.0)
@@ -95,6 +102,8 @@ class InferencePage(QWidget):
         summary_form.addRow("Anomaly Score", self.score_label)
         summary_form.addRow("Predicted Result", self.prediction_label)
         summary_form.addRow("Active Deployment NG Score Threshold", self.threshold_label)
+        summary_form.addRow("Active / Preview Decision", self.displayed_decision_label)
+        summary_form.addRow("Displayed Decision Threshold", self.displayed_threshold_label)
         summary_form.addRow("Calibrated NG Threshold", self.calibrated_threshold_label)
         summary_form.addRow("Threshold Source / Revision", self.threshold_source_label)
         summary_form.addRow("Decision Score Semantic", self.score_semantic_label)
@@ -108,6 +117,35 @@ class InferencePage(QWidget):
         summary_form.addRow("NG image copy filter", export_threshold_row)
         summary_form.addRow("Status", self.status_label)
         root.addWidget(summary_group)
+
+        decision_preview_group = QGroupBox("Image Decision Threshold Preview")
+        decision_preview_form = QFormLayout(decision_preview_group)
+        self.decision_preview_check = QCheckBox("Preview a different NG score threshold")
+        self.decision_preview_spin = QDoubleSpinBox()
+        self.decision_preview_spin.setRange(-1_000_000_000.0, 1_000_000_000.0)
+        self.decision_preview_spin.setDecimals(9)
+        self.decision_preview_spin.setSingleStep(0.0001)
+        self.reset_decision_preview_button = QPushButton("Reset to Active Threshold")
+        self.decision_preview_note_edit = QLineEdit()
+        self.decision_preview_note_edit.setPlaceholderText("Optional operator note")
+        self.save_decision_revision_button = QPushButton("Save and Activate Decision Revision")
+        self.save_decision_revision_button.setObjectName("PrimaryButton")
+        self.decision_preview_summary_label = QLabel("No inference results are available for an image decision preview.")
+        self.decision_preview_summary_label.setObjectName("ModelSupport")
+        self.decision_preview_summary_label.setWordWrap(True)
+        self.decision_preview_explanation_label = QLabel(
+            "Decision-only preview. The model is not rerun, and heatmaps and pixel masks do not change."
+        )
+        self.decision_preview_explanation_label.setObjectName("ModelSupport")
+        self.decision_preview_explanation_label.setWordWrap(True)
+        decision_preview_form.addRow(self.decision_preview_check)
+        decision_preview_form.addRow("Proposed NG Score Threshold", self.decision_preview_spin)
+        decision_preview_form.addRow("", self.reset_decision_preview_button)
+        decision_preview_form.addRow("Operator Note", self.decision_preview_note_edit)
+        decision_preview_form.addRow("", self.save_decision_revision_button)
+        decision_preview_form.addRow("Preview Summary", self.decision_preview_summary_label)
+        decision_preview_form.addRow(self.decision_preview_explanation_label)
+        root.addWidget(decision_preview_group)
 
         benchmark_group = QGroupBox("Industrial Inference Benchmark")
         benchmark_form = QFormLayout(benchmark_group)
@@ -188,10 +226,19 @@ class InferencePage(QWidget):
         log_layout.addWidget(self.log_output)
         root.addWidget(log_group)
 
-        self.results_table = QTableWidget(0, 5)
+        self.results_table = QTableWidget(0, 7)
         self.results_table.setHorizontalHeaderLabels(
-            ["Source", "Prediction", "Score", "Active Deployment NG Score Threshold", "Heat Map"]
+            [
+                "Source",
+                "Inference-Time Prediction",
+                "Score",
+                "Inference-Time Threshold",
+                "Heat Map",
+                "Active / Preview Decision",
+                "Decision Change",
+            ]
         )
+        self.results_table.setSortingEnabled(False)
         self.results_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.results_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.results_table.setWordWrap(True)
@@ -219,6 +266,7 @@ class InferencePage(QWidget):
         root.addWidget(preview_group)
         self.predictions: list[PredictionResult] = []
         self._trained_threshold: float | None = None
+        self._decision_score_semantic = ""
         self._inference_running = False
         self.cancel_inference_button.setEnabled(False)
         self.export_ng_images_button.setEnabled(False)
@@ -229,6 +277,11 @@ class InferencePage(QWidget):
         self.export_benchmark_csv_button.setEnabled(False)
         self.export_threshold_check.toggled.connect(self._update_export_ng_controls)
         self.export_threshold_spin.valueChanged.connect(self._update_export_ng_controls)
+        self.decision_preview_check.toggled.connect(self._refresh_decision_preview)
+        self.decision_preview_spin.valueChanged.connect(self._refresh_decision_preview)
+        self.reset_decision_preview_button.clicked.connect(self.reset_decision_preview)
+        self.save_decision_revision_button.clicked.connect(self._request_decision_revision_save)
+        self._update_decision_preview_controls()
 
     def set_training_run(
         self,
@@ -244,15 +297,34 @@ class InferencePage(QWidget):
         """Display the trained model selected for inference."""
         self.run_label.setText(run_directory.name)
         self.model_label.setText(model_name)
-        self._trained_threshold = threshold
+        self._trained_threshold = self._finite_threshold_or_none(threshold)
+        self._decision_score_semantic = score_semantic
         self.calibrated_threshold_label.setText(f"{calibrated_threshold:.6g}" if calibrated_threshold is not None else "-")
         self.threshold_source_label.setText(threshold_source or "run manifest")
         self.score_semantic_label.setText(score_semantic or "legacy unversioned")
         self.preprocessing_summary_label.setText(preprocessing_summary or "Historical legacy preprocessing")
         self.export_threshold_check.setChecked(False)
-        if threshold is not None:
-            self.export_threshold_spin.setValue(threshold)
+        if self._trained_threshold is not None:
+            self.export_threshold_spin.setValue(self._trained_threshold)
+        self.clear_predictions()
+        self.reset_decision_preview()
         self._update_export_ng_controls()
+        self.ui_text_changed.emit()
+
+    def set_active_decision_threshold(self, threshold: float, threshold_source: str, score_semantic: str) -> None:
+        """Adopt a successfully activated immutable revision without mutating historical inference rows."""
+        active_threshold = self._finite_threshold_or_none(threshold)
+        if active_threshold is None or not score_semantic:
+            raise ValueError("Active deployment threshold and score semantic must be valid.")
+        self._trained_threshold = active_threshold
+        self._decision_score_semantic = score_semantic
+        self.threshold_source_label.setText(threshold_source)
+        self.score_semantic_label.setText(score_semantic)
+        if not self.export_threshold_check.isChecked():
+            self.export_threshold_spin.setValue(active_threshold)
+        self.reset_decision_preview()
+        self._refresh_decision_preview()
+        self.ui_text_changed.emit()
 
     def export_threshold(self) -> float | None:
         """Return the trained threshold or an explicit post-inference export filter threshold."""
@@ -276,12 +348,14 @@ class InferencePage(QWidget):
     def set_status(self, status: str) -> None:
         """Display the current inference state."""
         self.status_label.setText(status)
+        self.ui_text_changed.emit()
 
     def set_benchmark_selection(self, run_directory: Path | None, input_path: Path | None) -> None:
         """Show independent benchmark run and input choices without changing folder inference selections."""
         self.benchmark_run_label.setText(run_directory.name if run_directory is not None else "No completed training run selected")
         self.benchmark_run_label.setToolTip(str(run_directory) if run_directory is not None else "")
         self.benchmark_input_label.setText(str(input_path) if input_path is not None else "No benchmark image or folder selected")
+        self.ui_text_changed.emit()
 
     def set_benchmark_running(self, running: bool) -> None:
         """Keep benchmark controls usable and separate from ordinary folder inference state."""
@@ -324,6 +398,7 @@ class InferencePage(QWidget):
         )
         self.export_benchmark_json_button.setEnabled(True)
         self.export_benchmark_csv_button.setEnabled(True)
+        self.ui_text_changed.emit()
 
     @staticmethod
     def _percentile_text(value: object, label: str) -> str:
@@ -358,17 +433,21 @@ class InferencePage(QWidget):
         self.results_table.setRowCount(0)
         self.score_label.setText("-")
         self.prediction_label.setText("-")
-        self.threshold_label.setText("-")
+        self.threshold_label.setText(self._threshold_text(self._trained_threshold))
+        self.displayed_decision_label.setText("-")
+        self.displayed_threshold_label.setText(self._threshold_text(self._trained_threshold))
         self.timing_preprocess_label.setText("-")
         self.timing_inference_label.setText("-")
         self.timing_end_to_end_label.setText("-")
         self.timing_batch_wall_label.setText("-")
         self.timing_amortized_label.setText("-")
         self.timing_batch_one_label.setText("-")
+        self.reset_decision_preview()
         self._update_export_ng_controls()
         for label in self.preview_labels.values():
             label.clear()
             label.setText("No image")
+        self.ui_text_changed.emit()
 
     def clear_log(self) -> None:
         """Clear messages from the prior inference request."""
@@ -393,6 +472,8 @@ class InferencePage(QWidget):
             f"{prediction.anomaly_score:.6g}",
             f"{prediction.threshold:.6g}",
             "Available" if prediction.anomaly_map else "Not produced",
+            "",
+            "",
         )
         for column, value in enumerate(values):
             item = QTableWidgetItem(value)
@@ -400,9 +481,11 @@ class InferencePage(QWidget):
                 item.setToolTip(prediction.source_path)
             self.results_table.setItem(row, column, item)
         self.results_table.resizeRowToContents(row)
+        self._refresh_decision_preview()
         self._update_export_ng_controls()
         if row == 0:
             self._show_prediction(prediction)
+        self.ui_text_changed.emit()
 
     def set_running(self, running: bool) -> None:
         """Keep inference controls coherent while the worker is active."""
@@ -412,6 +495,7 @@ class InferencePage(QWidget):
         self.select_folder_button.setEnabled(not running)
         self.run_inference_button.setEnabled(not running)
         self.cancel_inference_button.setEnabled(running)
+        self._update_decision_preview_controls()
         self._update_export_ng_controls()
 
     def _update_export_ng_controls(self) -> None:
@@ -432,7 +516,9 @@ class InferencePage(QWidget):
         """Show summary values and previews for one prediction without changing export selection."""
         self.score_label.setText(f"{prediction.anomaly_score:.6g}")
         self.prediction_label.setText(prediction.predicted_label)
-        self.threshold_label.setText(f"{prediction.threshold:.6g}")
+        self.threshold_label.setText(self._threshold_text(self._trained_threshold))
+        self.displayed_decision_label.setText(self._displayed_decision(prediction) or "Not available")
+        self.displayed_threshold_label.setText(self._threshold_text(self.displayed_decision_threshold()))
         timing = prediction.timing_metadata
         self.timing_preprocess_label.setText(self._timing_text(timing.get("preprocess_total_ms", timing.get("preprocess_compute_ms"))))
         self.timing_inference_label.setText(self._timing_text(timing.get("model_pipeline_ms", timing.get("inference_total_ms"))))
@@ -470,4 +556,190 @@ class InferencePage(QWidget):
     def _multiline_source_path(source_path: str) -> str:
         """Keep full source provenance visible in narrow result tables."""
         return source_path.replace("\\", "\\\n").replace("/", "/\n")
+
+    def displayed_decision_threshold(self) -> float | None:
+        """Return the active threshold unless the independent live preview is enabled."""
+        if self._trained_threshold is None:
+            return None
+        return self.decision_preview_spin.value() if self.decision_preview_check.isChecked() else self._trained_threshold
+
+    @property
+    def active_deployment_threshold(self) -> float | None:
+        """Return the immutable operating point loaded from the selected inference run."""
+        return self._trained_threshold
+
+    @property
+    def active_decision_score_semantic(self) -> str:
+        """Return the score semantic bound to the selected inference run's active threshold."""
+        return self._decision_score_semantic
+
+    def decision_preview_counts(self) -> dict[str, int]:
+        """Return stable decision counters without changing stored prediction records."""
+        inference_ok = inference_ng = displayed_ok = displayed_ng = ok_to_ng = ng_to_ok = 0
+        semantic_safe = self._decision_semantics_are_safe()
+        for prediction in self.predictions:
+            original = prediction.predicted_label.upper()
+            displayed = self._displayed_decision(prediction) if semantic_safe else None
+            if original == "OK":
+                inference_ok += 1
+            elif original == "NG":
+                inference_ng += 1
+            if displayed == "OK":
+                displayed_ok += 1
+            elif displayed == "NG":
+                displayed_ng += 1
+            if original == "OK" and displayed == "NG":
+                ok_to_ng += 1
+            elif original == "NG" and displayed == "OK":
+                ng_to_ok += 1
+        return {
+            "inference_ok": inference_ok,
+            "inference_ng": inference_ng,
+            "displayed_ok": displayed_ok,
+            "displayed_ng": displayed_ng,
+            "ok_to_ng": ok_to_ng,
+            "ng_to_ok": ng_to_ok,
+        }
+
+    def validate_decision_preview_semantics(self) -> None:
+        """Fail closed when the loaded run and streamed rows do not share one score domain."""
+        if self._trained_threshold is None:
+            raise ValueError("No finite active deployment threshold is loaded.")
+        if not self._decision_score_semantic:
+            raise ValueError("The loaded run does not declare an authoritative decision score semantic.")
+        inconsistent = next(
+            (
+                prediction.source_path
+                for prediction in self.predictions
+                if prediction.score_semantic != self._decision_score_semantic
+            ),
+            None,
+        )
+        if inconsistent is not None:
+            raise ValueError(f"Inference prediction score semantic does not match the loaded run: {inconsistent}")
+        if not all(isfinite(float(prediction.anomaly_score)) for prediction in self.predictions):
+            raise ValueError("Inference predictions must contain finite anomaly scores for a decision preview.")
+
+    def reset_decision_preview(self) -> None:
+        """Discard an unsaved preview and restore the exact active deployment threshold."""
+        blocker = QSignalBlocker(self.decision_preview_check)
+        self.decision_preview_check.setChecked(False)
+        del blocker
+        if self._trained_threshold is not None:
+            blocker = QSignalBlocker(self.decision_preview_spin)
+            self.decision_preview_spin.setValue(self._trained_threshold)
+            del blocker
+            self._set_decision_preview_step(self._trained_threshold)
+        self.decision_preview_note_edit.clear()
+        self._refresh_decision_preview()
+
+    def _request_decision_revision_save(self) -> None:
+        try:
+            self.validate_decision_preview_semantics()
+            threshold = self.displayed_decision_threshold()
+            if threshold is None or not isfinite(threshold):
+                raise ValueError("The proposed deployment threshold must be finite.")
+        except ValueError as exc:
+            self.set_status(str(exc))
+            return
+        self.decision_revision_save_requested.emit(threshold, self.decision_preview_note_edit.text().strip())
+
+    def _refresh_decision_preview(self, *_args: object) -> None:
+        threshold = self.displayed_decision_threshold()
+        if threshold is not None:
+            self._set_decision_preview_step(threshold)
+        self._update_decision_preview_controls()
+        self._refresh_decision_table()
+        self._update_selected_decision_summary()
+
+    def _refresh_decision_table(self) -> None:
+        """Update only derived columns while retaining immutable inference-time values and row mapping."""
+        semantic_safe = self._decision_semantics_are_safe()
+        self.results_table.setUpdatesEnabled(False)
+        blocker = QSignalBlocker(self.results_table)
+        try:
+            for row, prediction in enumerate(self.predictions):
+                if row >= self.results_table.rowCount():
+                    break
+                decision = self._displayed_decision(prediction) if semantic_safe else None
+                change = self._decision_change(prediction.predicted_label, decision)
+                self.results_table.setItem(row, 5, QTableWidgetItem(decision or "Not available"))
+                self.results_table.setItem(row, 6, QTableWidgetItem(change))
+        finally:
+            del blocker
+            self.results_table.setUpdatesEnabled(True)
+            self.results_table.viewport().update()
+        counts = self.decision_preview_counts()
+        if not semantic_safe and self.predictions:
+            self.decision_preview_summary_label.setText(
+                "Decision preview unavailable until every inference result matches the loaded run's decision score semantic."
+            )
+            self.ui_text_changed.emit()
+            return
+        self.decision_preview_summary_label.setText(
+            "Inference-time: "
+            f"OK {counts['inference_ok']}, NG {counts['inference_ng']} | "
+            f"Displayed: OK {counts['displayed_ok']}, NG {counts['displayed_ng']} | "
+            f"OK -> NG: {counts['ok_to_ng']} | NG -> OK: {counts['ng_to_ok']}"
+        )
+        self.ui_text_changed.emit()
+
+    def _update_selected_decision_summary(self) -> None:
+        selected_rows = self.results_table.selectionModel().selectedRows()
+        if selected_rows:
+            self._show_prediction(self.predictions[selected_rows[0].row()])
+        elif self.predictions:
+            self._show_prediction(self.predictions[0])
+
+    def _update_decision_preview_controls(self) -> None:
+        semantic_safe = self._decision_semantics_are_safe()
+        enabled = not self._inference_running and bool(self.predictions) and semantic_safe
+        self.decision_preview_check.setEnabled(enabled)
+        self.decision_preview_spin.setEnabled(enabled and self.decision_preview_check.isChecked())
+        self.reset_decision_preview_button.setEnabled(enabled)
+        self.decision_preview_note_edit.setEnabled(enabled)
+        self.save_decision_revision_button.setEnabled(enabled and self.decision_preview_check.isChecked())
+
+    def _decision_semantics_are_safe(self) -> bool:
+        try:
+            self.validate_decision_preview_semantics()
+        except ValueError:
+            return False
+        return True
+
+    def _displayed_decision(self, prediction: PredictionResult) -> str | None:
+        threshold = self.displayed_decision_threshold()
+        if threshold is None or not isfinite(threshold):
+            return None
+        if not self._decision_score_semantic or prediction.score_semantic != self._decision_score_semantic:
+            return None
+        score = float(prediction.anomaly_score)
+        if not isfinite(score):
+            return None
+        return "NG" if score >= threshold else "OK"
+
+    @staticmethod
+    def _decision_change(inference_label: str, displayed_label: str | None) -> str:
+        original = inference_label.upper()
+        if original == "NG" and displayed_label == "OK":
+            return "NG → OK"
+        if original == "OK" and displayed_label == "NG":
+            return "OK → NG"
+        return "—"
+
+    @staticmethod
+    def _finite_threshold_or_none(value: float | None) -> float | None:
+        try:
+            threshold = float(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+        return threshold if threshold is not None and isfinite(threshold) else None
+
+    @staticmethod
+    def _threshold_text(value: float | None) -> str:
+        return f"{value:.12g}" if value is not None else "Not available"
+
+    def _set_decision_preview_step(self, threshold: float) -> None:
+        magnitude = max(abs(threshold), 1e-6)
+        self.decision_preview_spin.setSingleStep(max(1e-9, 10 ** (floor(log10(magnitude)) - 2)))
 

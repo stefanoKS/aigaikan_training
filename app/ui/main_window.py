@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
-    QMessageBox,
+    QMessageBox as _QMessageBox,
     QPushButton,
     QScrollArea,
     QSplitter,
@@ -78,6 +78,27 @@ from app.ui.pages.results_page import ResultsPage
 from app.ui.pages.training_page import TrainingPage
 from app.ui.localization import UiTranslator
 from app.ui.styles import APP_STYLE
+
+
+class QMessageBox(_QMessageBox):
+    """Translate fixed MainWindow dialog text while leaving runtime details intact."""
+
+    @staticmethod
+    def information(parent: QWidget | None, title: str, text: str, *args: object, **kwargs: object) -> _QMessageBox.StandardButton:
+        return _QMessageBox.information(parent, _dialog_text(parent, title), _dialog_text(parent, text), *args, **kwargs)
+
+    @staticmethod
+    def warning(parent: QWidget | None, title: str, text: str, *args: object, **kwargs: object) -> _QMessageBox.StandardButton:
+        return _QMessageBox.warning(parent, _dialog_text(parent, title), _dialog_text(parent, text), *args, **kwargs)
+
+    @staticmethod
+    def question(parent: QWidget | None, title: str, text: str, *args: object, **kwargs: object) -> _QMessageBox.StandardButton:
+        return _QMessageBox.question(parent, _dialog_text(parent, title), _dialog_text(parent, text), *args, **kwargs)
+
+
+def _dialog_text(parent: QWidget | None, value: str) -> str:
+    translator = getattr(parent, "ui_translator", None)
+    return translator.text(value) if isinstance(translator, UiTranslator) else value
 
 
 class MainWindow(QMainWindow):
@@ -195,6 +216,10 @@ class MainWindow(QMainWindow):
         self.training_page = cast(TrainingPage, self.page_instances["Training"])
         self.results_page = cast(ResultsPage, self.page_instances["Results"])
         self.inference_page = cast(InferencePage, self.page_instances["Inference"])
+        self.config_page.ui_text_changed.connect(self._retranslate_ui)
+        self.preprocess_images_page.ui_text_changed.connect(self._retranslate_ui)
+        self.inference_page.ui_text_changed.connect(self._retranslate_ui)
+        self.results_page.ui_text_changed.connect(self._retranslate_ui)
         self._connect_actions()
         self.language_combo.currentIndexChanged.connect(self._change_ui_language)
         self.ui_translator.language_changed.connect(self._retranslate_ui)
@@ -206,8 +231,8 @@ class MainWindow(QMainWindow):
         """Show a friendly dependency error."""
         dialog = QMessageBox(self)
         dialog.setIcon(QMessageBox.Icon.Critical)
-        dialog.setWindowTitle("Missing Dependencies")
-        dialog.setText(message)
+        dialog.setWindowTitle(self.ui_translator.text("Missing Dependencies"))
+        dialog.setText(self.ui_translator.text(message))
         if details:
             dialog.setDetailedText(details)
         dialog.exec()
@@ -324,6 +349,7 @@ class MainWindow(QMainWindow):
         self.inference_page.cancel_inference_button.clicked.connect(self.inference_controller.cancel)
         self.inference_page.export_csv_button.clicked.connect(self._export_inference_csv)
         self.inference_page.export_ng_images_button.clicked.connect(self._export_inference_ng_images)
+        self.inference_page.decision_revision_save_requested.connect(self._save_inference_decision_revision)
         self.inference_controller.log_message.connect(self._append_inference_log)
         self.inference_controller.progress_changed.connect(self.inference_page.set_progress)
         self.inference_controller.prediction_emitted.connect(self._record_inference_prediction)
@@ -645,6 +671,7 @@ class MainWindow(QMainWindow):
         self._refresh_preprocess_images_page()
         self._load_latest_results(project)
         self._load_default_inference_run(project)
+        self._retranslate_ui()
 
     @staticmethod
     def _default_dialog_directory() -> Path:
@@ -1236,7 +1263,7 @@ class MainWindow(QMainWindow):
             return
         self._run_metrics.clear()
         self.training_page.log_output.clear()
-        self.training_page.current_stage_label.setText("Starting training")
+        self.ui_translator.set_label_text(self.training_page.current_stage_label, "Starting training")
         self.training_page.stage_progress.setRange(0, 0)
         self.training_page.dataset_counts_label.setText(
             f"OK: {project.dataset.folders[DatasetRole.OK_TRAIN].image_count}, "
@@ -1258,7 +1285,7 @@ class MainWindow(QMainWindow):
         self.training_page.overall_progress.setValue(current)
 
     def _update_training_stage(self, stage: str) -> None:
-        self.training_page.current_stage_label.setText(stage)
+        self.ui_translator.set_label_text(self.training_page.current_stage_label, stage)
         self.training_page.stage_progress.setRange(0, 0)
 
     def _update_training_stage_progress(self, current: int, total: int) -> None:
@@ -1293,7 +1320,7 @@ class MainWindow(QMainWindow):
             self.current_project.last_training_status = "Completed"
             self._save_project(show_dialog=False)
             self._refresh_project_views()
-        self.training_page.current_stage_label.setText("Completed")
+        self.ui_translator.set_label_text(self.training_page.current_stage_label, "Completed")
         self.training_page.stage_progress.setRange(0, 1)
         self.training_page.stage_progress.setValue(1)
         self._append_training_log("info", f"Results saved to {result_dir}")
@@ -1571,6 +1598,94 @@ class MainWindow(QMainWindow):
         self._inference_input_path = input_path.resolve()
         self.inference_page.set_input_path(self._inference_input_path)
         self.inference_page.set_status("Ready")
+
+    def _save_inference_decision_revision(self, proposed_threshold: float, operator_note: str) -> None:
+        """Confirm and atomically activate a decision-only revision for the run loaded on the Inference page."""
+        run_directory = self._inference_run_directory
+        if run_directory is None:
+            QMessageBox.information(self, "No Training Run", "Load a completed training run before changing decisions.")
+            return
+        try:
+            self.inference_page.validate_decision_preview_semantics()
+            active_revision = self.threshold_revision_service.read_active_revision(run_directory)
+            threshold_metadata = read_persisted_threshold_metadata(run_directory)
+            active_threshold = (
+                active_revision.image_operating_point.threshold
+                if active_revision is not None
+                else read_persisted_threshold(run_directory)
+            )
+            score_semantic = (
+                active_revision.image_operating_point.score_semantic
+                if active_revision is not None
+                else str(threshold_metadata.get("score_semantic", ""))
+            )
+            if not score_semantic:
+                raise ValueError("The loaded run does not declare an authoritative decision score semantic.")
+            if self.inference_page.active_decision_score_semantic != score_semantic:
+                raise ValueError("The loaded inference score semantic no longer matches the authoritative persisted run.")
+            if self.inference_page.active_deployment_threshold != active_threshold:
+                raise ValueError("The loaded inference active threshold no longer matches the authoritative persisted run.")
+            preview = self.threshold_revision_service.preview_decision_threshold(
+                run_directory,
+                proposed_threshold,
+                score_semantic,
+            )
+        except (OSError, ValueError, TypeError) as exc:
+            QMessageBox.warning(self, "Decision Revision Failed", str(exc))
+            return
+        counts = self.inference_page.decision_preview_counts()
+        final_test_details = [
+            f"Persisted final-test OK -> NG: {preview.ok_to_ng_changes}",
+            f"Persisted final-test NG -> OK: {preview.ng_to_ok_changes}",
+        ]
+        if preview.false_reject_rate is not None:
+            final_test_details.append(f"Persisted false-reject rate: {preview.false_reject_rate:.2%}")
+        if preview.ng_recall is not None:
+            final_test_details.append(f"Persisted NG recall: {preview.ng_recall:.2%}")
+        if preview.outside_calibration_range:
+            final_test_details.append("Warning: proposed threshold is outside observed calibration score range.")
+        confirmation = "\n".join(
+            [
+                f"Active deployment threshold: {active_threshold:.12g}",
+                f"Proposed deployment threshold: {proposed_threshold:.12g}",
+                f"Current inference-list OK -> NG: {counts['ok_to_ng']}",
+                f"Current inference-list NG -> OK: {counts['ng_to_ok']}",
+                *final_test_details,
+                "The model is not rerun. Heatmaps and pixel masks do not change.",
+            ]
+        )
+        confirmed = QMessageBox.question(
+            self,
+            "Confirm Decision Revision",
+            confirmation,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirmed != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            revision = self.threshold_revision_service.create_revision(
+                run_directory,
+                ImageThresholdOperatingPoint(proposed_threshold, score_semantic),
+                operator_note=operator_note,
+            )
+            revised_predictions = self.result_parser.read_predictions_csv(revision.predictions_path)
+        except (OSError, ValueError, TypeError) as exc:
+            QMessageBox.warning(self, "Decision Revision Failed", str(exc))
+            return
+        self.inference_page.set_active_decision_threshold(
+            revision.image_operating_point.threshold,
+            f"active decision revision: {revision.revision_path.stem}",
+            revision.image_operating_point.score_semantic,
+        )
+        result_run_directory = self.results_page.current_run_directory
+        if result_run_directory is not None and result_run_directory.resolve() == run_directory.resolve():
+            self.results_page.display_threshold_revision(
+                revision.revision_path.stem,
+                revision.image_operating_point.threshold,
+                revision.pixel_operating_point.active_threshold,
+                revised_predictions,
+            )
 
     def _start_inference(self) -> None:
         if self._inference_run_directory is None:

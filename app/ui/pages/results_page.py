@@ -31,6 +31,7 @@ class ResultsPage(QWidget):
 
     threshold_revision_requested = Signal(str, float, bool, float)
     decision_preview_requested = Signal(float)
+    ui_text_changed = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -240,6 +241,7 @@ class ResultsPage(QWidget):
         self.no_ng_warning_label.setVisible(False)
         for label in self.metric_labels.values():
             label.setText("Not available")
+        self.ui_text_changed.emit()
 
     def set_training_run(self, run: TrainingRun) -> None:
         """Populate the completed-run metadata and metrics."""
@@ -309,6 +311,7 @@ class ResultsPage(QWidget):
         for key, label in self.metric_labels.items():
             label.setText(summary.get(key, "Not available"))
         self._apply_prediction_filter()
+        self.ui_text_changed.emit()
 
     def _populate_threshold_revisions(self, run: TrainingRun) -> None:
         """List persisted revisions and initialize controls from the active saved operating point."""
@@ -393,6 +396,7 @@ class ResultsPage(QWidget):
         )
         self.active_deployment_threshold_label.setText(self._format_value(image_threshold))
         self._apply_prediction_filter()
+        self.ui_text_changed.emit()
 
     def operator_note(self) -> str:
         """Return the note persisted in an operator-created deployment decision revision."""
@@ -423,6 +427,7 @@ class ResultsPage(QWidget):
         if "superadd" in semantic.casefold():
             details.append("Warning: SuperADD scores are distance values, not probabilities.")
         self.threshold_preview_label.setText(" | ".join(details))
+        self.ui_text_changed.emit()
 
     def displayed_predictions(self) -> list[PredictionResult]:
         """Return all predictions for the currently displayed canonical run or threshold revision."""

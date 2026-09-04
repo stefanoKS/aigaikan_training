@@ -125,7 +125,7 @@ def test_export_model_uses_configured_formats_native_preprocessing_and_names(tmp
     revision_path.write_text(
         json.dumps(
             {
-                "version": 1,
+                "version": 2,
                 "revision_id": "threshold-001",
                 "image_operating_point": {
                     "version": 1,
@@ -141,6 +141,10 @@ def test_export_model_uses_configured_formats_native_preprocessing_and_names(tmp
                     "semantic": "continuous_anomaly_map_gte_v1",
                 },
                 "predictions_file": revision_predictions.name,
+                "source": "operator_override",
+                "base_calibrated_threshold": 0.5,
+                "created_at": "2026-09-04T00:00:00+00:00",
+                "operator_note": "inference page adjustment",
             }
         ),
         encoding="utf-8",
@@ -243,7 +247,18 @@ def test_export_model_uses_configured_formats_native_preprocessing_and_names(tmp
     assert deployment_manifest["preprocessing_contract"]["image_preprocessing"]["schema_version"] == 1
     assert deployment_manifest["input_contract"]["color_order"] == "RGB"
     assert deployment_manifest["decision_policy"]["file"] == "decision_policy.json"
+    assert deployment_manifest["decision_policy"]["threshold"] == 0.05
+    assert deployment_manifest["decision_policy"]["score_semantic"] == "anomalib_postprocessed_pred_score_v1"
+    assert deployment_manifest["decision_policy"]["revision_id"] == "threshold-001"
+    assert deployment_manifest["decision_policy"]["comparator"] == ">="
+    assert deployment_manifest["decision_policy"]["operator_note"] == "inference page adjustment"
     assert (report.package_directory / "decision_policy.json").is_file()
+    decision_policy = json.loads((report.package_directory / "decision_policy.json").read_text(encoding="utf-8"))
+    assert decision_policy["threshold"] == 0.05
+    assert decision_policy["score_semantic"] == "anomalib_postprocessed_pred_score_v1"
+    assert decision_policy["revision_id"] == "threshold-001"
+    assert decision_policy["comparator"] == ">="
+    assert decision_policy["operator_note"] == "inference page adjustment"
     standalone_preprocessing = json.loads((report.package_directory / "preprocessing.json").read_text(encoding="utf-8"))
     assert standalone_preprocessing["implementation"]["component"] == "app.core.image_preprocessor.ImagePreprocessor"
     runner = report.package_directory / "reference_runner" / "run_preprocessing_reference.py"

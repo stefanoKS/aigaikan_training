@@ -206,7 +206,15 @@ Once a model passes that separate evidence gate, a Torch package uses the manife
 }
 ```
 
-The Results page keeps calibrated and active deployment thresholds separate from the proposed operator value. Preview uses persisted validation/final-test scores only, reports OK-to-NG and NG-to-OK changes plus measurable false-reject/recall values, and warns when an operator threshold lies beyond calibration observations. Saving creates and atomically activates an immutable `threshold-NNN` revision with the operator note; it preserves continuous maps and heatmaps. A pixel threshold remains independent and changes only binary masks and contour overlays. The Inference page calls its post-result copy filter **NG image copy filter**; it never changes the deployment policy or prediction labels.
+The Results page keeps calibrated and active deployment thresholds separate from the proposed operator value. Preview uses persisted validation/final-test scores only, reports OK-to-NG and NG-to-OK changes plus measurable false-reject/recall values, and warns when an operator threshold lies beyond calibration observations. Saving creates and atomically activates an immutable `threshold-NNN` revision with the operator note; it preserves continuous maps and heatmaps. A pixel threshold remains independent and changes only binary masks and contour overlays.
+
+### Inference decision preview
+
+Inference results preserve their **inference-time prediction** and **inference-time threshold** as historical record columns. The Inference page also shows the active deployment threshold separately and offers an unsaved **Image Decision Threshold Preview**. Its displayed decision is calculated only as `anomaly_score >= displayed threshold -> NG`; equality is NG. The preview never reruns the model and never mutates a prediction record, score, continuous map, heatmap, overlay, binary mask, contour overlay, timing record, checkpoint, or canonical `results.json`. Changing the image decision threshold changes only displayed OK/NG decisions; it does not change a heatmap.
+
+The preview summary reports inference-time and displayed OK/NG counts and both transition directions. **Save and Activate Decision Revision** confirms the persisted final-test effect before calling the immutable threshold-revision service. The active revision then drives later trainer inference, deployment export, `active_threshold_revision.json`, and exported `decision_policy.json`, including its score semantic, comparator, revision ID, and operator note.
+
+The **NG image copy filter** is strictly export-only. An unsaved image decision preview never changes this filter or raw NG-image copying. After a saved revision, the default copy threshold follows the newly active threshold; an enabled custom copy filter still overrides it only for copying. Pixel-mask generation remains controlled exclusively by its independent pixel threshold.
 
 The metadata-driven in-memory reference runner accepts raw RGB arrays without temporary PNG staging, verifies package checksums, applies saved ROI -> image profile -> padding/tiling -> model transform order, resolves the same semantic-safe decision score as training/inference/export validation, and keeps pixel masks independent:
 

@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -17,6 +20,7 @@ from app.models.preprocessing_preview import PreprocessingPreviewState, PreviewS
 from app.core.preprocessing_contract import read_preprocessing_config
 from app.core.threshold_contract import ImageThresholdOperatingPoint, PixelThresholdOperatingPoint
 from app.services.threshold_revision_service import ThresholdRevisionResult
+from app.ui import main_window as main_window_module
 from app.core.project_manager import ProjectManager
 from app.core.settings_manager import SettingsManager
 from app.models.project_config import ProjectConfig
@@ -354,5 +358,181 @@ def test_saving_changed_superadd_backbone_or_precision_requires_retraining(tmp_p
     )
     assert window._save_training_config(show_dialog=False)
     assert project.last_training_status == "Retraining required"
+    assert application is not None
+    window.close()
+
+
+def test_inference_preview_save_revises_only_the_inference_selected_run_and_preserves_pixel_policy(
+    tmp_path: Path, monkeypatch
+) -> None:
+    application = QApplication.instance() or QApplication([])
+    window = MainWindow(SettingsManager(), ProjectManager(tmp_path / "projects"))
+    inference_run = tmp_path / "inference-run"
+    results_run = tmp_path / "results-run"
+    inference_run.mkdir()
+    results_run.mkdir()
+    semantic = "anomalib_postprocessed_pred_score_v1"
+    window._inference_run_directory = inference_run
+    window.inference_page.set_training_run(inference_run, "PatchCore", 0.1, score_semantic=semantic)
+    prediction = PredictionResult("inference.png", "NG", "Unknown", 0.12, 0.1, score_semantic=semantic)
+    window.inference_page.append_prediction(prediction)
+    window.inference_page.decision_preview_check.setChecked(True)
+    window.inference_page.decision_preview_spin.setValue(0.15)
+    window.results_page.current_run_directory = results_run
+    window.results_page._predictions = [
+        PredictionResult("results.png", "NG", "OK", 0.9, 0.5, score_semantic=semantic)
+    ]
+    captured: dict[str, object] = {}
+    revision_path = inference_run / "threshold_revisions" / "threshold-001.json"
+    predictions_path = revision_path.with_name("threshold-001_predictions.csv")
+    revision = ThresholdRevisionResult(
+        revision_path,
+        predictions_path,
+        ImageThresholdOperatingPoint(0.15, semantic),
+        PixelThresholdOperatingPoint(enabled=True, threshold=0.85),
+        operator_note="line trial",
+    )
+    monkeypatch.setattr(window.threshold_revision_service, "read_active_revision", lambda path: None)
+    monkeypatch.setattr(main_window_module, "read_persisted_threshold", lambda path: 0.1)
+    monkeypatch.setattr(
+        main_window_module,
+        "read_persisted_threshold_metadata",
+        lambda path: {"threshold_value": 0.1, "score_semantic": semantic},
+    )
+    monkeypatch.setattr(
+        window.threshold_revision_service,
+        "preview_decision_threshold",
+        lambda path, proposed, score_semantic: SimpleNamespace(
+            active_threshold=0.1,
+            proposed_threshold=proposed,
+            score_semantic=score_semantic,
+            ok_to_ng_changes=1,
+            ng_to_ok_changes=2,
+            false_reject_rate=0.2,
+            ng_recall=0.8,
+            outside_calibration_range=False,
+        ),
+    )
+
+    def create_revision(path, image_operating_point, pixel_operating_point=None, operator_note=""):
+        captured.update(
+            {
+                "run_directory": path,
+                "image_operating_point": image_operating_point,
+                "pixel_operating_point": pixel_operating_point,
+                "operator_note": operator_note,
+            }
+        )
+        return revision
+
+    refreshed_results: list[object] = []
+    monkeypatch.setattr(window.threshold_revision_service, "create_revision", create_revision)
+    monkeypatch.setattr(window.result_parser, "read_predictions_csv", lambda _path: [])
+    monkeypatch.setattr(window.results_page, "display_threshold_revision", lambda *args: refreshed_results.append(args))
+    monkeypatch.setattr(QMessageBox, "question", lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes)
+
+    window._save_inference_decision_revision(0.15, "line trial")
+
+    assert captured["run_directory"] == inference_run
+    assert captured["image_operating_point"] == ImageThresholdOperatingPoint(0.15, semantic)
+    assert captured["pixel_operating_point"] is None
+    assert captured["operator_note"] == "line trial"
+    assert not refreshed_results
+    assert window.inference_page.export_threshold() == pytest.approx(0.15)
+    assert not window.inference_page.decision_preview_check.isChecked()
+    assert window.inference_page.results_table.item(0, 5).text() == "OK"
+    assert prediction.predicted_label == "NG"
+    assert prediction.threshold == pytest.approx(0.1)
+    assert application is not None
+    window.close()
+
+
+def test_inference_preview_save_refreshes_matching_results_run_and_keeps_active_threshold_on_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    application = QApplication.instance() or QApplication([])
+    window = MainWindow(SettingsManager(), ProjectManager(tmp_path / "projects"))
+    run_directory = tmp_path / "run"
+    run_directory.mkdir()
+    semantic = "anomalib_postprocessed_pred_score_v1"
+    window._inference_run_directory = run_directory
+    window.results_page.current_run_directory = run_directory
+    window.inference_page.set_training_run(run_directory, "PatchCore", 0.1, score_semantic=semantic)
+    window.inference_page.append_prediction(PredictionResult("input.png", "NG", "Unknown", 0.12, 0.1, score_semantic=semantic))
+    window.inference_page.decision_preview_check.setChecked(True)
+    window.inference_page.decision_preview_spin.setValue(0.15)
+    revision_path = run_directory / "threshold_revisions" / "threshold-001.json"
+    revision = ThresholdRevisionResult(
+        revision_path,
+        revision_path.with_name("threshold-001_predictions.csv"),
+        ImageThresholdOperatingPoint(0.15, semantic),
+        PixelThresholdOperatingPoint(),
+    )
+    monkeypatch.setattr(window.threshold_revision_service, "read_active_revision", lambda path: None)
+    monkeypatch.setattr(main_window_module, "read_persisted_threshold", lambda path: 0.1)
+    monkeypatch.setattr(main_window_module, "read_persisted_threshold_metadata", lambda path: {"threshold_value": 0.1, "score_semantic": semantic})
+    monkeypatch.setattr(
+        window.threshold_revision_service,
+        "preview_decision_threshold",
+        lambda *_args: SimpleNamespace(ok_to_ng_changes=0, ng_to_ok_changes=1, false_reject_rate=None, ng_recall=None, outside_calibration_range=False),
+    )
+    monkeypatch.setattr(window.threshold_revision_service, "create_revision", lambda *_args, **_kwargs: revision)
+    revised_predictions = [PredictionResult("final.png", "OK", "OK", 0.12, 0.15, score_semantic=semantic)]
+    monkeypatch.setattr(window.result_parser, "read_predictions_csv", lambda _path: revised_predictions)
+    refreshed_results: list[tuple[object, ...]] = []
+    monkeypatch.setattr(window.results_page, "display_threshold_revision", lambda *args: refreshed_results.append(args))
+    monkeypatch.setattr(QMessageBox, "question", lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes)
+
+    window._save_inference_decision_revision(0.15, "")
+
+    assert refreshed_results and refreshed_results[0][0] == "threshold-001"
+    assert window.inference_page.export_threshold() == pytest.approx(0.15)
+
+    window.inference_page.decision_preview_check.setChecked(True)
+    window.inference_page.decision_preview_spin.setValue(0.2)
+    monkeypatch.setattr(
+        window.threshold_revision_service,
+        "create_revision",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("cannot save")),
+    )
+    monkeypatch.setattr(QMessageBox, "warning", lambda *_args, **_kwargs: None)
+    window._save_inference_decision_revision(0.2, "")
+
+    assert window.inference_page.export_threshold() == pytest.approx(0.15)
+    assert window.inference_page.decision_preview_spin.value() == pytest.approx(0.2)
+    assert application is not None
+    window.close()
+
+
+def test_inference_preview_save_rejects_stale_score_semantics_before_revision(tmp_path: Path, monkeypatch) -> None:
+    application = QApplication.instance() or QApplication([])
+    window = MainWindow(SettingsManager(), ProjectManager(tmp_path / "projects"))
+    run_directory = tmp_path / "run"
+    run_directory.mkdir()
+    window._inference_run_directory = run_directory
+    window.inference_page.set_training_run(
+        run_directory,
+        "PatchCore",
+        0.1,
+        score_semantic="anomalib_postprocessed_pred_score_v1",
+    )
+    window.inference_page.append_prediction(
+        PredictionResult("input.png", "NG", "Unknown", 0.12, 0.1, score_semantic="anomalib_postprocessed_pred_score_v1")
+    )
+    monkeypatch.setattr(window.threshold_revision_service, "read_active_revision", lambda path: None)
+    monkeypatch.setattr(main_window_module, "read_persisted_threshold", lambda path: 0.1)
+    monkeypatch.setattr(
+        main_window_module,
+        "read_persisted_threshold_metadata",
+        lambda path: {"threshold_value": 0.1, "score_semantic": "other_score_domain"},
+    )
+    calls: list[object] = []
+    monkeypatch.setattr(window.threshold_revision_service, "create_revision", lambda *_args, **_kwargs: calls.append(True))
+    monkeypatch.setattr(QMessageBox, "warning", lambda *_args, **_kwargs: None)
+
+    window._save_inference_decision_revision(0.15, "")
+
+    assert not calls
+    assert window.inference_page.active_deployment_threshold == pytest.approx(0.1)
     assert application is not None
     window.close()

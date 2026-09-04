@@ -132,6 +132,7 @@ class PreprocessImagesPage(QWidget):
 
     profile_save_requested = Signal(object)
     preview_state_changed = Signal(object)
+    ui_text_changed = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -685,6 +686,7 @@ class PreprocessImagesPage(QWidget):
         self.active_source_label.setText(f"Active preview source: {source_kind} | {source_name}")
         self.active_source_label.setToolTip(str(source_path))
         self.status_label.setText(" | ".join(warnings) if warnings else "Preview uses the same ROI and preprocessing implementation as training and inference.")
+        self.ui_text_changed.emit()
 
     def _preview_arrays_for_source(
         self,
@@ -743,9 +745,11 @@ class PreprocessImagesPage(QWidget):
         }[self._state.source]
         self.active_source_label.setText(f"Active preview source: {source_kind}")
         self.status_label.setText(" | ".join([*warnings, message]))
+        self.ui_text_changed.emit()
 
     def _show_source_warning(self, warnings: tuple[str, ...] | list[str]) -> None:
         self.status_label.setText(" | ".join(warnings))
+        self.ui_text_changed.emit()
 
     def _update_control_state(self) -> None:
         smoothing = SmoothingFilter(str(self.smoothing_combo.currentData()))
@@ -790,6 +794,7 @@ class PreprocessImagesPage(QWidget):
 
     def _set_pixel_inspection(self, enabled: bool) -> None:
         self.pixel_value_label.setText("Move over a preview to inspect RGB values." if enabled else "Pixel inspection disabled")
+        self.ui_text_changed.emit()
 
     def _show_pixel_value(self, message: str) -> None:
         if self.pixel_inspection_check.isChecked():

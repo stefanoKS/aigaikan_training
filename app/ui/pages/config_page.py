@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -26,6 +27,8 @@ from app.models.preprocessing_config import PaddingPolicy, ScoreAggregation
 
 class ConfigPage(QWidget):
     """Training configuration UI."""
+
+    ui_text_changed = Signal()
 
     def __init__(self, model_registry: ModelRegistry | None = None) -> None:
         super().__init__()
@@ -300,6 +303,7 @@ class ConfigPage(QWidget):
             else "Legacy preprocessing-v2 is retained unchanged for compatibility with existing runs."
         )
         self._update_preprocessing_controls()
+        self.ui_text_changed.emit()
 
     def set_preprocessing_geometry(
         self,
@@ -329,6 +333,7 @@ class ConfigPage(QWidget):
         )
         self.padding_validation_label.setText(validation_message)
         self.use_nearest_valid_size_button.setEnabled(automatic_padding is not None and allow_nearest_size)
+        self.ui_text_changed.emit()
 
     def padding_policy(self) -> PaddingPolicy:
         """Return the operator-selected v3 padding policy."""
@@ -388,6 +393,7 @@ class ConfigPage(QWidget):
             details.append(definition.requirement)
         self.model_support_label.setText(" | ".join(details))
         self._update_model_controls(definition.key)
+        self.ui_text_changed.emit()
 
     def _update_model_controls(self, model_key: str) -> None:
         """Show only inputs that apply to the selected Anomalib model."""
@@ -474,6 +480,7 @@ class ConfigPage(QWidget):
             self.superadd_guidance_label.setText("No curated SuperADD backbone is available in the installed timm runtime.")
         elif unavailable_labels:
             self.superadd_guidance_label.setText("Unavailable: " + ", ".join(unavailable_labels))
+        self.ui_text_changed.emit()
 
     def _update_superadd_guidance(self) -> None:
         """Show short latency guidance for the currently selected curated backbone."""
@@ -482,8 +489,10 @@ class ConfigPage(QWidget):
             preset = self.superadd_backbone_registry.get(identifier)
         except ValueError:
             self.superadd_guidance_label.setText("Select an available curated SuperADD backbone.")
+            self.ui_text_changed.emit()
             return
         self.superadd_guidance_label.setText(f"{preset.display_name}: {preset.guidance}.")
+        self.ui_text_changed.emit()
 
     def set_dinomaly_encoder(self, identifier: str) -> None:
         """Select a persisted curated encoder after the current model family is loaded."""
@@ -531,6 +540,7 @@ class ConfigPage(QWidget):
             if first_available_index < 0
             else ("Unavailable: " + ", ".join(unavailable_labels) if unavailable_labels else "All curated encoders are available.")
         )
+        self.ui_text_changed.emit()
 
     def threshold_false_reject_rate(self) -> float:
         """Return the selected normal false-reject rate as a probability."""
