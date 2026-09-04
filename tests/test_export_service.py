@@ -11,10 +11,13 @@ from types import ModuleType
 
 import numpy as np
 import pytest
+import torch
 
 from app.core.dataset_manifest import sha256_file
+from app.core.deployment_package import DeploymentPrediction
 from app.core.inspection_region import InspectionRegionProcessor, inspection_region_hash, write_inspection_region
 from app.core.model_registry import ModelRegistry, ModelSupportLevel
+from app.core.preprocessing_contract import resolved_preprocessing_hash, write_resolved_preprocessing_plan
 from app.core.preprocessing_pipeline import PreprocessingPipeline
 from app.models.inspection_region import InspectionRegionConfig
 from app.core.run_artifacts import CanonicalCheckpoint, read_canonical_checkpoint, write_run_manifest
@@ -48,8 +51,40 @@ class FakeAnomalibService:
     def __init__(self, engine: FakeEngine) -> None:
         self.engine = engine
 
-    def create_inference_components(self, config: TrainingConfig, output_directory: Path) -> dict[str, object]:
+    def create_inference_components(
+        self,
+        config: TrainingConfig,
+        output_directory: Path,
+        preprocessing_plan: object | None = None,
+    ) -> dict[str, object]:
         return {"model": object(), "engine": self.engine}
+
+
+def test_superadd_memory_bank_metadata_comes_from_completed_checkpoint_state(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "superadd.ckpt"
+    bank = torch.zeros((2, 3, 4), dtype=torch.float16)
+    torch.save({"state_dict": {"model.model.memory_bank": bank}}, checkpoint_path)
+
+    metadata = ExportService._superadd_memory_bank_metadata_from_checkpoint(checkpoint_path)
+
+    assert metadata == {
+        "bank_count": 2,
+        "feature_dimension": 4,
+        "database_sizes": [3, 3],
+        "dtype": "torch.float16",
+    }
+
+    for state_dict, error in (
+        ({}, "exactly one"),
+        (
+            {"model.first.memory_bank": bank, "model.second.memory_bank": bank},
+            "exactly one",
+        ),
+        ({"model.model.memory_bank": torch.zeros((2, 0, 4))}, "non-empty"),
+    ):
+        torch.save({"state_dict": state_dict}, checkpoint_path)
+        with pytest.raises(ValueError, match=error):
+            ExportService._superadd_memory_bank_metadata_from_checkpoint(checkpoint_path)
 
 
 def test_export_model_uses_configured_formats_native_preprocessing_and_names(tmp_path: Path) -> None:
@@ -62,6 +97,8 @@ def test_export_model_uses_configured_formats_native_preprocessing_and_names(tmp
     (run_directory / "config.json").write_text(json.dumps(config.to_dict()), encoding="utf-8")
     inspection_region = InspectionRegionConfig()
     write_inspection_region(run_directory / "inspection_region.json", inspection_region)
+    preprocessing_plan = PreprocessingConfig().resolve("patchcore", (4, 3))
+    write_resolved_preprocessing_plan(run_directory / "preprocessing_plan.json", preprocessing_plan)
     write_run_manifest(
         run_directory / "run_manifest.json",
         canonical_checkpoint=CanonicalCheckpoint(checkpoint.resolve(), sha256_file(checkpoint)),
@@ -82,7 +119,16 @@ def test_export_model_uses_configured_formats_native_preprocessing_and_names(tmp
                 "metadata_sha256": inspection_region_hash(inspection_region),
                 "source_size": [0, 0],
                 "rectified_size": [0, 0],
-            }
+            },
+            "preprocessing_contract": {
+                "preprocessing_contract_version": preprocessing_plan.preprocessing_contract_version,
+                "metadata_file": "preprocessing_plan.json",
+                "metadata_sha256": resolved_preprocessing_hash(preprocessing_plan),
+                "model_id": preprocessing_plan.model_id,
+                "model_input_size": list(preprocessing_plan.model_input_size),
+                "score_aggregation": preprocessing_plan.score_aggregation.value,
+                "tiled": preprocessing_plan.tiled,
+            },
         },
     )
     ResultParser().write_training_run(
@@ -186,11 +232,15 @@ def test_export_model_uses_configured_formats_native_preprocessing_and_names(tmp
         received_tolerances.append((_format, score_tolerance))
         return {
             "status": "PASS",
-            "tested_images": len(predictions),
-            "decision_parity": 1.0,
-            "threshold": threshold,
+            "number_of_test_images": len(predictions),
+            "decision_match_rate": 1.0,
             "score_tolerance": score_tolerance,
-            "maximum_score_delta": 0.0,
+            "map_tolerance": score_tolerance,
+            "max_abs_score_error": 0.0,
+            "mean_abs_map_error": 0.0,
+            "max_abs_map_error": 0.0,
+            "artifact": "model.pt",
+            "decision_threshold": threshold,
         }
 
     report = ExportService(
@@ -200,94 +250,41 @@ def test_export_model_uses_configured_formats_native_preprocessing_and_names(tmp
     ).export_model(
         run_directory,
         export_directory,
-        [ModelExportFormat.OPENVINO, ModelExportFormat.TORCH],
+        [ModelExportFormat.TORCH],
     )
 
     assert report.failures == {}
-    assert [result.export_format for result in report.exported] == ["openvino", "torch"]
+    assert [result.export_format for result in report.exported] == ["torch"]
     assert all(len(result.sha256) == 64 for result in report.exported)
-    assert all(result.validation_report and result.validation_report.is_file() for result in report.exported)
-    assert report.package_directory and (report.package_directory / "deployment_manifest.json").is_file()
-    assert (report.package_directory / "predictions.csv").is_file()
-    assert (report.package_directory / "calibration_manifest.json").is_file()
-    assert (report.package_directory / "final_test_manifest.json").is_file()
-    assert (report.package_directory / "inspection_region.json").is_file()
-    assert (report.package_directory / "preprocessing.json").is_file()
-    assert (report.package_directory / "reference_runner" / "run_preprocessing_reference.py").is_file()
-    assert (report.package_directory / "reference_runner" / "deployment_reference_inference.py").is_file()
-    assert (report.package_directory / "reference_runner" / "golden_vectors.json").is_file()
-    assert (report.package_directory / "canonical_checkpoint.ckpt").read_text(encoding="utf-8") == "checkpoint"
-    assert (report.package_directory / "active_threshold_revision.json").is_file()
-    assert (report.package_directory / "threshold_revisions" / "threshold-001.json").is_file()
-    assert (report.package_directory / "threshold_revisions" / "threshold-001_predictions.csv").is_file()
-    assert read_canonical_checkpoint(report.package_directory).path == report.package_directory / "canonical_checkpoint.ckpt"
-    assert [result.exported_path.name for result in report.exported] == [
-        "patchcore_2026_08_31_12_00_00_openvino.xml",
-        "patchcore_2026_08_31_12_00_00_torch.pt",
-    ]
-    assert [call["input_size"] for call in engine.calls] == [None, None]
-    assert [call["ckpt_path"] for call in engine.calls] == [checkpoint.resolve(), checkpoint.resolve()]
-    assert received_thresholds == [0.05, 0.05]
+    assert report.package_directory is not None
+    assert {path.name for path in report.package_directory.iterdir()} == {"model.pt", "deployment.json"}
+    assert [result.exported_path.name for result in report.exported] == ["model.pt"]
+    assert [call["input_size"] for call in engine.calls] == [None]
+    assert [call["ckpt_path"] for call in engine.calls] == [checkpoint.resolve()]
+    assert received_thresholds == [0.05]
     assert received_tolerances == [
-        ("openvino", FORMAT_SCORE_TOLERANCES["openvino"]),
         ("torch", FORMAT_SCORE_TOLERANCES["torch"]),
     ]
-    deployment_manifest = json.loads((report.package_directory / "deployment_manifest.json").read_text(encoding="utf-8"))
-    assert deployment_manifest["threshold_metadata"]["threshold_method"] == "normal_only_conformal"
-    assert deployment_manifest["threshold_metadata"]["threshold_revision"] == "threshold-001"
-    assert deployment_manifest["anomalib_version"] == "2.6.0"
-    assert deployment_manifest["deployment_contract_version"] == DEPLOYMENT_CONTRACT_VERSION
-    assert deployment_manifest["trainer_version"]
-    assert deployment_manifest["torch_export_type"] == "torch"
-    assert deployment_manifest["runtime_versions"]["torch"]
-    assert deployment_manifest["canonical_checkpoint"] == "canonical_checkpoint.ckpt"
-    assert deployment_manifest["format_score_tolerances"] == FORMAT_SCORE_TOLERANCES
-    assert deployment_manifest["inspection_preprocessing"]["metadata_sha256"] == inspection_region_hash(inspection_region)
-    assert deployment_manifest["preprocessing_contract"]["image_preprocessing_file"] == "preprocessing.json"
-    assert deployment_manifest["preprocessing_contract"]["image_preprocessing"]["schema_version"] == 1
-    assert deployment_manifest["input_contract"]["color_order"] == "RGB"
-    assert deployment_manifest["decision_policy"]["file"] == "decision_policy.json"
-    assert deployment_manifest["decision_policy"]["threshold"] == 0.05
-    assert deployment_manifest["decision_policy"]["score_semantic"] == "anomalib_postprocessed_pred_score_v1"
-    assert deployment_manifest["decision_policy"]["revision_id"] == "threshold-001"
-    assert deployment_manifest["decision_policy"]["comparator"] == ">="
-    assert deployment_manifest["decision_policy"]["operator_note"] == "inference page adjustment"
-    assert (report.package_directory / "decision_policy.json").is_file()
-    decision_policy = json.loads((report.package_directory / "decision_policy.json").read_text(encoding="utf-8"))
-    assert decision_policy["threshold"] == 0.05
-    assert decision_policy["score_semantic"] == "anomalib_postprocessed_pred_score_v1"
-    assert decision_policy["revision_id"] == "threshold-001"
-    assert decision_policy["comparator"] == ">="
-    assert decision_policy["operator_note"] == "inference page adjustment"
-    standalone_preprocessing = json.loads((report.package_directory / "preprocessing.json").read_text(encoding="utf-8"))
-    assert standalone_preprocessing["implementation"]["component"] == "app.core.image_preprocessor.ImagePreprocessor"
-    runner = report.package_directory / "reference_runner" / "run_preprocessing_reference.py"
-    runner_result = subprocess.run(
-        [sys.executable, str(runner), "--golden", str(runner.with_name("golden_vectors.json"))],
-        cwd=runner.parent,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert runner_result.returncode == 0, runner_result.stderr
-    deployment_runner = report.package_directory / "reference_runner" / "deployment_reference_inference.py"
-    deployment_runner_result = subprocess.run(
-        [sys.executable, str(deployment_runner), "--help"],
-        cwd=deployment_runner.parent,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert deployment_runner_result.returncode == 0, deployment_runner_result.stderr
-    benchmark_runner = report.package_directory / "reference_runner" / "benchmark_deployment_reference.py"
-    benchmark_runner_result = subprocess.run(
-        [sys.executable, str(benchmark_runner), "--help"],
-        cwd=benchmark_runner.parent,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert benchmark_runner_result.returncode == 0, benchmark_runner_result.stderr
+    deployment = json.loads((report.package_directory / "deployment.json").read_text(encoding="utf-8"))
+    assert deployment["deployment_contract_version"] == DEPLOYMENT_CONTRACT_VERSION
+    assert deployment["deployment"]["model_sha256"] == report.exported[0].sha256
+    assert deployment["input"] == {
+        "dtype": "uint8",
+        "range": [0, 255],
+        "accepted_layouts": ["HW", "HWC"],
+        "canonical_color_order": "RGB",
+        "color_input_order": "RGB",
+        "mono_conversion": "GRAY_TO_RGB",
+    }
+    assert deployment["inspection_region"] == inspection_region.to_dict()
+    assert deployment["image_preprocessing"] == preprocessing_plan.image_preprocessing.to_dict()
+    assert deployment["model_preprocessing"]["resolved_plan"] == preprocessing_plan.to_dict()
+    assert deployment["decision"]["threshold"] == 0.05
+    assert deployment["decision"]["score_semantic"] == "anomalib_postprocessed_pred_score_v1"
+    assert deployment["decision"]["threshold_revision_id"] == "threshold-001"
+    assert deployment["decision"]["comparator"] == ">="
+    assert deployment["decision"]["operator_note"] == "inference page adjustment"
+    assert deployment["validation"]["status"] == "PASS"
 
     revised_package = ExportService().create_deployment_policy_revision(
         report.package_directory,
@@ -295,18 +292,13 @@ def test_export_model_uses_configured_formats_native_preprocessing_and_names(tmp
         1.7,
         "line override",
     )
-    revised_policy = json.loads((revised_package / "decision_policy.json").read_text(encoding="utf-8"))
-    revised_manifest = json.loads((revised_package / "deployment_manifest.json").read_text(encoding="utf-8"))
-    assert revised_policy["threshold"] == 1.7
-    assert revised_policy["source"] == "operator_override"
-    assert revised_policy["model_sha256"] == deployment_manifest["exports"][1]["sha256"]
-    assert revised_manifest["decision_policy"]["sha256"] != deployment_manifest["decision_policy"]["sha256"]
-    assert deployment_manifest["model"]["profile"]["preprocessing"] == "anomalib-native"
-    assert deployment_manifest["exports"][0]["validation"]["maximum_score_delta"] == 0.0
-    validation_report = json.loads(report.exported[0].validation_report.read_text(encoding="utf-8"))
-    assert validation_report["decision_threshold"] == 0.05
-    assert validation_report["deployment_contract_version"] == DEPLOYMENT_CONTRACT_VERSION
-    assert validation_report["threshold_metadata"]["calibration_manifest_sha256"] == "b" * 64
+    revised_deployment = json.loads((revised_package / "deployment.json").read_text(encoding="utf-8"))
+    assert {path.name for path in revised_package.iterdir()} == {"model.pt", "deployment.json"}
+    assert revised_deployment["decision"]["threshold"] == 1.7
+    assert revised_deployment["decision"]["threshold_source"] == "operator_override"
+    assert revised_deployment["deployment"]["model_sha256"] == deployment["deployment"]["model_sha256"]
+    assert revised_deployment["validation"]["decision_threshold"] == deployment["validation"]["decision_threshold"] == 0.05
+    assert revised_deployment["model"]["profile"]["preprocessing"] == "anomalib-native"
 
 
 def test_export_service_allows_an_explicit_per_format_tolerance_override() -> None:
@@ -314,6 +306,45 @@ def test_export_service_allows_an_explicit_per_format_tolerance_override() -> No
 
     assert service.score_tolerances["openvino"] == 0.02
     assert service.score_tolerances["torch"] == FORMAT_SCORE_TOLERANCES["torch"]
+
+
+def test_two_file_export_rejects_non_torch_format_selection(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="two-file deployment contract supports only one Torch"):
+        ExportService().export_model(tmp_path, tmp_path / "exports", [ModelExportFormat.TORCH, ModelExportFormat.ONNX])
+
+
+def test_two_file_parity_validation_compares_score_map_and_decision(tmp_path: Path, monkeypatch) -> None:
+    from PIL import Image
+
+    source = tmp_path / "input.png"
+    Image.new("RGB", (4, 3), (10, 20, 30)).save(source)
+    map_path = tmp_path / "map.npz"
+    expected_map = np.full((3, 4), 0.4, dtype=np.float32)
+    np.savez_compressed(map_path, anomaly_map=expected_map)
+    prediction = PredictionResult(
+        source_path=str(source),
+        predicted_label="OK",
+        ground_truth_label="OK",
+        anomaly_score=0.4,
+        threshold=0.5,
+        score_semantic="anomalib_postprocessed_pred_score_v1",
+        continuous_anomaly_map=str(map_path),
+    )
+
+    class FakePackage:
+        def predict(self, frame: np.ndarray) -> DeploymentPrediction:
+            assert frame.dtype == np.uint8 and frame.shape == (3, 4, 3)
+            return DeploymentPrediction(0.4, 0.5, False, expected_map.copy(), "anomalib_postprocessed_pred_score_v1")
+
+    monkeypatch.setattr("app.services.export_service.DeploymentPackage.load", lambda *_args, **_kwargs: FakePackage())
+    report = ExportService._validate_two_file_deployment(tmp_path, [prediction], 0.5, 1e-4)
+
+    assert report["status"] == "PASS"
+    assert report["max_abs_score_error"] == pytest.approx(0.0)
+    assert report["mean_abs_map_error"] == pytest.approx(0.0)
+    assert report["max_abs_map_error"] == pytest.approx(0.0)
+    assert report["decision_match_rate"] == pytest.approx(1.0)
+    assert report["number_of_test_images"] == 1
 
 
 def test_deployment_validation_rejects_any_final_test_decision_mismatch(monkeypatch) -> None:
@@ -508,7 +539,7 @@ def test_deployment_validation_uses_superadd_raw_native_score_and_rejects_semant
         def predict(self, _image: object) -> dict[str, object]:
             return {
                 "pred_score": 1.0,
-                "raw_pred_score": 1.7,
+                "decision_score": 1.7,
                 "anomaly_map": np.full((448, 448), 0.4, dtype=np.float32),
             }
 

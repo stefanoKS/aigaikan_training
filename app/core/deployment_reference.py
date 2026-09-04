@@ -301,11 +301,8 @@ class TorchDeploymentReferenceInferencer:
 
     @classmethod
     def _raw_score(cls, output: Any) -> float | None:
-        for name in ("raw_pred_score", "raw_image_score", "raw_score"):
-            value = cls._value(output, name)
-            if value is not None:
-                return cls._finite_scalar(value, "raw native image score")
-        return None
+        value = cls._value(output, "decision_score")
+        return None if value is None else cls._finite_scalar(value, "SuperADD decision_score")
 
     @classmethod
     def _anomaly_map(cls, output: Any) -> np.ndarray:

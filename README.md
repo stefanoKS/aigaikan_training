@@ -120,13 +120,13 @@ Convenience presets populate the same explicit controls: No Additional Preproces
 
 Saving changed operations or parameters updates the preprocessing hash, marks prior results stale, and requires training plus recalibration. Changing only the preview source never changes a dataset split, model profile, hash, manifest, or result. Projects and historic runs without profile metadata resolve to `legacy_none_v1`, reproducing the prior RGB no-op behavior exactly.
 
-New runs record the full profile in `config.json`, `preprocessing_plan.json` when non-legacy, `image_preprocessing.json`, `results.json`, `run_manifest.json`, and model provenance. The deployment bundle contains standalone `preprocessing.json`, its semantic SHA-256, runtime OpenCV/NumPy versions, `reference_runner/run_preprocessing_reference.py`, and `reference_runner/golden_vectors.json`. Run the bundle checker with:
+New runs record the full profile in `config.json`, `preprocessing_plan.json` when non-legacy, `image_preprocessing.json`, `results.json`, `run_manifest.json`, and model provenance. These are internal training/audit records; a current deployment export does not copy them as sidecars. The repository preprocessing runner and golden vectors remain internal verification tools. Run the checker from the repository with:
 
 ```powershell
-python reference_runner\run_preprocessing_reference.py --golden reference_runner\golden_vectors.json
+python scripts\preprocessing_reference_runner.py --golden path\to\golden_vectors.json
 ```
 
-For exact raw-frame model inputs, give the runner `--input`, `--output`, `--inspection-region inspection_region.json`, and `--resolved-plan preprocessing_plan.json`. The golden vectors verify both the profile and the full ROI-to-model-input route before a future runtime accepts a bundle.
+For exact raw-frame model inputs, give the runner `--input`, `--output`, `--inspection-region inspection_region.json`, and `--resolved-plan preprocessing_plan.json`. The golden vectors verify both the profile and the full ROI-to-model-input route before a completed run is accepted.
 
 The project and every run persist canonical `inspection_region.json` metadata. Runs store its SHA-256 hash, source resolution, and rectified dimensions in `run_manifest.json`. Inputs at another resolution are rejected; the source files remain unchanged. A changed ROI requires retraining and prevents stale result/inference-run selection.
 
@@ -185,26 +185,25 @@ AUROC and F1 are supplementary ranking metrics. An escaped NG is always treated 
 
 Export is blocked for every default model until it reaches `TORCH_EXPORT_VALIDATED`; the interface does not treat an unverified export as deployable. **No default model is currently Torch-export validated.** PatchCore, PaDiM, and both Dinomaly profiles are training-validated only; AnomalyDINO, SuperADD, EfficientAD, and SuperSimpleNet remain experimental. The blocker is missing demonstrated real Anomalib export, reload, map, score, and decision-parity evidence for the exact model/configuration. No registry flag is changed by this repository work.
 
-Once a model passes that separate evidence gate, a Torch package uses the manifest-verified canonical checkpoint rather than the newest file in a folder and packages `canonical_checkpoint.ckpt`, `deployment_manifest.json`, `decision_policy.json`, `preprocessing_plan.json`, `inspection_region.json`, `preprocessing.json`, `environment.json`, `config.json`, the Torch artifact, validation report, reference runners, and golden preprocessing vectors. Every referenced artifact has a SHA-256 recorded in the manifest. Contract version 3 adds the sidecar decision policy; version 2 manifests can be read for migration/audit but fail closed for production reference inference because they have no explicit decision policy.
+Once a model passes that separate evidence gate, the exporter reads the manifest-verified canonical checkpoint rather than the newest file in a folder and emits exactly `model.pt` and `deployment.json`. The JSON document binds the model SHA-256 and embeds the frozen ROI, preprocessing plan, decision policy, and export/reload parity evidence. Historical v2/v3 multi-file manifests remain readable only for migration and audit; they are not current production export outputs.
 
-`decision_policy.json` is authoritative for the image decision. It is independent from Anomalib's embedded thresholds and uses the unchanged rule `score >= threshold -> NG`. Thresholds are finite but are not restricted to $[0,1]$ because SuperADD distance scores may legitimately exceed one:
+The embedded `decision` object is authoritative for the image decision. It is independent from Anomalib's embedded thresholds and uses the unchanged rule `score >= threshold -> NG`. Thresholds are finite but are not restricted to $[0,1]$ because SuperADD distance scores may legitimately exceed one:
 
 ```json
 {
-	"decision_policy_version": 1,
+	"score_semantic": "superadd_native_top_quantile_score_v1",
 	"threshold": 1.7,
 	"comparator": ">=",
 	"above_or_equal_label": "NG",
 	"below_label": "OK",
-	"score_semantic": "superadd_native_top_quantile_score_v1",
-	"source": "operator_override",
+	"threshold_source": "operator_override",
 	"base_calibrated_threshold": 0.7,
-	"revision_id": "threshold-003",
-	"operator_note": "line trial",
-	"model_sha256": "...",
-	"preprocessing_plan_sha256": "..."
+	"threshold_revision_id": "threshold-003",
+	"operator_note": "line trial"
 }
 ```
+
+Creating a deployment policy revision copies the verified model and its export/reload validation snapshot, then freezes only the new embedded decision threshold and revision metadata. It never reads a later active run revision while loading an existing deployment package.
 
 The Results page keeps calibrated and active deployment thresholds separate from the proposed operator value. Preview uses persisted validation/final-test scores only, reports OK-to-NG and NG-to-OK changes plus measurable false-reject/recall values, and warns when an operator threshold lies beyond calibration observations. Saving creates and atomically activates an immutable `threshold-NNN` revision with the operator note; it preserves continuous maps and heatmaps. A pixel threshold remains independent and changes only binary masks and contour overlays.
 
@@ -212,17 +211,48 @@ The Results page keeps calibrated and active deployment thresholds separate from
 
 Inference results preserve their **inference-time prediction** and **inference-time threshold** as historical record columns. The Inference page also shows the active deployment threshold separately and offers an unsaved **Image Decision Threshold Preview**. Its displayed decision is calculated only as `anomaly_score >= displayed threshold -> NG`; equality is NG. The preview never reruns the model and never mutates a prediction record, score, continuous map, heatmap, overlay, binary mask, contour overlay, timing record, checkpoint, or canonical `results.json`. Changing the image decision threshold changes only displayed OK/NG decisions; it does not change a heatmap.
 
-The preview summary reports inference-time and displayed OK/NG counts and both transition directions. **Save and Activate Decision Revision** confirms the persisted final-test effect before calling the immutable threshold-revision service. The active revision then drives later trainer inference, deployment export, `active_threshold_revision.json`, and exported `decision_policy.json`, including its score semantic, comparator, revision ID, and operator note.
+The preview summary reports inference-time and displayed OK/NG counts and both transition directions. **Save and Activate Decision Revision** confirms the persisted final-test effect before calling the immutable threshold-revision service. The active revision then drives later trainer inference, deployment export, `active_threshold_revision.json`, and the embedded `deployment.json` decision object, including its score semantic, comparator, revision ID, and operator note.
 
 The **NG image copy filter** is strictly export-only. An unsaved image decision preview never changes this filter or raw NG-image copying. After a saved revision, the default copy threshold follows the newly active threshold; an enabled custom copy filter still overrides it only for copying. Pixel-mask generation remains controlled exclusively by its independent pixel threshold.
 
-The metadata-driven in-memory reference runner accepts raw RGB arrays without temporary PNG staging, verifies package checksums, applies saved ROI -> image profile -> padding/tiling -> model transform order, resolves the same semantic-safe decision score as training/inference/export validation, and keeps pixel masks independent:
+## Two-file deployment contract
+
+A successful deployment export contains exactly two files:
+
+```text
+deployment/
+	model.pt
+	deployment.json
+```
+
+`model.pt` is the executable Anomalib Torch deployment model and contains its required model tensors/state. `deployment.json` is the versioned non-tensor contract: raw pixel input adaptation, saved four-point ROI, deterministic image preprocessing operations, resolved padding/alignment/tiling plan, model metadata, score semantic, active immutable image threshold, independent pixel policy, model SHA-256 binding, and export/reload parity evidence. No training-run file, checkpoint, preprocessing sidecar, ROI sidecar, policy sidecar, or internet lookup is required by the package loader.
+
+The raw input boundary is explicit: a `numpy.uint8` Mono8 frame uses `HW` layout and is converted with `cv2.COLOR_GRAY2RGB`; color uses `HWC` with exactly three channels in declared `RGB` order. The canonical internal representation before ROI/preprocessing is always RGB `uint8` in $[0,255]$. The loader never infers BGR/RGB from array shape, normalizes raw input outside the saved contract, or accepts floating tensors from a camera caller.
+
+The required runtime flow is:
+
+```text
+raw numpy uint8 frame
+	-> input adaptation to RGB uint8
+	-> saved perspective ROI
+	-> saved deterministic image preprocessing
+	-> saved padding/alignment/tiling plan
+	-> model.pt-owned Anomalib transform
+	-> model.pt inference
+	-> decision_score
+	-> decision_score >= deployment threshold
+	-> NG / OK
+```
+
+The two-file reference API is `DeploymentPackage.load(path)` followed by `deployment.predict(raw_uint8_frame)`. It verifies the SHA-256 binding before loading `model.pt`, and its result exposes `decision_score`, `threshold`, `is_ng`, `score_semantic`, and `anomaly_map`. Anomalib's `TorchInferencer` loads Torch artifacts through PyTorch pickle and requires `TRUST_REMOTE_CODE=1`; set it only in a trusted environment for a `model.pt` exported by this toolchain. SuperADD packages additionally require a finite explicit `decision_score` from the exported model and verified non-empty registered memory-bank state; raw alias fields such as `raw_pred_score` are not accepted.
+
+Use the standalone reference loader with only the two deployment files available:
 
 ```powershell
 python scripts\deployment_reference_inference.py --package path\to\deployment --input frame.png --output result.json --device cpu
 ```
 
-`result.json` contains the score, score semantic/source, decision, and versioned timing record. Run the batch-one benchmark separately; it excludes artifact saving from model latency and reports P50/P95/P99/maximum/throughput after 10 warm-ups and 100 measured frames by default:
+`result.json` contains the decision score, threshold, NG/OK decision, semantic, and anomaly-map shape. The existing multi-file reference runner and its batch-one benchmark remain available for historical v3 audit packages only; they are not required by, and do not validate, a new two-file package. That benchmark excludes artifact saving from model latency and reports P50/P95/P99/maximum/throughput after 10 warm-ups and 100 measured frames by default:
 
 ```powershell
 python scripts\benchmark_deployment_reference.py --package path\to\deployment --input frames --output benchmark.json

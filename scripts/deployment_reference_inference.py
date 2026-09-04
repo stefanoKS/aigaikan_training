@@ -1,4 +1,4 @@
-"""Run verified in-memory Torch deployment reference inference on one RGB image."""
+"""Run two-file Torch deployment reference inference without a training directory."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ if str(package_root) not in sys.path:
 import numpy as np
 from PIL import Image
 
-from app.core.deployment_reference import TorchDeploymentReferenceInferencer
+from app.core.deployment_package import DeploymentPackage
 
 
 def main() -> int:
@@ -26,18 +26,19 @@ def main() -> int:
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     args = parser.parse_args()
     with Image.open(args.input) as image:
-        source_rgb = np.asarray(image.convert("RGB"))
-    reference = TorchDeploymentReferenceInferencer.load(args.package, device=args.device)
-    result = reference.infer_rgb(source_rgb)
+        raw_uint8 = np.asarray(image)
+    deployment = DeploymentPackage.load(args.package, device=args.device)
+    result = deployment.predict(raw_uint8)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(
         json.dumps(
             {
-                "score": result.score,
+                "decision_score": result.decision_score,
                 "score_semantic": result.score_semantic,
-                "score_source": result.score_source,
-                "predicted_label": result.predicted_label,
-                "timing": result.timing.to_dict(),
+                "threshold": result.threshold,
+                "is_ng": result.is_ng,
+                "predicted_label": "NG" if result.is_ng else "OK",
+                "anomaly_map_shape": list(result.anomaly_map.shape),
             },
             indent=2,
         ),

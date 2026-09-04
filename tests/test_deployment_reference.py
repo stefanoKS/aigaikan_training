@@ -112,7 +112,7 @@ def test_reference_inference_preserves_unbounded_superadd_raw_score(tmp_path: Pa
         lambda _model_path: type(
             "Inferencer",
             (),
-            {"predict": lambda _self, _input: {"pred_score": 1.0, "raw_pred_score": 1.7, "anomaly_map": map_values}},
+            {"predict": lambda _self, _input: {"pred_score": 1.0, "decision_score": 1.7, "anomaly_map": map_values}},
         )(),
     )
     result = reference.infer_rgb(np.zeros((2, 3, 3), dtype=np.uint8))
