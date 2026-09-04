@@ -27,8 +27,10 @@ def test_registry_uses_evidence_based_model_lifecycle_levels() -> None:
         "EfficientAd",
         "Supersimplenet",
     }
-    assert registry.production_models() == []
-    assert all(not definition.supports_export for definition in registry.all())
+    assert [definition.key for definition in registry.production_models()] == ["super_add"]
+    assert registry.get("super_add").supports_export
+    assert registry.get("super_add").support_level is ModelSupportLevel.TORCH_EXPORT_VALIDATED
+    assert all(not definition.supports_export for definition in registry.all() if definition.key != "super_add")
     assert all(
         registry.get(key).support_level is ModelSupportLevel.TRAINING_VALIDATED
         for key in ("patchcore", "padim", "dinomaly_dinov2", "dinomaly_dinov3")

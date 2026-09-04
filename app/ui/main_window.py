@@ -322,6 +322,7 @@ class MainWindow(QMainWindow):
         self.config_page.tiling_check.toggled.connect(self._refresh_preprocessing_geometry)
 
         self.results_page.browse_export_directory_button.clicked.connect(self._choose_model_export_directory)
+        self.results_page.load_completed_run_requested.connect(self._choose_results_run)
         self.results_page.export_model_button.clicked.connect(self._export_model)
         self.results_page.export_csv_button.clicked.connect(self._export_results_csv)
         self.results_page.export_json_button.clicked.connect(self._export_results_json)
@@ -415,6 +416,36 @@ class MainWindow(QMainWindow):
         selected = QFileDialog.getExistingDirectory(self, "Select Model Export Folder", str(default_directory))
         if selected:
             self.results_page.export_directory_edit.setText(selected)
+
+    def _choose_results_run(self) -> None:
+        """Load a completed run explicitly when current project settings have since changed."""
+        if self.current_project is None:
+            QMessageBox.information(self, "No Project", "Open a project before selecting a completed training run.")
+            return
+        selected = QFileDialog.getExistingDirectory(
+            self,
+            "Select Completed Training Run",
+            str(self.current_project.root_path / "runs"),
+        )
+        if not selected:
+            return
+        run_directory = Path(selected).expanduser().resolve()
+        runs_directory = (self.current_project.root_path / "runs").resolve()
+        if not run_directory.is_relative_to(runs_directory):
+            QMessageBox.warning(self, "Invalid Training Run", "Select a completed run from this project's runs folder.")
+            return
+        try:
+            read_canonical_checkpoint(run_directory)
+            read_persisted_threshold_metadata(run_directory)
+            read_verified_inspection_region(run_directory)
+            if read_verified_preprocessing_plan(run_directory) is None:
+                raise ValueError("The selected run does not contain a verified preprocessing plan required for deployment export.")
+            run = self.result_parser.read_training_run(run_directory / "results.json")
+        except (OSError, ValueError, TypeError) as exc:
+            QMessageBox.warning(self, "Invalid Training Run", f"Could not load the completed run: {exc}")
+            return
+        self.results_page.set_training_run(run)
+        self._display_active_threshold_revision(run_directory)
 
     def _export_model(self) -> None:
         project = self.current_project

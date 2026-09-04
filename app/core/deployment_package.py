@@ -83,13 +83,20 @@ class DeploymentPackage:
             model_path,
             require_validation=require_validation,
         )
+        model = _section(metadata, "model")
         if inferencer_factory is None:
-            from anomalib.deploy import TorchInferencer
+            if str(model.get("algorithm", "")) == "super_add":
+                if model.get("expected_precision") == "float16" and device != "cuda":
+                    raise ValueError("SuperADD FP16 deployment requires CUDA.")
+                from app.core.superadd_deployment import SuperADDDeploymentInferencer
 
-            inferencer = TorchInferencer(path=model_path, device=device)
+                inferencer = SuperADDDeploymentInferencer.load(model_path, device=device)
+            else:
+                from anomalib.deploy import TorchInferencer
+
+                inferencer = TorchInferencer(path=model_path, device=device)
         else:
             inferencer = inferencer_factory(model_path)
-        model = _section(metadata, "model")
         if str(model.get("algorithm", "")) == "super_add":
             validate_superadd_memory_bank(inferencer, model)
         pipeline = PreprocessingPipeline(inspection_region, plan)
@@ -218,6 +225,8 @@ def validate_deployment_json(
         raise ValueError("model precision does not match model_preprocessing.")
     if model.get("expected_precision") not in {"float16", "float32"}:
         raise ValueError("model expected_precision must be float16 or float32.")
+    if plan.model_id == "super_add":
+        _validate_superadd_adapter_contract(model, model_preprocessing)
     _validate_decision(_section(metadata, "decision"), deployment, plan)
     validation = _section(metadata, "validation")
     if require_validation:
@@ -282,6 +291,22 @@ def validate_superadd_memory_bank(inferencer: Any, model_metadata: Mapping[str, 
     expected_dtype = expected.get("dtype")
     if expected_dtype and actual["dtype"] != expected_dtype:
         raise ValueError("SuperADD memory bank dtype does not match deployment.json.")
+
+
+def _validate_superadd_adapter_contract(
+    model: Mapping[str, object],
+    model_preprocessing: Mapping[str, object],
+) -> None:
+    if model.get("export_adapter") != "superadd_native_v1":
+        raise ValueError("SuperADD model.pt must use the superadd_native_v1 deployment adapter.")
+    output_contract = model.get("output_contract")
+    if output_contract != {
+        "decision_score": "superadd_native_top_quantile_score_v1",
+        "anomaly_map": "continuous_unthresholded",
+    }:
+        raise ValueError("SuperADD deployment adapter output contract is invalid.")
+    if model.get("external_tiling") is not False or model_preprocessing.get("external_tiling") is not False:
+        raise ValueError("SuperADD deployment must prohibit external tiling.")
 
 
 def _section(metadata: Mapping[str, object], name: str) -> Mapping[str, object]:

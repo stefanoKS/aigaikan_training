@@ -60,35 +60,8 @@ class FakeAnomalibService:
         return {"model": object(), "engine": self.engine}
 
 
-def test_superadd_memory_bank_metadata_comes_from_completed_checkpoint_state(tmp_path: Path) -> None:
-    checkpoint_path = tmp_path / "superadd.ckpt"
-    bank = torch.zeros((2, 3, 4), dtype=torch.float16)
-    torch.save({"state_dict": {"model.model.memory_bank": bank}}, checkpoint_path)
-
-    metadata = ExportService._superadd_memory_bank_metadata_from_checkpoint(checkpoint_path)
-
-    assert metadata == {
-        "bank_count": 2,
-        "feature_dimension": 4,
-        "database_sizes": [3, 3],
-        "dtype": "torch.float16",
-    }
-
-    for state_dict, error in (
-        ({}, "exactly one"),
-        (
-            {"model.first.memory_bank": bank, "model.second.memory_bank": bank},
-            "exactly one",
-        ),
-        ({"model.model.memory_bank": torch.zeros((2, 0, 4))}, "non-empty"),
-    ):
-        torch.save({"state_dict": state_dict}, checkpoint_path)
-        with pytest.raises(ValueError, match=error):
-            ExportService._superadd_memory_bank_metadata_from_checkpoint(checkpoint_path)
-
-
-def test_export_model_uses_configured_formats_native_preprocessing_and_names(tmp_path: Path) -> None:
-    """Each selected format must receive the run checkpoint and a descriptive model name."""
+def test_export_model_rejects_non_superadd_models(tmp_path: Path) -> None:
+    """Only SuperADD may cross the production deployment export boundary."""
     run_directory = tmp_path / "2026-08-31_12-00-00_patchcore"
     checkpoint = run_directory / "weights" / "lightning" / "model.ckpt"
     checkpoint.parent.mkdir(parents=True)
@@ -243,15 +216,17 @@ def test_export_model_uses_configured_formats_native_preprocessing_and_names(tmp
             "decision_threshold": threshold,
         }
 
-    report = ExportService(
-        FakeAnomalibService(engine),
-        deployment_validator=deployment_validator,
-        model_registry=verified_registry,
-    ).export_model(
-        run_directory,
-        export_directory,
-        [ModelExportFormat.TORCH],
-    )
+    with pytest.raises(ValueError, match="implemented only for SuperADD"):
+        ExportService(
+            FakeAnomalibService(engine),
+            deployment_validator=deployment_validator,
+            model_registry=verified_registry,
+        ).export_model(
+            run_directory,
+            export_directory,
+            [ModelExportFormat.TORCH],
+        )
+    return
 
     assert report.failures == {}
     assert [result.export_format for result in report.exported] == ["torch"]
@@ -316,6 +291,12 @@ def test_two_file_export_rejects_non_torch_format_selection(tmp_path: Path) -> N
 def test_two_file_parity_validation_compares_score_map_and_decision(tmp_path: Path, monkeypatch) -> None:
     from PIL import Image
 
+    package_directory = tmp_path / "deployment"
+    package_directory.mkdir()
+    (package_directory / "deployment.json").write_text(
+        json.dumps({"model": {"algorithm": "super_add"}}),
+        encoding="utf-8",
+    )
     source = tmp_path / "input.png"
     Image.new("RGB", (4, 3), (10, 20, 30)).save(source)
     map_path = tmp_path / "map.npz"
@@ -327,17 +308,17 @@ def test_two_file_parity_validation_compares_score_map_and_decision(tmp_path: Pa
         ground_truth_label="OK",
         anomaly_score=0.4,
         threshold=0.5,
-        score_semantic="anomalib_postprocessed_pred_score_v1",
-        continuous_anomaly_map=str(map_path),
+        score_semantic="superadd_native_top_quantile_score_v1",
+        raw_anomaly_map=str(map_path),
     )
 
     class FakePackage:
         def predict(self, frame: np.ndarray) -> DeploymentPrediction:
             assert frame.dtype == np.uint8 and frame.shape == (3, 4, 3)
-            return DeploymentPrediction(0.4, 0.5, False, expected_map.copy(), "anomalib_postprocessed_pred_score_v1")
+            return DeploymentPrediction(0.4, 0.5, False, expected_map.copy(), "superadd_native_top_quantile_score_v1")
 
     monkeypatch.setattr("app.services.export_service.DeploymentPackage.load", lambda *_args, **_kwargs: FakePackage())
-    report = ExportService._validate_two_file_deployment(tmp_path, [prediction], 0.5, 1e-4)
+    report = ExportService._validate_two_file_deployment(package_directory, [prediction], 0.5, 1e-4)
 
     assert report["status"] == "PASS"
     assert report["max_abs_score_error"] == pytest.approx(0.0)
@@ -627,5 +608,5 @@ def test_deployment_validation_preserves_legacy_v2_map_score_semantics(tmp_path:
 def test_export_rejects_models_without_a_validated_deployment_format(tmp_path: Path) -> None:
     (tmp_path / "config.json").write_text(json.dumps(TrainingConfig(model_name="anomaly_dino").to_dict()), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="export is unavailable"):
+    with pytest.raises(ValueError, match="implemented only for SuperADD"):
         ExportService().export_model(tmp_path, tmp_path / "exports", [ModelExportFormat.TORCH])

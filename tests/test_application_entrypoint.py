@@ -29,6 +29,9 @@ def test_application_entrypoint_starts_main_window_maximized(tmp_path: Path, mon
         def __init__(self, _arguments: list[str]) -> None:
             type(self).instance = self
 
+        def setWindowIcon(self, icon: object) -> None:
+            self.icon = icon
+
         def setApplicationDisplayName(self, _name: str) -> None:
             pass
 
@@ -64,12 +67,17 @@ def test_application_entrypoint_starts_main_window_maximized(tmp_path: Path, mon
         def showMaximized(self) -> None:
             self.maximized = True
 
+        def setWindowIcon(self, icon: object) -> None:
+            self.icon = icon
+
     core_module = ModuleType("PySide6.QtCore")
     core_module.QSettings = SimpleNamespace(
         Format=SimpleNamespace(IniFormat=object()),
         setDefaultFormat=lambda _format: None,
     )
     core_module.Qt = SimpleNamespace(ApplicationAttribute=SimpleNamespace(AA_DontUseNativeDialogs=object()))
+    gui_module = ModuleType("PySide6.QtGui")
+    gui_module.QIcon = lambda path: path
     widgets_module = ModuleType("PySide6.QtWidgets")
     widgets_module.QApplication = FakeApplication
     main_window_module = ModuleType("app.ui.main_window")
@@ -77,6 +85,7 @@ def test_application_entrypoint_starts_main_window_maximized(tmp_path: Path, mon
     styles_module = ModuleType("app.ui.styles")
     styles_module.APP_STYLE = ""
     monkeypatch.setitem(sys.modules, "PySide6.QtCore", core_module)
+    monkeypatch.setitem(sys.modules, "PySide6.QtGui", gui_module)
     monkeypatch.setitem(sys.modules, "PySide6.QtWidgets", widgets_module)
     monkeypatch.setitem(sys.modules, "app.ui.main_window", main_window_module)
     monkeypatch.setitem(sys.modules, "app.ui.styles", styles_module)
@@ -88,3 +97,5 @@ def test_application_entrypoint_starts_main_window_maximized(tmp_path: Path, mon
     assert application_main.main() == 0
     assert FakeWindow.instance is not None
     assert FakeWindow.instance.maximized
+    assert str(FakeApplication.instance.icon).endswith("app\\ui\\assets\\aigaikan_training.ico")
+    assert FakeWindow.instance.icon == FakeApplication.instance.icon

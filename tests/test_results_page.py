@@ -62,6 +62,7 @@ def test_aigaikan_export_defaults_to_torch_and_keeps_runtime_compatibility_pendi
     assert page.export_format_checks[ModelExportFormat.TORCH].isChecked()
     assert not page.export_format_checks[ModelExportFormat.ONNX].isChecked()
     assert not page.export_format_checks[ModelExportFormat.OPENVINO].isChecked()
+    assert page.load_completed_run_button.text() == "Load Completed Run"
     assert page.export_model_button.text() == "Export for AIGAIKAN"
     assert page.metric_labels["Anomalib Export Parity"].text().startswith("Validated")
     assert page.metric_labels["AIGAIKAN Compatibility"].text() == "Pending AIGAIKAN runtime validation"

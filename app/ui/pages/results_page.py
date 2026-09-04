@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
 class ResultsPage(QWidget):
     """Training results UI."""
 
+    load_completed_run_requested = Signal()
     threshold_revision_requested = Signal(str, float, bool, float)
     decision_preview_requested = Signal(float)
     ui_text_changed = Signal()
@@ -66,6 +67,7 @@ class ResultsPage(QWidget):
 
         export_group = QGroupBox("Model Export")
         export_form = QFormLayout(export_group)
+        self.load_completed_run_button = QPushButton("Load Completed Run")
         export_directory_row = QHBoxLayout()
         self.export_directory_edit = QLineEdit()
         self.export_directory_edit.setPlaceholderText("Project directory")
@@ -82,12 +84,15 @@ class ResultsPage(QWidget):
             (ModelExportFormat.ONNX, "ONNX (.onnx)"),
         ):
             checkbox = QCheckBox(label)
+            checkbox.setEnabled(False)
+            checkbox.setToolTip("SuperADD deployment supports Torch (.pt) only.")
             self.export_format_checks[export_format] = checkbox
             advanced_format_row.addWidget(checkbox)
         advanced_format_row.addStretch(1)
         self.export_model_button = QPushButton("Export for AIGAIKAN")
         self.export_model_button.setObjectName("PrimaryButton")
         self.export_model_button.setEnabled(False)
+        export_form.addRow("Training Run", self.load_completed_run_button)
         export_form.addRow("Destination", export_directory_row)
         export_form.addRow("Export for AIGAIKAN", torch_checkbox)
         export_form.addRow("Advanced Formats", advanced_format_row)
@@ -217,6 +222,7 @@ class ResultsPage(QWidget):
         self.preview_threshold_effect_button.clicked.connect(
             lambda: self.decision_preview_requested.emit(self.image_threshold_spin.value())
         )
+        self.load_completed_run_button.clicked.connect(self.load_completed_run_requested)
         self.apply_threshold_revision_button.clicked.connect(self._request_threshold_revision)
         self._set_threshold_revision_enabled(False)
 

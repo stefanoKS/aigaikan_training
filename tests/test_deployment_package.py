@@ -8,16 +8,21 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+from typing import NamedTuple
 
 import numpy as np
 import pytest
+import torch
+from torch import nn
 
 from app.core.deployment_package import DeploymentPackage, sha256_file
 from app.core.prediction_contract import POSTPROCESSED_SCORE_SEMANTIC, SUPERADD_NATIVE_IMAGE_SCORE_SEMANTIC
+from app.core.superadd_deployment import SuperADDDeploymentAdapter, SuperADDDeploymentInferencer
 from app.models.image_preprocessing import ImagePreprocessingConfig
 from app.models.inspection_region import InspectionRegionConfig
 from app.models.preprocessing_config import PreprocessingConfig
 from app.core.threshold_contract import PixelThresholdOperatingPoint
+from app.services.export_service import ExportService
 
 
 def _package(tmp_path: Path, *, model_id: str = "patchcore") -> Path:
@@ -69,6 +74,12 @@ def _package(tmp_path: Path, *, model_id: str = "patchcore") -> Path:
             "expected_precision": "float32",
         } | (
             {
+                "export_adapter": "superadd_native_v1",
+                "output_contract": {
+                    "decision_score": "superadd_native_top_quantile_score_v1",
+                    "anomaly_map": "continuous_unthresholded",
+                },
+                "external_tiling": False,
                 "memory_bank": {
                     "bank_count": 2,
                     "feature_dimension": 4,
@@ -122,6 +133,27 @@ def _superadd_inferencer(outputs: list[dict[str, object]], received: list[np.nda
     inferencer = _inferencer(outputs, received)
     inferencer.model = type("SuperADD", (), {"model": type("Core", (), {"memory_bank": np.zeros((2, 3, 4), dtype=np.float32)})()})()
     return inferencer
+
+
+class _NativeSuperADDOutput(NamedTuple):
+    pred_score: torch.Tensor
+    anomaly_map: torch.Tensor
+
+
+class _NativeSuperADDDetector(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.register_buffer("memory_bank", torch.ones((2, 3, 4)))
+
+    def forward(self, image: torch.Tensor) -> _NativeSuperADDOutput:
+        return _NativeSuperADDOutput(torch.tensor([1.7], device=image.device), image[:, 0] * 2)
+
+
+class _TrainedSuperADD(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.pre_processor = nn.Identity()
+        self.model = _NativeSuperADDDetector()
 
 
 def test_two_file_package_adapts_mono8_to_rgb_and_decides_from_postprocessed_score(tmp_path: Path) -> None:
@@ -236,6 +268,64 @@ def test_two_file_package_preserves_superadd_native_decision_score_without_alias
     )
     with pytest.raises(ValueError, match="decision_score"):
         missing_score.predict(np.zeros((3, 4, 3), dtype=np.uint8))
+
+
+def test_superadd_adapter_serializes_native_output_without_mutating_trust_environment(tmp_path: Path, monkeypatch) -> None:
+    artifact = tmp_path / "model.pt"
+    torch.save({"model": SuperADDDeploymentAdapter(_TrainedSuperADD())}, artifact)
+    monkeypatch.delenv("TRUST_REMOTE_CODE", raising=False)
+
+    with pytest.raises(ValueError, match="TRUST_REMOTE_CODE"):
+        SuperADDDeploymentInferencer.load(artifact)
+
+    inferencer = SuperADDDeploymentInferencer.load(artifact, trust_newly_created_local_artifact=True)
+    output = inferencer.predict(np.full((3, 4, 3), 100, dtype=np.uint8))
+
+    assert output.decision_score.item() == pytest.approx(1.7)
+    assert np.asarray(output.anomaly_map.detach().cpu()).shape == (1, 3, 4)
+    assert os.environ.get("TRUST_REMOTE_CODE") is None
+
+
+def test_superadd_package_default_loader_uses_the_serialized_native_adapter(tmp_path: Path, monkeypatch) -> None:
+    directory = _package(tmp_path, model_id="super_add")
+    model_path = directory / "model.pt"
+    torch.save({"model": SuperADDDeploymentAdapter(_TrainedSuperADD())}, model_path)
+    metadata_path = directory / "deployment.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["deployment"]["model_sha256"] = sha256_file(model_path)
+    metadata["model"]["memory_bank"]["dtype"] = "torch.float32"
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    monkeypatch.setenv("TRUST_REMOTE_CODE", "1")
+
+    result = DeploymentPackage.load(directory).predict(np.full((3, 4, 3), 100, dtype=np.uint8))
+
+    assert result.decision_score == pytest.approx(1.7)
+    assert result.is_ng is True
+    assert result.score_semantic == SUPERADD_NATIVE_IMAGE_SCORE_SEMANTIC
+    assert result.anomaly_map.shape == (3, 4)
+
+
+def test_superadd_saved_policy_revision_changes_only_the_decision_threshold(tmp_path: Path) -> None:
+    source = _package(tmp_path, model_id="super_add")
+    revised = ExportService().create_deployment_policy_revision(source, tmp_path / "exports", 1.8, "line adjustment")
+    anomaly_map = np.full((448, 448), 0.4, dtype=np.float32)
+    source_package = DeploymentPackage.load(
+        source,
+        lambda _model: _superadd_inferencer([{"decision_score": 1.7, "anomaly_map": anomaly_map}], []),
+    )
+    revised_package = DeploymentPackage.load(
+        revised,
+        lambda _model: _superadd_inferencer([{"decision_score": 1.7, "anomaly_map": anomaly_map}], []),
+    )
+
+    source_result = source_package.predict(np.zeros((3, 4, 3), dtype=np.uint8))
+    revised_result = revised_package.predict(np.zeros((3, 4, 3), dtype=np.uint8))
+
+    assert source_result.is_ng is True
+    assert revised_result.is_ng is False
+    assert source_result.decision_score == revised_result.decision_score == pytest.approx(1.7)
+    assert np.array_equal(source_result.anomaly_map, revised_result.anomaly_map)
+    assert sha256_file(source / "model.pt") == sha256_file(revised / "model.pt")
 
 
 def test_two_file_package_rejects_superadd_memory_bank_metadata_mismatch(tmp_path: Path) -> None:

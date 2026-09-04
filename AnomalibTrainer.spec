@@ -2,7 +2,7 @@
 
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
-datas = []
+datas = [("app/ui/assets/aigaikan_training.ico", "app/ui/assets")]
 for package_name in ("matplotlib", "PySide6", "torchvision"):
     try:
         datas += collect_data_files(package_name, include_py_files=True)
@@ -40,7 +40,7 @@ exe = EXE(
     strip=False,
     upx=True,
     console=False,
-    icon="app/resources/app.ico",
+    icon="app/ui/assets/aigaikan_training.ico",
 )
 coll = COLLECT(
     exe,

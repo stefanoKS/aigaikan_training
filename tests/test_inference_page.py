@@ -10,6 +10,7 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import Qt
 
 from app.models.prediction_result import PredictionResult
 from app.ui.pages.inference_page import InferencePage
@@ -76,6 +77,24 @@ def test_inference_page_filters_ng_export_after_inference_without_changing_predi
     assert page.ng_predictions_for_export()[0].source_path == source_path
     assert page.export_ng_images_button.isEnabled()
     assert page.results_table.item(0, 1).text() == "OK"
+
+
+def test_inference_table_sorts_numeric_scores_and_keeps_selected_prediction_mapping() -> None:
+    application = QApplication.instance() or QApplication([])
+    page = _preview_page(0.5)
+    page.append_prediction(PredictionResult("high.png", "NG", "Unknown", 0.9, 0.5, score_semantic=_SCORE_SEMANTIC))
+    page.append_prediction(PredictionResult("low.png", "OK", "Unknown", 0.1, 0.5, score_semantic=_SCORE_SEMANTIC))
+
+    page.results_table.sortItems(2, Qt.SortOrder.AscendingOrder)
+    page.results_table.selectRow(0)
+    application.processEvents()
+
+    assert page.results_table.item(0, 2).text() == "0.1"
+    assert page.score_label.text() == "0.1"
+    assert page.ng_predictions_for_export() == []
+    assert page.results_table.columnWidth(1) >= 190
+    assert page.results_table.columnWidth(5) >= 190
+    page.close()
 
 
 def test_inference_page_shows_original_overlay_and_binary_mask_previews(tmp_path: Path) -> None:

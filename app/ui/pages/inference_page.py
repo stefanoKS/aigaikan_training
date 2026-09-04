@@ -238,13 +238,17 @@ class InferencePage(QWidget):
                 "Decision Change",
             ]
         )
-        self.results_table.setSortingEnabled(False)
+        self.results_table.setSortingEnabled(True)
         self.results_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.results_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.results_table.setWordWrap(True)
         self.results_table.setTextElideMode(Qt.TextElideMode.ElideNone)
-        self.results_table.setColumnWidth(0, 280)
-        self.results_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        for column, width in enumerate((360, 190, 100, 190, 110, 190, 150)):
+            self.results_table.setColumnWidth(column, width)
+            self.results_table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeMode.Interactive)
+        self.results_table.horizontalHeader().setMinimumSectionSize(90)
+        self.results_table.horizontalHeader().setSortIndicatorShown(True)
+        self.results_table.horizontalHeader().setSortIndicator(0, Qt.SortOrder.AscendingOrder)
         self.results_table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.results_table.itemSelectionChanged.connect(self._show_selected_prediction)
 
@@ -338,7 +342,7 @@ class InferencePage(QWidget):
         if threshold is None:
             return []
         selected_rows = sorted({index.row() for index in self.results_table.selectionModel().selectedRows()})
-        source = (self.predictions[index] for index in selected_rows) if selected_rows else iter(self.predictions)
+        source = (prediction for row in selected_rows if (prediction := self._prediction_for_row(row)) is not None) if selected_rows else iter(self.predictions)
         return [prediction for prediction in source if prediction.anomaly_score >= threshold]
 
     def set_input_path(self, input_path: Path) -> None:
@@ -464,6 +468,8 @@ class InferencePage(QWidget):
     def append_prediction(self, prediction: PredictionResult) -> None:
         """Add one streamed prediction to the table and preview it."""
         self.predictions.append(prediction)
+        prediction_index = len(self.predictions) - 1
+        self.results_table.setSortingEnabled(False)
         row = self.results_table.rowCount()
         self.results_table.insertRow(row)
         values = (
@@ -479,8 +485,12 @@ class InferencePage(QWidget):
             item = QTableWidgetItem(value)
             if column == 0:
                 item.setToolTip(prediction.source_path)
+                item.setData(Qt.ItemDataRole.UserRole, prediction_index)
+            elif column in (2, 3):
+                item.setData(Qt.ItemDataRole.EditRole, prediction.anomaly_score if column == 2 else prediction.threshold)
             self.results_table.setItem(row, column, item)
         self.results_table.resizeRowToContents(row)
+        self.results_table.setSortingEnabled(True)
         self._refresh_decision_preview()
         self._update_export_ng_controls()
         if row == 0:
@@ -509,8 +519,9 @@ class InferencePage(QWidget):
         selected_rows = self.results_table.selectionModel().selectedRows()
         if not selected_rows:
             return
-        prediction = self.predictions[selected_rows[0].row()]
-        self._show_prediction(prediction)
+        prediction = self._prediction_for_row(selected_rows[0].row())
+        if prediction is not None:
+            self._show_prediction(prediction)
 
     def _show_prediction(self, prediction: PredictionResult) -> None:
         """Show summary values and previews for one prediction without changing export selection."""
@@ -658,9 +669,10 @@ class InferencePage(QWidget):
         self.results_table.setUpdatesEnabled(False)
         blocker = QSignalBlocker(self.results_table)
         try:
-            for row, prediction in enumerate(self.predictions):
-                if row >= self.results_table.rowCount():
-                    break
+            for row in range(self.results_table.rowCount()):
+                prediction = self._prediction_for_row(row)
+                if prediction is None:
+                    continue
                 decision = self._displayed_decision(prediction) if semantic_safe else None
                 change = self._decision_change(prediction.predicted_label, decision)
                 self.results_table.setItem(row, 5, QTableWidgetItem(decision or "Not available"))
@@ -687,9 +699,16 @@ class InferencePage(QWidget):
     def _update_selected_decision_summary(self) -> None:
         selected_rows = self.results_table.selectionModel().selectedRows()
         if selected_rows:
-            self._show_prediction(self.predictions[selected_rows[0].row()])
+            prediction = self._prediction_for_row(selected_rows[0].row())
+            if prediction is not None:
+                self._show_prediction(prediction)
         elif self.predictions:
             self._show_prediction(self.predictions[0])
+
+    def _prediction_for_row(self, row: int) -> PredictionResult | None:
+        item = self.results_table.item(row, 0)
+        index = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+        return self.predictions[index] if isinstance(index, int) and 0 <= index < len(self.predictions) else None
 
     def _update_decision_preview_controls(self) -> None:
         semantic_safe = self._decision_semantics_are_safe()

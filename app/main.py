@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 import sys
 
 from app.core.project_manager import ProjectManager
@@ -41,6 +42,7 @@ def main() -> int:
     configure_logging()
     try:
         from PySide6.QtCore import QSettings, Qt
+        from PySide6.QtGui import QIcon
         from PySide6.QtWidgets import QApplication
     except Exception as exc:
         logging.exception("PySide6 is unavailable")
@@ -58,6 +60,8 @@ def main() -> int:
     QApplication.setApplicationName("AnomalibTrainer")
     QApplication.setAttribute(Qt.ApplicationAttribute.AA_DontUseNativeDialogs)
     app = QApplication(sys.argv)
+    application_icon = QIcon(str(Path(__file__).resolve().parent / "ui" / "assets" / "aigaikan_training.ico"))
+    app.setWindowIcon(application_icon)
     app.setApplicationDisplayName("Anomalib Trainer")
     app.setStyle("Fusion")
     app.setStyleSheet(APP_STYLE)
@@ -70,6 +74,7 @@ def main() -> int:
         settings_manager=settings_manager,
         project_manager=ProjectManager(settings_manager.default_projects_directory()),
     )
+    window.setWindowIcon(application_icon)
     window.showMaximized()
     return app.exec()
 

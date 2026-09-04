@@ -58,6 +58,7 @@ def test_global_style_covers_all_popup_dialog_surfaces() -> None:
     assert "QToolTip" in APP_STYLE
     assert "QRadioButton {\n    color: #e7eff0;" in APP_STYLE
     assert "QRadioButton::indicator:checked" in APP_STYLE
+    assert "QPushButton#PrimaryButton:disabled" in APP_STYLE
 
 
 def test_training_log_scrolls_to_its_latest_message() -> None:

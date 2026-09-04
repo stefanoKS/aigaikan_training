@@ -185,7 +185,16 @@ AUROC and F1 are supplementary ranking metrics. An escaped NG is always treated 
 
 Export is blocked for every default model until it reaches `TORCH_EXPORT_VALIDATED`; the interface does not treat an unverified export as deployable. **No default model is currently Torch-export validated.** PatchCore, PaDiM, and both Dinomaly profiles are training-validated only; AnomalyDINO, SuperADD, EfficientAD, and SuperSimpleNet remain experimental. The blocker is missing demonstrated real Anomalib export, reload, map, score, and decision-parity evidence for the exact model/configuration. No registry flag is changed by this repository work.
 
-Once a model passes that separate evidence gate, the exporter reads the manifest-verified canonical checkpoint rather than the newest file in a folder and emits exactly `model.pt` and `deployment.json`. The JSON document binds the model SHA-256 and embeds the frozen ROI, preprocessing plan, decision policy, and export/reload parity evidence. Historical v2/v3 multi-file manifests remain readable only for migration and audit; they are not current production export outputs.
+Once SuperADD passes that separate evidence gate, the exporter reads the manifest-verified canonical checkpoint rather than the newest file in a folder and emits exactly `model.pt` and `deployment.json`. The JSON document binds the model SHA-256 and embeds the frozen ROI, preprocessing plan, decision policy, and export/reload parity evidence. Other models remain export-disabled. Historical v2/v3 multi-file manifests remain readable only for migration and audit; they are not current production export outputs.
+
+The evidence gate is the real-checkpoint integration test, not a mocked exporter: set `SUPERADD_EXPORT_RUN` to a completed SuperADD run that has an active saved decision revision and retained final-test raw-map artifacts, then run:
+
+```powershell
+$env:SUPERADD_EXPORT_RUN = "path\to\completed_superadd_run"
+python -m pytest tests\test_superadd_two_file_smoke.py -m anomalib_smoke -q
+```
+
+It exports the real checkpoint, reloads only the staged local `model.pt` with network access disabled, compares native scores, raw continuous maps, and decisions against the trainer artifacts, and verifies the saved active threshold/revision/note in `deployment.json`. SuperADD stays export-gated until this passes.
 
 The embedded `decision` object is authoritative for the image decision. It is independent from Anomalib's embedded thresholds and uses the unchanged rule `score >= threshold -> NG`. Thresholds are finite but are not restricted to $[0,1]$ because SuperADD distance scores may legitimately exceed one:
 
@@ -203,7 +212,7 @@ The embedded `decision` object is authoritative for the image decision. It is in
 }
 ```
 
-Creating a deployment policy revision copies the verified model and its export/reload validation snapshot, then freezes only the new embedded decision threshold and revision metadata. It never reads a later active run revision while loading an existing deployment package.
+Creating a deployment policy revision copies the verified model and its export/reload validation snapshot, then freezes only the new embedded decision threshold and revision metadata. It never reads a later active run revision while loading an existing deployment package. Export reads only the persisted calibration threshold or persisted active revision; an unsaved inference-page preview is never an exportable threshold.
 
 The Results page keeps calibrated and active deployment thresholds separate from the proposed operator value. Preview uses persisted validation/final-test scores only, reports OK-to-NG and NG-to-OK changes plus measurable false-reject/recall values, and warns when an operator threshold lies beyond calibration observations. Saving creates and atomically activates an immutable `threshold-NNN` revision with the operator note; it preserves continuous maps and heatmaps. A pixel threshold remains independent and changes only binary masks and contour overlays.
 
@@ -225,7 +234,7 @@ deployment/
 	deployment.json
 ```
 
-`model.pt` is the executable Anomalib Torch deployment model and contains its required model tensors/state. `deployment.json` is the versioned non-tensor contract: raw pixel input adaptation, saved four-point ROI, deterministic image preprocessing operations, resolved padding/alignment/tiling plan, model metadata, score semantic, active immutable image threshold, independent pixel policy, model SHA-256 binding, and export/reload parity evidence. No training-run file, checkpoint, preprocessing sidecar, ROI sidecar, policy sidecar, or internet lookup is required by the package loader.
+`model.pt` is the executable SuperADD Torch deployment model and contains its required model tensors/state. It serializes the `superadd_native_v1` adapter, which applies the saved Anomalib preprocessor and calls the trained `SuperADDModel` directly without Anomalib score normalization or postprocessing. Its output contract is the native top-quantile `decision_score` (`superadd_native_top_quantile_score_v1`) and a continuous, unthresholded `anomaly_map`. `deployment.json` is the versioned non-tensor contract: raw pixel input adaptation, saved four-point ROI, deterministic image preprocessing operations, resolved padding/alignment plan, model metadata, score semantic, active immutable image threshold, independent pixel policy, model SHA-256 binding, and export/reload parity evidence. No training-run file, checkpoint, preprocessing sidecar, ROI sidecar, policy sidecar, or internet lookup is required by the package loader.
 
 The raw input boundary is explicit: a `numpy.uint8` Mono8 frame uses `HW` layout and is converted with `cv2.COLOR_GRAY2RGB`; color uses `HWC` with exactly three channels in declared `RGB` order. The canonical internal representation before ROI/preprocessing is always RGB `uint8` in $[0,255]$. The loader never infers BGR/RGB from array shape, normalizes raw input outside the saved contract, or accepts floating tensors from a camera caller.
 
@@ -244,7 +253,7 @@ raw numpy uint8 frame
 	-> NG / OK
 ```
 
-The two-file reference API is `DeploymentPackage.load(path)` followed by `deployment.predict(raw_uint8_frame)`. It verifies the SHA-256 binding before loading `model.pt`, and its result exposes `decision_score`, `threshold`, `is_ng`, `score_semantic`, and `anomaly_map`. Anomalib's `TorchInferencer` loads Torch artifacts through PyTorch pickle and requires `TRUST_REMOTE_CODE=1`; set it only in a trusted environment for a `model.pt` exported by this toolchain. SuperADD packages additionally require a finite explicit `decision_score` from the exported model and verified non-empty registered memory-bank state; raw alias fields such as `raw_pred_score` are not accepted.
+The two-file reference API is `DeploymentPackage.load(path)` followed by `deployment.predict(raw_uint8_frame)`. It verifies the SHA-256 binding before loading `model.pt`, and its result exposes `decision_score`, `threshold`, `is_ng`, `score_semantic`, and `anomaly_map`. Loading a SuperADD Torch artifact uses PyTorch pickle and requires `TRUST_REMOTE_CODE=1`; set it only in a trusted environment for a `model.pt` exported by this toolchain. During export validation, the newly generated local staged artifact is reloaded directly without modifying that environment setting. SuperADD packages additionally require a finite explicit `decision_score` from the exported adapter and verified non-empty registered memory-bank state; raw alias fields such as `raw_pred_score` are not accepted.
 
 Use the standalone reference loader with only the two deployment files available:
 

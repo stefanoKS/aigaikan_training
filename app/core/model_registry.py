@@ -118,9 +118,9 @@ class ModelRegistry:
             algorithm="SuperADD",
             model_variant="super_add",
             encoder_family="DINOv3",
-            requirement="Export formats remain unavailable until deployment parity validation is completed.",
-            supports_export=False,
-            support_level=ModelSupportLevel.EXPERIMENTAL,
+            requirement="Torch export/reload parity is validated for the native SuperADD deployment adapter.",
+            supports_export=True,
+            support_level=ModelSupportLevel.TORCH_EXPORT_VALIDATED,
         ),
         ModelDefinition(
             "efficient_ad",

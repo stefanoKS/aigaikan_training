@@ -217,6 +217,11 @@ QPushButton#PrimaryButton:hover {
     border-color: #78eadc;
     color: #f2fffe;
 }
+QPushButton#PrimaryButton:disabled {
+    background: #151a1c;
+    border-color: #293437;
+    color: #62767a;
+}
 QPushButton#AlertButton {
     background: #28191b;
     border-color: #753f42;

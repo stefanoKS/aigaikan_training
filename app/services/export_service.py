@@ -29,6 +29,7 @@ from app.core.deployment_package import (
     superadd_memory_bank_metadata,
     validate_deployment_json,
 )
+from app.core.superadd_deployment import SuperADDDeploymentAdapter, SuperADDDeploymentInferencer
 from app.core.model_registry import ModelRegistry, ModelSupportLevel
 from app.core.result_parser import ResultParser
 from app.core.inspection_region import InspectionRegionProcessor, inspection_region_hash
@@ -125,6 +126,8 @@ class ExportService:
 
         config = self._load_training_config(run_directory)
         definition = self.model_registry.get(config.model_name)
+        if definition.key != "super_add":
+            raise ValueError("Torch deployment export is implemented only for SuperADD.")
         if not definition.supports_export or definition.support_level is not ModelSupportLevel.TORCH_EXPORT_VALIDATED:
             raise ValueError(
                 f"{definition.display_name} export is unavailable until an Anomalib export/reload/parity smoke test passes."
@@ -143,6 +146,8 @@ class ExportService:
         )
         if preprocessing_plan is None:
             raise ValueError("Two-file deployment export requires a verified resolved preprocessing plan from the completed run.")
+        if preprocessing_plan.tiled:
+            raise ValueError("SuperADD deployment export prohibits external tiling.")
         final_test_predictions = self._load_final_test_predictions(
             run_directory,
             active_revision.predictions_path if active_revision is not None else None,
@@ -152,75 +157,69 @@ class ExportService:
         if package_directory.exists():
             raise FileExistsError(f"Deployment directory already exists: {package_directory}")
         export_directory.mkdir(parents=True, exist_ok=True)
-        with TemporaryDirectory(prefix="aigaikan-two-file-deployment-", dir=export_directory) as temporary_directory:
-            staging_root = Path(temporary_directory)
-            engine_export_root = staging_root / "engine_export"
-            engine_export_root.mkdir()
-            components = self.anomalib_service.create_inference_components(config, engine_export_root, preprocessing_plan)
-            exported_path = components["engine"].export(
-                model=components["model"],
-                export_type=ModelExportFormat.TORCH.value,
-                export_root=engine_export_root,
-                model_file_name="model",
-                input_size=None,
-                ckpt_path=checkpoint_path,
-            )
-            if exported_path is None:
-                raise RuntimeError("Anomalib did not return an exported Torch model path.")
-            staged_result = self.verify_export(Path(exported_path), ModelExportFormat.TORCH.value)
-            staged_package = staging_root / "deployment"
-            staged_package.mkdir()
-            staged_model = staged_package / DEPLOYMENT_MODEL_FILENAME
-            shutil.copy2(staged_result.exported_path, staged_model)
-            policy = self._build_decision_policy(
-                threshold_metadata,
-                calibrated_threshold_metadata,
-                active_revision,
-                model_sha256=sha256_file(staged_model),
-                preprocessing_plan_sha256=resolved_preprocessing_hash(preprocessing_plan),
-            )
-            pending_metadata = self._deployment_metadata(
-                run_directory,
-                config,
-                definition,
-                checkpoint_path,
-                inspection_region,
-                preprocessing_plan,
-                policy,
-                {"status": "PENDING"},
-            )
-            self._write_deployment_json(staged_package / DEPLOYMENT_METADATA_FILENAME, pending_metadata)
-            validation = (
-                self._deployment_validator(
-                    staged_model,
-                    ModelExportFormat.TORCH.value,
-                    final_test_predictions,
-                    policy.threshold,
-                    self.score_tolerances[ModelExportFormat.TORCH.value],
+        stage = "create deployment staging area"
+        try:
+            with TemporaryDirectory(prefix="aigaikan-superadd-deployment-", dir=export_directory) as temporary_directory:
+                staging_root = Path(temporary_directory)
+                stage = "load completed SuperADD checkpoint"
+                components = self.anomalib_service.create_inference_components(config, staging_root, preprocessing_plan)
+                staged_package = staging_root / "deployment"
+                staged_package.mkdir()
+                staged_model = staged_package / DEPLOYMENT_MODEL_FILENAME
+                stage = "write SuperADD native-score Torch artifact"
+                memory_bank = self._write_superadd_torch_artifact(components["model"], checkpoint_path, staged_model)
+                policy = self._build_decision_policy(
+                    threshold_metadata,
+                    calibrated_threshold_metadata,
+                    active_revision,
+                    model_sha256=sha256_file(staged_model),
+                    preprocessing_plan_sha256=resolved_preprocessing_hash(preprocessing_plan),
                 )
-                if self._has_custom_deployment_validator
-                else self._validate_two_file_deployment(
+                stage = "write pending deployment metadata"
+                pending_metadata = self._deployment_metadata(
+                    run_directory,
+                    config,
+                    definition,
+                    checkpoint_path,
+                    inspection_region,
+                    preprocessing_plan,
+                    policy,
+                    {"status": "PENDING"},
+                    superadd_memory_bank=memory_bank,
+                )
+                self._write_deployment_json(staged_package / DEPLOYMENT_METADATA_FILENAME, pending_metadata)
+                stage = "reload local SuperADD artifact and verify final-test parity"
+                validation_device = "cuda" if components["device"] == "gpu" else "cpu"
+                if config.superadd_precision == "float16" and validation_device != "cuda":
+                    raise ValueError("SuperADD FP16 deployment validation requires CUDA.")
+                validation = self._validate_two_file_deployment(
                     staged_package,
                     final_test_predictions,
                     policy.threshold,
                     self.score_tolerances[ModelExportFormat.TORCH.value],
+                    device=validation_device,
+                    trust_newly_created_local_artifact=True,
                 )
-            )
-            if validation.get("status") != "PASS":
-                raise RuntimeError("Deployment export/reload parity validation did not pass.")
-            finalized_metadata = self._deployment_metadata(
-                run_directory,
-                config,
-                definition,
-                checkpoint_path,
-                inspection_region,
-                preprocessing_plan,
-                policy,
-                validation,
-            )
-            self._write_deployment_json(staged_package / DEPLOYMENT_METADATA_FILENAME, finalized_metadata)
-            validate_deployment_json(finalized_metadata, staged_model)
-            staged_package.replace(package_directory)
+                if validation.get("status") != "PASS":
+                    raise RuntimeError("Deployment export/reload parity validation did not pass.")
+                stage = "finalize deployment metadata"
+                finalized_metadata = self._deployment_metadata(
+                    run_directory,
+                    config,
+                    definition,
+                    checkpoint_path,
+                    inspection_region,
+                    preprocessing_plan,
+                    policy,
+                    validation,
+                    superadd_memory_bank=memory_bank,
+                )
+                self._write_deployment_json(staged_package / DEPLOYMENT_METADATA_FILENAME, finalized_metadata)
+                validate_deployment_json(finalized_metadata, staged_model)
+                stage = "publish validated deployment"
+                staged_package.replace(package_directory)
+        except Exception as exc:
+            raise RuntimeError(f"SuperADD deployment export failed during {stage}: {exc}") from exc
         result = ExportResult(
             exported_path=package_directory / DEPLOYMENT_MODEL_FILENAME,
             export_format=ModelExportFormat.TORCH.value,
@@ -228,6 +227,23 @@ class ExportService:
             validation=validation,
         )
         return ModelExportReport(exported=[result], failures={}, package_directory=package_directory)
+
+    @staticmethod
+    def _write_superadd_torch_artifact(model: Any, checkpoint_path: Path, destination: Path) -> dict[str, object]:
+        """Serialize the completed SuperADD checkpoint behind the native-score adapter."""
+        load_from_checkpoint = getattr(model.__class__, "load_from_checkpoint", None)
+        if not callable(load_from_checkpoint):
+            raise ValueError("SuperADD model class cannot load the completed checkpoint for deployment.")
+        try:
+            trained_model = load_from_checkpoint(checkpoint_path, map_location="cpu", weights_only=False)
+            adapter = SuperADDDeploymentAdapter(trained_model)
+            adapter.eval()
+            import torch
+
+            torch.save({"model": adapter}, destination)
+            return superadd_memory_bank_metadata(adapter)
+        except Exception as exc:
+            raise ValueError("Could not serialize the completed SuperADD checkpoint as a native-score Torch artifact.") from exc
 
     def create_deployment_policy_revision(
         self,
@@ -291,6 +307,8 @@ class ExportService:
         preprocessing_plan: Any,
         policy: DecisionPolicy,
         validation: Mapping[str, object],
+        *,
+        superadd_memory_bank: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
         """Embed all non-tensor state required by the two-file raw-pixel deployment boundary."""
         model_sha256 = policy.model_sha256
@@ -308,9 +326,16 @@ class ExportService:
             "expected_precision": config.superadd_precision if config.is_super_add else "float32",
         }
         if config.is_super_add:
-            memory_bank = ExportService._superadd_memory_bank_metadata_from_checkpoint(checkpoint_path)
+            if superadd_memory_bank is None:
+                raise ValueError("SuperADD deployment metadata requires trained memory-bank state from the serialized artifact.")
+            memory_bank = dict(superadd_memory_bank)
             model_metadata.update(
                 {
+                    "export_adapter": "superadd_native_v1",
+                    "output_contract": {
+                        "decision_score": "superadd_native_top_quantile_score_v1",
+                        "anomaly_map": "continuous_unthresholded",
+                    },
                     "backbone": config.superadd_backbone_name,
                     "layers": model_profile["layers"],
                     "precision": config.superadd_precision,
@@ -377,33 +402,32 @@ class ExportService:
         return path
 
     @staticmethod
-    def _superadd_memory_bank_metadata_from_checkpoint(checkpoint_path: Path) -> dict[str, object]:
-        """Read the trained SuperADD registered memory bank from checkpoint state without rebuilding it."""
-        try:
-            import torch
-
-            payload = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-        except Exception as exc:
-            raise ValueError("Could not read the completed SuperADD checkpoint state for memory-bank verification.") from exc
-        state_dict = payload.get("state_dict") if isinstance(payload, Mapping) else None
-        if not isinstance(state_dict, Mapping):
-            raise ValueError("Completed SuperADD checkpoint does not contain a state_dict.")
-        banks = [value for key, value in state_dict.items() if str(key).endswith("memory_bank")]
-        if len(banks) != 1:
-            raise ValueError("Completed SuperADD checkpoint must contain exactly one registered memory_bank tensor.")
-        return superadd_memory_bank_metadata(type("CheckpointModel", (), {"memory_bank": banks[0]})())
-
-    @staticmethod
     def _validate_two_file_deployment(
         package_directory: Path,
         expected_predictions: list[PredictionResult],
         threshold: float,
         score_tolerance: float,
+        *,
+        device: str = "cpu",
+        trust_newly_created_local_artifact: bool = False,
     ) -> dict[str, object]:
         """Reload model.pt from the two-file package and require score, map, and decision parity."""
         from PIL import Image
 
-        package = DeploymentPackage.load(package_directory, require_validation=False)
+        metadata = read_deployment_json(package_directory / DEPLOYMENT_METADATA_FILENAME)
+        model = metadata.get("model")
+        if not isinstance(model, Mapping) or model.get("algorithm") != "super_add":
+            raise ValueError("Two-file export parity validation is implemented only for SuperADD.")
+        package = DeploymentPackage.load(
+            package_directory,
+            lambda model_path: SuperADDDeploymentInferencer.load(
+                model_path,
+                device=device,
+                trust_newly_created_local_artifact=trust_newly_created_local_artifact,
+            ),
+            device=device,
+            require_validation=False,
+        )
         score_errors: list[float] = []
         map_errors: list[np.ndarray] = []
         decisions = 0
@@ -416,8 +440,13 @@ class ExportService:
             actual = package.predict(raw_rgb)
             if actual.score_semantic != expected.score_semantic:
                 raise RuntimeError("Deployment score semantic does not match the completed-run prediction.")
-            score_errors.append(abs(actual.decision_score - float(expected.anomaly_score)))
-            expected_map = ExportService._stored_anomaly_map(expected)
+            expected_score = float(expected.anomaly_score)
+            if not isfinite(expected_score):
+                raise ValueError("Completed-run SuperADD decision score must be finite.")
+            score_errors.append(abs(actual.decision_score - expected_score))
+            if actual.threshold != threshold:
+                raise RuntimeError("Deployment did not use the saved active decision threshold.")
+            expected_map = ExportService._stored_anomaly_map(expected, require_raw_superadd_map=True)
             if expected_map.shape != actual.anomaly_map.shape:
                 raise RuntimeError("Deployment anomaly-map shape does not match the completed-run prediction.")
             map_errors.append(np.abs(expected_map.astype(np.float64) - actual.anomaly_map.astype(np.float64)))
@@ -427,6 +456,8 @@ class ExportService:
         if decisions != len(expected_predictions):
             raise RuntimeError("Deployment decision parity failed for the two-file package.")
         errors = np.concatenate([values.ravel() for values in map_errors])
+        if float(errors.max()) > score_tolerance:
+            raise RuntimeError("Deployment continuous anomaly-map parity failed for the two-file package.")
         return {
             "status": "PASS",
             "score_tolerance": score_tolerance,
@@ -441,8 +472,13 @@ class ExportService:
         }
 
     @staticmethod
-    def _stored_anomaly_map(prediction: PredictionResult) -> np.ndarray:
-        path = Path(prediction.postprocessed_anomaly_map or prediction.continuous_anomaly_map)
+    def _stored_anomaly_map(prediction: PredictionResult, *, require_raw_superadd_map: bool = False) -> np.ndarray:
+        path_value = prediction.raw_anomaly_map if require_raw_superadd_map else (
+            prediction.postprocessed_anomaly_map or prediction.continuous_anomaly_map
+        )
+        if require_raw_superadd_map and not path_value:
+            raise ValueError("Completed-run SuperADD raw continuous anomaly map is missing for deployment parity.")
+        path = Path(path_value)
         if not path.is_file():
             raise FileNotFoundError(f"Completed-run anomaly map is missing for deployment parity: {path}")
         with np.load(path, allow_pickle=False) as stored:
